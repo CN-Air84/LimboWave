@@ -1,0 +1,19 @@
+# 统一走 LF，避免跨工具链换行漂移
+* text=auto eol=lf
+
+# Windows 脚本工具链按 CRLF 处理
+*.ps1 text eol=crlf
+*.psm1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 二进制资源不做换行转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.ico binary
+*.db binary
+*.whl binary
+
+# 锁文件在 diff 中折叠，且不参与语言统计
+uv.lock linguist-generated=true -diff
