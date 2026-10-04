@@ -26,11 +26,24 @@ class RoutingService:
     def get_model(self, model_id: str) -> LogicalModel | None:
         return self._models.get(model_id)
 
-    def route(self, model_id: str | None = None) -> RoutingDecision:
+    def route(
+        self, model_id: str | None = None, *, endpoint_id: str | None = None
+    ) -> RoutingDecision:
         """把逻辑模型路由到默认端点。失败抛 RoutingError。"""
         model = self._resolve_model(model_id)
 
+        if not model.bindings:
+            # 逻辑模型由用户手动建立，可以先建后绑；没绑定就如实报错，不猜站点
+            raise RoutingError(f"逻辑模型 {model.id} 还没有绑定实际模型")
         binding = model.bindings[model.default_binding]
+        reason = f"逻辑模型 {model.id} 的默认绑定（第 {model.default_binding} 个）"
+        if endpoint_id is not None:
+            default_endpoint = binding.endpoint_id
+            selected = next((b for b in model.bindings if b.endpoint_id == endpoint_id), None)
+            if selected is None:
+                raise RoutingError(f"模型 {model.id} 没有绑定站点 {endpoint_id}")
+            binding = selected
+            reason = f"会话级站点覆盖（配置默认是 {default_endpoint}）"
         endpoint = self._endpoints.get(binding.endpoint_id)
         if endpoint is None:
             raise RoutingError(f"模型 {model.id} 的默认绑定指向不存在的端点 {binding.endpoint_id}")
@@ -39,8 +52,31 @@ class RoutingService:
             model=model,
             binding=binding,
             endpoint=endpoint,
-            reason=f"逻辑模型 {model.id} 的默认绑定（第 {model.default_binding} 个）",
+            reason=reason,
         )
+
+    def catalog(self) -> list[RoutingDecision]:
+        """所有「逻辑模型 × 绑定」组合，供运行时一次性登记给 Pi。
+
+        Pi 的 ``set_model`` 只能切到 models.json 里登记过的 (provider, model)；
+        只登记启动时那一个，会话内切换逻辑模型/站点就会 ``Model not found``。
+        指向不存在端点的绑定跳过（它本来也路由不过去）。
+        """
+        decisions: list[RoutingDecision] = []
+        for model in self._config.models:
+            for index, binding in enumerate(model.bindings):
+                endpoint = self._endpoints.get(binding.endpoint_id)
+                if endpoint is None:
+                    continue
+                decisions.append(
+                    RoutingDecision(
+                        model=model,
+                        binding=binding,
+                        endpoint=endpoint,
+                        reason=f"逻辑模型 {model.id} 的第 {index} 个绑定（运行时目录）",
+                    )
+                )
+        return decisions
 
     def _resolve_model(self, model_id: str | None) -> LogicalModel:
         if model_id is not None:

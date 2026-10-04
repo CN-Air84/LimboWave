@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 .venv/
+.venv-linux/
 *.egg-info/
 build/
 dist/
@@ -20,3 +21,14 @@ htmlcov/
 /data/
 /vault/
 /logs/
+
+# 本地运行产物与编辑器状态
+/.var/
+/.zcode/
+/.claude/
+/%SystemDrive%/
+/.probe-*.png
+*.log
+.env
+.env.*
+!.env.example

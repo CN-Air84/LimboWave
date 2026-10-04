@@ -1,0 +1,38 @@
+name: Linux compatibility
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      QT_QPA_PLATFORM: offscreen
+      UV_PROJECT_ENVIRONMENT: .venv-linux
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Install Qt runtime libraries and Chinese fonts
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libopengl0 libxkbcommon0 libdbus-1-3 fonts-noto-cjk
+      - name: Install locked dependencies
+        run: bash scripts/linux.sh bootstrap
+      - name: Static checks
+        run: |
+          uv run --locked ruff check src tests
+          uv run --locked mypy src
+      - name: Tests (native POSIX process tests included)
+        if: ${{ !cancelled() }}
+        run: uv run --locked pytest -q --tb=short
+      - name: Build native directory distribution
+        id: package
+        if: ${{ !cancelled() }}
+        run: bash scripts/linux.sh package --console
+      - name: Verify frozen CLI starts
+        if: ${{ !cancelled() && steps.package.outcome == 'success' }}
+        run: dist/pyinstaller/LimboWave/LimboWave --help

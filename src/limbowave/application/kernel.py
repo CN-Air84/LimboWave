@@ -32,6 +32,7 @@ class KernelCapability(enum.StrEnum):
     TOOL_PREFLIGHT_HOOK = "tool_preflight_hook"
     INTERNAL_RETRY_DISABLE = "internal_retry_disable"
     TELEMETRY_DISABLE = "telemetry_disable"
+    RUNTIME_RESTORE = "runtime_restore"
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +72,7 @@ class KernelState:
     session_name: str | None
     message_count: int
     pending_message_count: int
+    provider: str | None = None
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -81,6 +83,19 @@ class CompactionResult:
     summary: str
     tokens_before: int
     raw: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class ContextUsage:
+    """上下文占用（对应 Pi 的 ``get_session_stats.contextUsage``，字段归一）。
+
+    **这是估算**：token 计数来自内核/站点的估算策略，不是精确值
+    （设计计划 §3 / Task 5.1 要求展示为「估算」）。
+    """
+
+    tokens: int
+    context_window: int
+    percent: float  # 0-100
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,6 +117,31 @@ EventHandler = Callable[[KernelEvent], None]
 # 权限裁决回调：收到 (标题, 详情)，返回 True=允许 / False=拒绝。
 # 本阶段抽象层只承载 confirm 语义；结构化资源授权属后续阶段。
 PermissionHandler = Callable[[str, str], Awaitable[bool]]
+
+
+@dataclass(frozen=True, slots=True)
+class KernelSetup:
+    """装配结果：内核 + 它被装配时采用的路由决策。
+
+    路由决策随内核一起返回，因为**请求意图快照需要它**：没有这层信息，
+    应用就无法记录"这一轮本来打算发往哪个逻辑模型的哪个端点、为什么"。
+    """
+
+    kernel: AgentKernel
+    logical_model_id: str
+    endpoint_id: str
+    routing_reason: str
+    app_params: dict[str, Any] = field(default_factory=dict)
+    # 当前逻辑模型的视觉能力（Task 4.4：图片发送前检查）
+    supports_images: bool = False
+    # 站点的重试策略（§八.3）：来自站点预设，随内核一起交出去
+    retry_policy: Any = None
+    # 站点-模型级能力声明（§二.4 模型级覆盖）：绑定上的默认思考强度与工具能力
+    default_thinking_level: str | None = None
+    thinking_level_locked: bool = False
+    available_thinking_levels: tuple[str, ...] = ()
+    supports_thinking: bool | None = None
+    supports_tools: bool = False
 
 
 class AgentKernel(ABC):
@@ -126,6 +166,23 @@ class AgentKernel(ABC):
     async def send_message(self, text: str, *, images: list[dict[str, Any]] | None = None) -> None:
         """发送一条用户消息。仅负责投递；流式结果经事件回调送达。"""
 
+    async def new_session(self) -> None:
+        """创建不继承历史的空会话，不调用 Provider。失败必须抛错，不能静默复用旧上下文。"""
+        raise NotImplementedError("当前内核不支持清空会话上下文")
+
+    async def set_memory_context(self, context: dict[str, object]) -> None:
+        """可选的独立记忆上下文通道；不支持的内核不得污染用户原文。"""
+        if context.get("global") or context.get("session"):
+            raise NotImplementedError("当前内核不支持记忆上下文")
+
+    def create_isolated(self) -> AgentKernel | None:
+        """创建一个不共享会话上下文的临时内核（可选能力）。
+
+        适合标题生成等不应进入当前对话树的后台模型调用。默认不支持；实现若返回
+        临时内核，调用方负责启动与关闭它。
+        """
+        return None
+
     @abstractmethod
     async def abort(self) -> None:
         """中止当前操作，等待内核进入 idle。"""
@@ -134,9 +191,27 @@ class AgentKernel(ABC):
     async def get_state(self) -> KernelState:
         """返回当前会话状态快照。"""
 
+    async def get_context_usage(self) -> ContextUsage | None:
+        """上下文占用估算（可选能力）。不支持的实现返回 None。
+
+        **这是估算**：token 计数来自内核/站点的估算策略，不是精确值。
+        """
+        return None
+
     @abstractmethod
     async def set_model(self, provider: str, model_id: str) -> None:
         """切换当前模型（应用侧路由决策的执行点）。"""
+
+    async def reload_models(
+        self, env: dict[str, str], expected: tuple[tuple[str, str], ...]
+    ) -> None:
+        """热更新模型目录（可选能力）。
+
+        调用前应用已重写运行时的模型目录；``env`` 是需要同步进运行时进程的变量
+        （**含密钥**，值为空串表示删除），``expected`` 是更新后必须可用的
+        (provider, model)。核对不过抛错。默认不支持。
+        """
+        raise NotImplementedError("当前内核不支持热更新模型目录")
 
     @abstractmethod
     async def set_thinking_level(self, level: str) -> None:
@@ -161,6 +236,49 @@ class AgentKernel(ABC):
     @abstractmethod
     def set_permission_handler(self, handler: PermissionHandler | None) -> None:
         """设置权限裁决回调。未设置时实现必须默认拒绝（合同 §十一 GATE-04）。"""
+
+    def set_observation_handler(self, handler: Callable[[dict[str, Any]], None] | None) -> None:
+        """设置原始请求/响应观测回调（可选能力）。
+
+        默认空实现：不是所有内核都暴露 provider 级别的原始观测。
+        提供该能力（``FINAL_REQUEST_HOOK``）的实现应覆盖此方法。
+        """
+        return None
+
+    def runtime_instance_id(self) -> str:
+        """返回本次 Runtime 的实例标识。每次内核进程启动时分配新值。
+
+        用于区分"旧进程的迟到事件"与"新进程的有效事件"——
+        恢复场景中旧进程的事件不得污染新 Runtime 的状态。
+        不支持恢复的实现返回空字符串。
+        """
+        return ""
+
+    async def export_runtime_state(self) -> Any:
+        """导出当前 Runtime 的可移植快照（可选能力，``RUNTIME_RESTORE``）。
+
+        默认不支持。支持恢复的实现应覆盖此方法并返回
+        :class:`limbowave.domain.runtime_state.RuntimeStateSnapshot`。
+        """
+        return None
+
+    async def restore_runtime_state(self, snapshot: Any) -> Any:
+        """从快照恢复 Runtime 状态（可选能力）。
+
+        默认不支持。支持恢复的实现应覆盖此方法并返回
+        :class:`limbowave.domain.runtime_state.RuntimeRestoreResult`。
+
+        **恢复只物化会话文件与切换，不得触发任何 Provider 请求。**
+        """
+        return None
+
+    async def validate_runtime_state(self, expected: Any) -> Any:
+        """校验恢复后的状态与期望快照语义一致（可选能力）。
+
+        默认不支持。支持恢复的实现应覆盖此方法并返回
+        :class:`limbowave.domain.runtime_state.RuntimeValidationResult`。
+        """
+        return None
 
     @abstractmethod
     def events(self) -> AsyncIterator[KernelEvent]:

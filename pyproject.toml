@@ -15,6 +15,8 @@ dependencies = [
     "platformdirs>=4.2",
     "markdown-it-py>=3.0",
     "pygments>=2.17",
+    "Pillow>=10.0",
+    "pypinyin>=0.55.0",
 ]
 
 [dependency-groups]
@@ -24,6 +26,8 @@ dev = [
     "pytest-asyncio>=0.23",
     "ruff>=0.5",
     "mypy>=1.10",
+    "types-Pygments>=2.21",
+    "pyinstaller>=6.10",
 ]
 
 [build-system]

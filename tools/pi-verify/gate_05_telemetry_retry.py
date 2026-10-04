@@ -30,6 +30,7 @@ import tempfile
 import time
 import urllib.request
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from rpc_client import PiRpcClient, default_env, resolve_pi_command

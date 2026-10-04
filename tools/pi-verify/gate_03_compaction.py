@@ -17,6 +17,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from rpc_client import PiRpcClient, default_env, resolve_pi_command
@@ -116,7 +117,13 @@ def run_session(
     env_extra = {"GATE03_MODE": mode, "GATE03_LOG": str(ext_log)}
     client = PiRpcClient(argv, cwd=workdir, env=default_env(env_extra))
     client.start()
-    out: dict[str, Any] = {"hook": [], "compact_resp": None, "events": [], "before": None, "after": None}
+    out: dict[str, Any] = {
+        "hook": [],
+        "compact_resp": None,
+        "events": [],
+        "before": None,
+        "after": None,
+    }
     try:
         for p in prompts:
             client.request({"type": "prompt", "message": p}, timeout=30)

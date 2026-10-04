@@ -34,6 +34,7 @@ def test_default_pi_capabilities_match_gate_results() -> None:
         KernelCapability.TOOL_PREFLIGHT_HOOK,
         KernelCapability.INTERNAL_RETRY_DISABLE,
         KernelCapability.TELEMETRY_DISABLE,
+        KernelCapability.RUNTIME_RESTORE,
     }
     assert caps.capabilities == expected
     # 关键：按裁决 3 用 --no-session，不得声称持久化能力

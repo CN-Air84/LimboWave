@@ -36,6 +36,9 @@ class FakeKernel(AgentKernel):
     async def send_message(self, text: str, *, images: list[dict[str, Any]] | None = None) -> None:
         self.sent.append(text)
 
+    async def new_session(self) -> None:
+        pass
+
     async def abort(self) -> None:
         self.aborted = True
 
@@ -99,7 +102,11 @@ async def test_send_delegates_to_kernel() -> None:
     await controller.send("  你好  ")
 
     assert kernel.sent == ["你好"]
-    assert ("user", {"text": "你好"}) in events
+    # user 事件带 message_id（分支操作以消息为锚点）
+    user_events = [d for k, d in events if k == "user"]
+    assert len(user_events) == 1
+    assert user_events[0]["text"] == "你好"
+    assert user_events[0]["message_id"]
     assert controller.busy
 
 
@@ -214,3 +221,31 @@ async def test_permission_routes_to_app_handler() -> None:
     controller.set_permission_handler(_allow)
     assert kernel.permission_handler is not None
     assert await kernel.permission_handler("允许？", "read x") is True
+
+
+async def test_switch_conversation_without_restore_capability() -> None:
+    """不能恢复历史时必须拒绝，不能仅改定位后沿用旧上下文。"""
+
+    kernel = FakeKernel()  # 默认 capabilities 为空
+    controller = SessionController(kernel)
+
+    # 先聊一轮落库，再开新会话，再切回去
+    await controller.send("第一轮")
+    conv_id = controller.conversation_id
+    assert conv_id
+    kernel.emit("assistant_delta", {"text": "ACK"})
+    kernel.emit("run.settled", {})
+    await controller.wait_idle()
+
+    coordinator = controller.coordinator()
+    branch_id = coordinator.branch_id
+    assert branch_id
+    assert await controller.new_session()
+
+    assert not await controller.switch_conversation(conv_id, branch_id)
+    assert controller.conversation_id is None
+
+
+async def test_switch_conversation_rejects_unknown() -> None:
+    controller = SessionController(FakeKernel())
+    assert not await controller.switch_conversation("nope", "nope")

@@ -9,9 +9,12 @@
 from __future__ import annotations
 
 import enum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+if TYPE_CHECKING:
+    from limbowave.domain.retry import RetryPolicy
 
 
 class ProviderProtocol(enum.StrEnum):
@@ -21,6 +24,32 @@ class ProviderProtocol(enum.StrEnum):
     OPENAI_RESPONSES = "openai-responses"
     ANTHROPIC_MESSAGES = "anthropic-messages"
     GOOGLE_GENERATIVE_AI = "google-generative-ai"
+
+
+class RetryConfig(BaseModel):
+    """站点的超时与重试策略（§二.4 的站点预设字段 / §八.3 的配置来源）。
+
+    默认面向「偶尔抖一下的连接」：3 次尝试、1s 起、指数退避、上限 8s。
+    ``max_attempts=1`` 表示不重试。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    max_attempts: int = Field(default=3, ge=1, le=10)
+    base_delay_ms: int = Field(default=1000, ge=0, le=60_000)
+    max_delay_ms: int = Field(default=8000, ge=0, le=300_000)
+    multiplier: float = Field(default=2.0, ge=1.0, le=10.0)
+
+    def to_policy(self) -> RetryPolicy:
+        """转成领域规则用的策略对象。"""
+        from limbowave.domain.retry import RetryPolicy
+
+        return RetryPolicy(
+            max_attempts=self.max_attempts,
+            base_delay_ms=self.base_delay_ms,
+            max_delay_ms=self.max_delay_ms,
+            multiplier=self.multiplier,
+        )
 
 
 class EndpointConfig(BaseModel):
@@ -38,6 +67,17 @@ class EndpointConfig(BaseModel):
     headers: dict[str, str] = Field(default_factory=dict)
     # Pi 兼容开关，原样透传
     compat: dict[str, Any] = Field(default_factory=dict)
+    # 超时与连接重试策略（§二.4 / §八.3）：由站点预设控制，不是全局写死
+    retry: RetryConfig = Field(default_factory=RetryConfig)
+    # 单次请求超时（秒）。None = 交给内核默认值
+    timeout_seconds: int | None = Field(default=None, ge=1, le=3600)
+    # 参数白名单（§二.4）：只允许这些参数上线。空 = 不限制
+    param_whitelist: tuple[str, ...] = ()
+    # 参数删除规则（§二.4）：发送前一律去掉这些参数
+    strip_params: tuple[str, ...] = ()
+    # 站点优先级（§二.4）：数字越大越优先。**只用于给备用站点候选排序**——
+    # 逻辑模型的默认站点仍由 bindings 顺序与 default_binding 决定（§四.3）
+    priority: int = 0
 
     @field_validator("base_url")
     @classmethod
@@ -45,3 +85,11 @@ class EndpointConfig(BaseModel):
         if not (value.startswith("http://") or value.startswith("https://")):
             raise ValueError(f"base_url 必须是 http(s) URL：{value!r}")
         return value.rstrip("/")
+
+    @model_validator(mode="after")
+    def _rules_consistent(self) -> EndpointConfig:
+        """规则自洽性在**构造配置时**就校验——不要等发送时才炸（§二.4）。"""
+        from limbowave.domain.param_rules import validate_rules
+
+        validate_rules(whitelist=self.param_whitelist, strip=self.strip_params)
+        return self
