@@ -1,5 +1,11 @@
 # LimboWave / 灵波
 
+astra这写的什么玩意这是。等我重写。
+
+---
+
+
+
 Windows 优先、基于 PySide6 原生界面的桌面 Harness：日常聊天与 Agent 能力共用同一会话。
 
 Linux 初始适配已加入：原生 Bash/Sh、平台路径与打包分支；**尚待 Linux 实机验收**。
