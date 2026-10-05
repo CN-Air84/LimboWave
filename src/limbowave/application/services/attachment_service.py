@@ -52,7 +52,7 @@ class AttachmentService:
         documents: list[str] = []
         for attachment_id in attachment_ids:
             # 先试图片
-            image = next((a for a in self._images.list_all() if a.id == attachment_id), None)
+            image = self._images.get(attachment_id)
             if image is not None:
                 raw = self._images.read_bytes(image.id)  # 原图字节
                 images.append(

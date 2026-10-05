@@ -19,8 +19,8 @@ from __future__ import annotations
 
 from difflib import SequenceMatcher
 
-from PySide6.QtCore import QEvent, QObject, QStringListModel, Qt, Signal
-from PySide6.QtGui import QMouseEvent, QStandardItemModel
+from PySide6.QtCore import QEvent, QObject, QSize, QStringListModel, Qt, Signal
+from PySide6.QtGui import QDropEvent, QMouseEvent, QStandardItemModel
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -42,6 +42,7 @@ from limbowave.application.services.model_probe import ModelProbeResult
 from limbowave.application.services.routing_service import RoutingService
 from limbowave.application.services.settings_service import SettingsService
 from limbowave.domain.configuration import AppConfiguration
+from limbowave.domain.model_display import model_display_name, model_name_sort_key
 from limbowave.domain.model_matching import MatchPlan, match_rank, plan_for_logical
 from limbowave.domain.model_normalize import normalize_model_id
 from limbowave.domain.models import LogicalModel, ModelBinding
@@ -75,6 +76,45 @@ def _capabilities_text(binding: ModelBinding) -> str:
     if binding.supports_tools:
         caps.append("工具")
     return f"　[{' '.join(caps)}]" if caps else ""
+
+
+class _BindingPriorityList(QListWidget):
+    """只在 Qt 完成整次拖放后通知保存，避免 rowsMoved 中重建列表打断拖放。"""
+
+    order_changed = Signal()
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setObjectName("modelPriorityList")
+        self.setAccessibleName("实际模型优先级排序")
+        self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.setDragDropOverwriteMode(False)
+        self.setDropIndicatorShown(True)
+        self.setSpacing(4)
+        self.setMinimumHeight(240)
+        self.setToolTip("拖动整行调整优先级，松手即保存；也可选中后使用上移 / 下移按钮")
+
+    def endpoint_order(self) -> list[str]:
+        return [self.item(row).data(Qt.ItemDataRole.UserRole) for row in range(self.count())]
+
+    def dropEvent(self, event: QDropEvent) -> None:
+        before = self.endpoint_order()
+        super().dropEvent(event)
+        if self.endpoint_order() != before:
+            self.order_changed.emit()
+
+    def move_selected(self, offset: int) -> None:
+        row = self.currentRow()
+        target = row + offset
+        if row < 0 or not 0 <= target < self.count():
+            return
+        item = self.takeItem(row)
+        self.insertItem(target, item)
+        self.setCurrentItem(item)
+        self.order_changed.emit()
 
 
 class _TokenLimitCombo(QComboBox):
@@ -186,8 +226,11 @@ class LogicalModelsTab(QWidget):
         workspace_layout.addWidget(self._stack, 1)
         self._configuration_page = QWidget()
         self._binding_page = QWidget()
+        self._priority_page = QWidget()
         for title, page in (
-            ("逻辑模型设置", self._configuration_page), ("模型绑定", self._binding_page)
+            ("逻辑模型设置", self._configuration_page),
+            ("模型绑定", self._binding_page),
+            ("优先级排序", self._priority_page),
         ):
             page.setObjectName("modelSubtabPage")
             self._subtabs.addTab(title)
@@ -261,13 +304,12 @@ class LogicalModelsTab(QWidget):
         binding_layout.addWidget(QLabel("绑定的实际模型（★ 为默认站点，每个站点至多一个）："))
         self._bindings = QListWidget()
         self._bindings.setObjectName("modelBindingsList")
-        self._bindings.setMinimumHeight(120)
-        self._bindings.setMaximumHeight(160)
+        self._bindings.setMinimumHeight(240)
         self._bindings.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self._bindings.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self._bindings.setToolTip("点击一行选择实际模型，再设置默认站点、解除绑定或检测能力")
+        self._bindings.setToolTip("点击一行可解除绑定或检测能力；默认站点由「优先级排序」首位决定")
         self._bindings.currentItemChanged.connect(self._on_binding_selected)
-        binding_layout.addWidget(self._bindings)
+        binding_layout.addWidget(self._bindings, 1)
         pair_row = QHBoxLayout()
         self._pair_site_combo = QComboBox()
         self._pair_site_combo.setMaxVisibleItems(16)
@@ -285,9 +327,6 @@ class LogicalModelsTab(QWidget):
         pair_row.addWidget(self._pair_btn)
         binding_layout.addLayout(pair_row)
         bind_ops = QHBoxLayout()
-        self._default_binding_btn = QPushButton("设为默认站点")
-        self._default_binding_btn.clicked.connect(self._on_default_binding)
-        bind_ops.addWidget(self._default_binding_btn)
         self._unbind_btn = QPushButton("解除绑定")
         self._unbind_btn.clicked.connect(self._on_unbind)
         bind_ops.addWidget(self._unbind_btn)
@@ -329,11 +368,100 @@ class LogicalModelsTab(QWidget):
         self._preview.setWordWrap(True)
         binding_layout.addWidget(self._preview)
 
-        binding_layout.addStretch(1)
+        self._build_priority_page()
         splitter.addWidget(right)
         splitter.setStretchFactor(1, 1)
         splitter.setSizes([230, 520])
         root.addWidget(splitter)
+
+    def _build_priority_page(self) -> None:
+        layout = QVBoxLayout(self._priority_page)
+        layout.setContentsMargins(18, 14, 18, 18)
+        layout.setSpacing(10)
+        layout.addWidget(QLabel("实际模型优先级"))
+        hint = QLabel(
+            "拖动调整顺序，越靠上越优先，松手即保存；仅影响当前逻辑模型。\n"
+            "★ 排在第一位的实际模型即默认站点，其余按顺序作为备用；"
+            "失败时不会自动跨站重试。"
+        )
+        hint.setProperty("hint", True)
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        self._priority_list = _BindingPriorityList()
+        self._priority_list.order_changed.connect(self._on_priority_reordered)
+        self._priority_list.currentRowChanged.connect(self._refresh_priority_controls)
+        layout.addWidget(self._priority_list, 1)
+        operations = QHBoxLayout()
+        self._priority_up_btn = QPushButton("上移")
+        self._priority_up_btn.setAccessibleName("上移选中的实际模型")
+        self._priority_up_btn.clicked.connect(lambda: self._priority_list.move_selected(-1))
+        operations.addWidget(self._priority_up_btn)
+        self._priority_down_btn = QPushButton("下移")
+        self._priority_down_btn.setAccessibleName("下移选中的实际模型")
+        self._priority_down_btn.clicked.connect(lambda: self._priority_list.move_selected(1))
+        operations.addWidget(self._priority_down_btn)
+        operations.addStretch(1)
+        layout.addLayout(operations)
+        self._priority_status = QLabel()
+        self._priority_status.setProperty("hint", True)
+        self._priority_status.setWordWrap(True)
+        layout.addWidget(self._priority_status)
+
+    def _show_priority(self, model: LogicalModel | None) -> None:
+        current = self._priority_list.currentItem()
+        selected = current.data(Qt.ItemDataRole.UserRole) if current is not None else None
+        self._priority_list.blockSignals(True)
+        self._priority_list.clear()
+        if model is not None:
+            for index, binding in enumerate(model.bindings):
+                default = "  ★ 默认站点" if index == 0 else ""
+                item = QListWidgetItem(
+                    f"{index + 1:02d}  ::  {self._endpoint_name(binding.endpoint_id)}{default}\n"
+                    f"         {binding.model_id}"
+                )
+                item.setData(Qt.ItemDataRole.UserRole, binding.endpoint_id)
+                item.setToolTip(item.text())
+                item.setSizeHint(QSize(0, max(56, self.fontMetrics().height() * 2 + 16)))
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsDropEnabled)
+                self._priority_list.addItem(item)
+                if binding.endpoint_id == selected:
+                    self._priority_list.setCurrentItem(item)
+        if self._priority_list.currentRow() < 0 and self._priority_list.count():
+            self._priority_list.setCurrentRow(0)
+        self._priority_list.setEnabled(model is not None and bool(model.bindings))
+        self._priority_list.blockSignals(False)
+        self._refresh_priority_controls()
+        if model is None:
+            self._priority_status.setText("请先在左侧选择一个已保存的逻辑模型。")
+        elif not model.bindings:
+            self._priority_status.setText("尚未绑定实际模型，请先到「模型绑定」页添加。")
+        elif len(model.bindings) == 1:
+            self._priority_status.setText("当前只有一个实际模型，无需排序。")
+        else:
+            self._priority_status.setText(f"共 {len(model.bindings)} 个实际模型 · 拖动后自动保存")
+
+    def _refresh_priority_controls(self, _row: int = -1) -> None:
+        row = self._priority_list.currentRow()
+        self._priority_up_btn.setEnabled(row > 0)
+        self._priority_down_btn.setEnabled(0 <= row < self._priority_list.count() - 1)
+
+    def _on_priority_reordered(self) -> None:
+        model = self._current_model()
+        if model is None:
+            return
+        try:
+            self._settings.reorder_bindings(model.id, self._priority_list.endpoint_order())
+        except (ValueError, OSError) as exc:
+            # 保存失败不保留虚假的 UI 顺序；读取失败时仍能回到上次加载的配置。
+            try:
+                self.reload()
+            except (ValueError, OSError):
+                self._refresh_detail()
+            self._priority_status.setText("排序未保存，已恢复原顺序。")
+            _show_error(self, exc)
+            return
+        self.reload()
+        self._priority_status.setText("优先级顺序已保存 · 第一位即默认站点")
 
     # ---------- 数据 ----------
 
@@ -343,7 +471,7 @@ class LogicalModelsTab(QWidget):
         selected = self._selected_id()
         self._list.blockSignals(True)
         self._list.clear()
-        for model in self._config.models:
+        for model in sorted(self._config.models, key=lambda model: model_name_sort_key(model.name)):
             mark = "★ " if model.id == self._config.default_model_id else ""
             unbound = "　· 未绑定" if not model.bindings else ""
             item = QListWidgetItem(model.name)
@@ -396,7 +524,7 @@ class LogicalModelsTab(QWidget):
             return
         direction = (
             -1
-            if previous is not None
+            if previous is not None and current is not None
             and self._list.row(current) < self._list.row(previous)
             else 1
         )
@@ -436,10 +564,10 @@ class LogicalModelsTab(QWidget):
         """绑定列表、配对候选、路由预览随当前模型刷新（不动表单字段）。"""
         model = self._current_model()
         self._show_bindings(model)
+        self._show_priority(model)
         self._fill_pair_combo(model)
         self._refresh_preview(model)
         for widget in (
-            self._default_binding_btn,
             self._unbind_btn,
             self._auto_match_btn,
             self._probe_btn,
@@ -452,7 +580,7 @@ class LogicalModelsTab(QWidget):
         self._bindings.clear()
         if model is not None:
             for index, binding in enumerate(model.bindings):
-                star = "★ " if index == model.default_binding else ""
+                star = "★ " if index == 0 else ""
                 auto = "（自动匹配）" if binding.auto_matched else ""
                 item = QListWidgetItem(
                     f"{star}{self._endpoint_name(binding.endpoint_id)} · {binding.model_id}"
@@ -597,7 +725,7 @@ class LogicalModelsTab(QWidget):
         current = self._name.text()
         if current.strip() and current != self._auto_name:
             return
-        name = self._id.text().strip().replace("-", " ").title()
+        name = model_display_name(self._id.text())
         self._auto_name = name or None
         self._name.setText(name)
 
@@ -670,7 +798,6 @@ class LogicalModelsTab(QWidget):
                         id=fresh.id,
                         name=name,
                         bindings=fresh.bindings,
-                        default_binding=fresh.default_binding,
                         context_window=context_window,
                         max_tokens=max_tokens,
                         supports_images=supports_images,
@@ -762,18 +889,6 @@ class LogicalModelsTab(QWidget):
             return
         try:
             self._settings.unbind_endpoint(model.id, endpoint_id)
-        except ValueError as exc:
-            _show_error(self, exc)
-            return
-        self.reload()
-
-    def _on_default_binding(self) -> None:
-        model = self._current_model()
-        row = self._bindings.currentRow()
-        if model is None or row < 0:
-            return
-        try:
-            self._settings.set_default_binding(model.id, row)
         except ValueError as exc:
             _show_error(self, exc)
             return

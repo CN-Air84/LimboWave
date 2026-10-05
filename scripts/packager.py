@@ -75,9 +75,11 @@ def write_entry_script(work_dir: Path) -> Path:
     entry = work_dir / "entry_app.py"
     entry.write_text(
         '"""PyInstaller 入口垫片（打包器生成）。"""\n'
+        "from multiprocessing import freeze_support\n"
         "from limbowave.cli import main\n"
         "\n"
         'if __name__ == "__main__":\n'
+        "    freeze_support()\n"
         "    raise SystemExit(main())\n",
         encoding="utf-8",
     )

@@ -16,6 +16,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from PySide6.QtWidgets import (
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QFileDialog,
@@ -23,7 +24,6 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
-    QRadioButton,
     QScrollArea,
     QVBoxLayout,
     QWidget,
@@ -95,11 +95,12 @@ class ExportPanel(FloatingPanel):
         rows: list[tuple[str, str, list[tuple[str, str]], datetime]],
         *,
         default_dir: str = "",
+        current_branch_id: str | None = None,
         on_export: Callable[[list[str], list[str], str, Path], None],
     ) -> None:
         """``rows``：(conversation_id, title, branches, last_active)。
 
-        ``on_export(branch_ids, branch_labels, fmt, directory)`` 由上层执行写出，
+        ``on_export(branch_ids, branch_labels, fmt, target)`` 由上层执行写出，
         结果反馈也由上层负责（面板在点击后立即关闭）。
         """
         super().__init__(parent, "导出", width=470)
@@ -134,7 +135,12 @@ class ExportPanel(FloatingPanel):
         rows_layout.setSpacing(2)
         self._rows: list[_ConversationRow] = []
         for _cid, title, branches, last_active in rows:
+            if not branches:
+                continue
             row = _ConversationRow(title, branches, last_active)
+            row.checkbox.setChecked(any(bid == current_branch_id for bid, _ in branches))
+            for bid, check in row._branch_checks:
+                check.setChecked(bid == current_branch_id)
             self._rows.append(row)
             rows_layout.addWidget(row)
         rows_layout.addStretch(1)
@@ -149,14 +155,21 @@ class ExportPanel(FloatingPanel):
         # ---- 格式 ----
         fmt_row = QHBoxLayout()
         fmt_row.addWidget(QLabel("格式"))
-        self._fmt: dict[str, QRadioButton] = {}
+        # 复用全局 checkbox 绘制与动画；格式仍然保持互斥单选。
+        self._format_group = QButtonGroup(self)
+        self._format_group.setExclusive(True)
+        self._fmt: dict[str, QCheckBox] = {}
         for fmt in Formats:
-            button = QRadioButton(fmt.upper())
-            button.setChecked(fmt == "md")
+            button = QCheckBox(fmt.upper())
+            self._format_group.addButton(button)
+            button.setChecked(fmt == "html")
             self._fmt[fmt] = button
             fmt_row.addWidget(button)
         fmt_row.addStretch(1)
         root.addLayout(fmt_row)
+        hint = QLabel("多选时每个分支独立保存为编号文件；HTML 内嵌图片，其他格式仅含文本。")
+        hint.setWordWrap(True)
+        root.addWidget(hint)
 
         # ---- 文件名 ----
         name_row = QHBoxLayout()
@@ -175,6 +188,10 @@ class ExportPanel(FloatingPanel):
         browse.clicked.connect(self._browse_dir)
         dir_row.addWidget(browse)
         root.addLayout(dir_row)
+
+        self._error = QLabel("")
+        self._error.setWordWrap(True)
+        root.addWidget(self._error)
 
         # ---- 动作 ----
         actions = QHBoxLayout()
@@ -226,9 +243,22 @@ class ExportPanel(FloatingPanel):
             branch_ids.extend(ids)
             labels.extend(row.selected_labels())
         if not branch_ids:
+            self._error.setText("请至少选择一个分支。")
             return
         fmt = next((key for key, box in self._fmt.items() if box.isChecked()), "md")
         directory = self._dir.text().strip() or str(Path.home())
         name = self._name.text().strip() or self._default_name()
+        if (
+            any(char in name for char in '<>:"/\\|?*')
+            or any(ord(char) < 32 for char in name)
+            or name.endswith((".", " "))
+            or name.split(".")[0].upper() in {
+                "CON", "PRN", "AUX", "NUL",
+                *(f"COM{i}" for i in range(1, 10)),
+                *(f"LPT{i}" for i in range(1, 10)),
+            }
+        ):
+            self._error.setText("请输入有效的文件名，不要包含路径或特殊字符。")
+            return
         self.close_panel()
         self._on_export(branch_ids, labels, fmt, Path(directory) / name)

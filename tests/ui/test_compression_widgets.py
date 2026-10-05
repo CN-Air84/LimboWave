@@ -120,6 +120,7 @@ def test_preview_shows_summary_and_meta(qtbot: QtBot, service: CompressionServic
     version_id = _make_preview_version(service)
     dialog = CompressionPreviewDialog(service, version_id)
     qtbot.addWidget(dialog)
+    qtbot.waitUntil(lambda: dialog._versions.count() > 0)
 
     assert dialog._summary.toPlainText() == "生成摘要"
     assert "42000" in dialog._meta.text()
@@ -135,9 +136,11 @@ def test_preview_accept_stores_edit_and_activates(
     version_id = _make_preview_version(service)
     dialog = CompressionPreviewDialog(service, version_id)
     qtbot.addWidget(dialog)
+    qtbot.waitUntil(lambda: dialog._versions.count() > 0)
 
     dialog._summary.setPlainText("用户改过的摘要")
-    dialog._on_accept()
+    with qtbot.waitSignal(dialog.accepted):
+        dialog._on_accept()
 
     version = service.get(version_id)
     assert version is not None
@@ -157,6 +160,7 @@ def test_preview_failed_version_shows_error_not_acceptable(
     service.record_failure(v.id, "模型超时")
     dialog = CompressionPreviewDialog(service, v.id)
     qtbot.addWidget(dialog)
+    qtbot.waitUntil(lambda: dialog._versions.count() > 0)
 
     assert "模型超时" in dialog._meta.text()
     assert not dialog._accept_btn.isEnabled()
@@ -173,6 +177,7 @@ def test_preview_version_history_lists_all(qtbot: QtBot, service: CompressionSer
 
     dialog = CompressionPreviewDialog(service, v1)
     qtbot.addWidget(dialog)
+    qtbot.waitUntil(lambda: dialog._versions.count() > 0)
     assert dialog._versions.count() == 2
     texts = [dialog._versions.item(i).text() for i in range(2)]
     assert any("失败" in t for t in texts)
@@ -185,9 +190,11 @@ def test_preview_rollback_clears_active(qtbot: QtBot, service: CompressionServic
 
     dialog = CompressionPreviewDialog(service, version_id)
     qtbot.addWidget(dialog)
+    qtbot.waitUntil(lambda: dialog._versions.count() > 0)
     rolled: list[str] = []
     dialog.rolled_back.connect(rolled.append)
-    dialog._on_rollback()
+    with qtbot.waitSignal(dialog.rolled_back):
+        dialog._on_rollback()
 
     assert service.get_active("b1") is None
     assert rolled == ["b1"]

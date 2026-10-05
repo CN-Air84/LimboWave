@@ -6,6 +6,7 @@ import json
 from collections.abc import Callable
 from dataclasses import asdict
 from datetime import UTC, datetime
+from threading import Lock
 from uuid import uuid4
 
 from limbowave.application.repositories import UnitOfWork, UnitOfWorkFactory
@@ -84,6 +85,7 @@ class MemoryService:
         self._uow_factory = uow_factory
         self._configuration = configuration
         self._approvals: dict[tuple[str, str], tuple[MemoryRunContext, str]] = {}
+        self._approval_lock = Lock()
 
     def settings(self) -> MemorySettings:
         return self._configuration.load().memory
@@ -218,10 +220,12 @@ class MemoryService:
             uow.commit()
 
     def approve(self, context: MemoryRunContext, call_id: str, content: str) -> None:
-        self._approvals[(context.run_id, call_id)] = (context, self.validate_content(content))
+        with self._approval_lock:
+            self._approvals[(context.run_id, call_id)] = (context, self.validate_content(content))
 
     def clear_approvals(self) -> None:
-        self._approvals.clear()
+        with self._approval_lock:
+            self._approvals.clear()
 
     def add_from_model(
         self,
@@ -242,7 +246,8 @@ class MemoryService:
                 if item.content != content:
                     raise ValueError("重复工具调用的正文不一致")
                 return item
-            approval = self._approvals.pop((context.run_id, call_id), None)
+            with self._approval_lock:
+                approval = self._approvals.pop((context.run_id, call_id), None)
             if approval != (context, content):
                 raise ValueError("记忆写入缺少有效的一次性授权")
             items = _items(uow.memories.get(_key(context.branch_id)))
@@ -256,6 +261,8 @@ class MemoryService:
                     context.branch_id,
                 )
             )
+            if not is_active(context):
+                raise ValueError("记忆工具所属运行已失效")
             uow.commit()
             return item
 

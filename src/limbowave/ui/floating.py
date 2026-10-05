@@ -30,10 +30,11 @@ from PySide6.QtCore import (
     QParallelAnimationGroup,
     QPoint,
     QPropertyAnimation,
+    QRectF,
     Qt,
     Signal,
 )
-from PySide6.QtGui import QKeyEvent
+from PySide6.QtGui import QColor, QKeyEvent, QPainter, QPaintEvent, QPen
 from PySide6.QtWidgets import (
     QApplication,
     QFrame,
@@ -47,8 +48,49 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from limbowave.ui import theme
+from limbowave.ui import soft_shadow, theme
 from limbowave.ui.popup_material import install_popup_material
+
+
+class _PanelShadow(QWidget):
+    """Sibling canvas: the shadow must extend outside the panel, without replacing its fade."""
+
+    def __init__(self, panel: FloatingPanel) -> None:
+        super().__init__(panel.parentWidget())
+        self._panel = panel
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
+        self.setStyleSheet("background: transparent;")
+        self.hide()
+        panel.installEventFilter(self)
+        panel._opacity.opacityChanged.connect(self._fade)
+        panel.destroyed.connect(self.deleteLater)
+
+    def _fade(self, opacity: float) -> None:
+        self.update()
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        kind = event.type()
+        if kind in (
+            QEvent.Type.Move, QEvent.Type.Resize, QEvent.Type.Show, QEvent.Type.ZOrderChange,
+        ):
+            self.setGeometry(soft_shadow.shadow_bounds(self._panel.geometry()))
+            if self._panel.isVisible():
+                self.show()
+                self.stackUnder(self._panel)
+            self.update()
+        elif kind == QEvent.Type.Hide:
+            self.hide()
+        elif kind == QEvent.Type.ParentChange:
+            self.setParent(self._panel.parentWidget())
+        return False
+
+    def paintEvent(self, event: QPaintEvent) -> None:
+        painter = QPainter(self)
+        painter.setOpacity(self._panel._opacity.opacity())
+        body = QRectF(self._panel.geometry().translated(-self.pos()))
+        soft_shadow.paint_soft_shadow(painter, body, 10, QRectF(self.rect()))
+        painter.end()
 
 
 class FloatingPanel(QFrame):
@@ -72,7 +114,7 @@ class FloatingPanel(QFrame):
         self.setWindowFlags(Qt.WindowType.Widget)
         self.setStyleSheet(
             f"#floatingPanel {{ background: {theme.BG_SURFACE};"
-            f" border: 1px solid {theme.BORDER}; border-radius: 10px; }}"
+            " border: 1px solid transparent; border-radius: 10px; }"
             "QLabel { background: transparent; border: none; }"
             "QLineEdit, QPlainTextEdit, QComboBox, QSpinBox, QDateEdit"
             " { background: " + theme.BG_ELEVATED + "; }"
@@ -107,6 +149,20 @@ class FloatingPanel(QFrame):
         self.content_layout.setSpacing(8)
         root.addLayout(self.content_layout, 1)
         install_popup_material(self, kind="card", radius=10, selector="QFrame#floatingPanel")
+        self._shadow = _PanelShadow(self)
+
+    def paintEvent(self, event: QPaintEvent) -> None:
+        super().paintEvent(event)
+        # Material sampling can cover the QSS frame; stroke last so the outline
+        # stays visible over wallpaper and follows live theme changes.
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        border = QColor(theme.TEXT_SECONDARY)
+        border.setAlphaF(0.65)
+        painter.setPen(QPen(border, 1.0))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRoundedRect(QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5), 9.5, 9.5)
+        painter.end()
 
     # ---------- 生命周期 ----------
 

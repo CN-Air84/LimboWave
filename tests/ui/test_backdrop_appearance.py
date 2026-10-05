@@ -495,6 +495,7 @@ def test_background_import_is_managed_and_previewed(
         appearance_editor.QFileDialog, "getOpenFileName", lambda *args: (str(source), "")
     )
     editor._import_background()
+    qtbot.waitUntil(editor.isEnabled)
     assert editor.draft.background.asset.startswith("assets/")
     assert service.resolve_asset(editor.draft.background.asset) is not None
     editor._remove_background()
@@ -540,6 +541,7 @@ def test_imported_font_is_managed_and_survives_reload(
         appearance_editor.QFileDialog, "getOpenFileName", lambda *args: (str(source), "")
     )
     editor._import_font()
+    qtbot.waitUntil(editor.isEnabled)
     saved = preferences.load()
     assert saved.font_family in family_for_file(saved.font_file)
     assert Path(saved.font_file).parent == preferences.path.parent / "fonts"

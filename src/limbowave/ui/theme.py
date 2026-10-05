@@ -691,6 +691,7 @@ QFrame#actualModelRow {{
 #actualModelRow QLabel, #actualModelRow QCheckBox {{ background: transparent; border: none; }}
 #actualModelsTitle {{ font-size: {FS_TITLE}px; font-weight: 600; border: none; }}
 #actualModelName {{ font-weight: 600; }}
+QPushButton#actualModelAdd {{ margin: 0px; padding: 7px 0px; }}
 QCheckBox[capabilityTone="muted"] {{ color: {TEXT_SECONDARY}; }}
 QCheckBox[capabilityTone="success"] {{ color: {status_text_color('success')}; }}
 QCheckBox[capabilityTone="warning"] {{ color: {status_text_color('warning')}; }}

@@ -312,3 +312,22 @@ def test_retry_migration_preserves_existing_runs(vault_key, db_path: Path) -> No
     assert run.retry_of_message_id is None
     assert run.status is RunStatus.FAILED
     assert message.content == "原问题"
+
+
+def test_migration_keeps_existing_forks_exclusive(db_path: Path) -> None:
+    """升级时不能把原有编辑/重生成分支误改成保留起点。"""
+    conn = open_connection(db_path)
+    migrate(conn, target=10)
+    with conn:
+        conn.execute(
+            "INSERT INTO conversations (id, title_enc, created_at) VALUES (?, ?, ?)",
+            ("c", "encrypted", "2026-10-04T00:00:00+00:00"),
+        )
+        conn.execute(
+            "INSERT INTO branches (id, conversation_id, created_at) VALUES (?, ?, ?)",
+            ("b", "c", "2026-10-04T00:00:00+00:00"),
+        )
+    migrate(conn)
+    stored = conn.execute("SELECT include_fork_message FROM branches WHERE id = 'b'").fetchone()
+    assert stored == (0,)
+    conn.close()

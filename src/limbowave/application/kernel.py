@@ -139,6 +139,8 @@ class KernelSetup:
     # 站点-模型级能力声明（§二.4 模型级覆盖）：绑定上的默认思考强度与工具能力
     default_thinking_level: str | None = None
     thinking_level_locked: bool = False
+    thinking_trial_id: str | None = None
+    runtime_thinking_levels: tuple[str, ...] | None = None
     available_thinking_levels: tuple[str, ...] = ()
     supports_thinking: bool | None = None
     supports_tools: bool = False
@@ -174,6 +176,11 @@ class AgentKernel(ABC):
         """可选的独立记忆上下文通道；不支持的内核不得污染用户原文。"""
         if context.get("global") or context.get("session"):
             raise NotImplementedError("当前内核不支持记忆上下文")
+
+    async def set_attachment_context(self, context: dict[str, object]) -> None:
+        """Sync durable text-attachment metadata separately from compactable messages."""
+        if context.get("documents"):
+            raise NotImplementedError("当前内核不支持持久附件上下文")
 
     def create_isolated(self) -> AgentKernel | None:
         """创建一个不共享会话上下文的临时内核（可选能力）。
@@ -212,6 +219,10 @@ class AgentKernel(ABC):
         (provider, model)。核对不过抛错。默认不支持。
         """
         raise NotImplementedError("当前内核不支持热更新模型目录")
+
+    async def get_available_thinking_levels(self) -> tuple[str, ...] | None:
+        """当前运行时接受的等级；None 表示尚未获得可靠结果。"""
+        return None
 
     @abstractmethod
     async def set_thinking_level(self, level: str) -> None:

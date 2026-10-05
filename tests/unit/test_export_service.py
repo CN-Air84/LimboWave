@@ -282,3 +282,74 @@ def test_code_blocks_are_highlighted_inline(seeded, tmp_path: Path) -> None:
     assert '<span style="color: #' in page  # 内联着色
     assert "<style>" in page  # 页面样式也是内联的
     assert 'rel="stylesheet"' not in page  # 没有外部样式表
+
+@pytest.mark.parametrize("fmt", ["html", "md", "txt", "json"])
+def test_export_selection_deduplicates_branches(seeded, tmp_path: Path, fmt: str) -> None:
+    export, _, _ = seeded
+    paths = export.export_selection(["b1", "b1"], fmt, tmp_path / f"single.{fmt}")
+    assert paths == [tmp_path / f"single.{fmt}"]
+    assert paths[0].read_text(encoding="utf-8")
+
+
+def test_export_selection_refuses_overwrite(seeded, tmp_path: Path) -> None:
+    export, _, _ = seeded
+    target = tmp_path / "existing.html"
+    target.write_text("keep me", encoding="utf-8")
+    with pytest.raises(FileExistsError):
+        export.export_selection(["b1"], "html", target)
+    assert target.read_text(encoding="utf-8") == "keep me"
+
+
+def test_export_selection_invalid_branch_writes_nothing(seeded, tmp_path: Path) -> None:
+    export, _, _ = seeded
+    with pytest.raises(ValueError):
+        export.export_selection(["b1", "missing"], "html", tmp_path / "batch")
+    assert not list(tmp_path.glob("batch*"))
+
+
+@pytest.mark.parametrize("fmt", ["html", "md", "txt", "json"])
+def test_export_selection_writes_every_branch(seeded, tmp_path: Path, fmt: str) -> None:
+    export, _, _ = seeded
+    paths = export.export_selection(["b1", "b2"], fmt, tmp_path / "batch")
+    assert [path.name for path in paths] == [f"batch-001.{fmt}", f"batch-002.{fmt}"]
+    assert "分叉分支上的问题" not in paths[0].read_text(encoding="utf-8")
+    assert "分叉分支上的问题" in paths[1].read_text(encoding="utf-8")
+
+
+def test_export_selection_batch_conflict_writes_nothing(seeded, tmp_path: Path) -> None:
+    export, _, _ = seeded
+    (tmp_path / "batch-002.html").write_text("original", encoding="utf-8")
+    with pytest.raises(FileExistsError):
+        export.export_selection(["b1", "b2"], "html", tmp_path / "batch")
+    assert not (tmp_path / "batch-001.html").exists()
+    assert (tmp_path / "batch-002.html").read_text(encoding="utf-8") == "original"
+
+
+def test_export_uses_display_names_and_escapes_them(seeded, tmp_path: Path) -> None:
+    _, factory, _ = seeded
+    export = ExportService(
+        factory, None,
+        model_names={"deepseek-chat": "深度求索 <对话>"},
+        endpoint_names={"relay-a": "中转站 & A"},
+    )
+    page = export.export_branch("b1", tmp_path / "names.html").path.read_text(encoding="utf-8")
+    assert "深度求索 &lt;对话&gt;" in page
+    assert "中转站 &amp; A" in page
+    assert "deepseek-chat" not in page
+    assert "relay-a" not in page
+
+
+def test_export_routing_reason_resolves_names_without_partial_or_recursive_replacement(seeded):
+    _, factory, _ = seeded
+    export = ExportService(
+        factory, None,
+        model_names={"deepseek-chat": "深度求索"},
+        endpoint_names={"relay-a": "relay-b", "relay-b": "备用站"},
+    )
+    assert export._display_reason("逻辑模型 deepseek-chat 的默认绑定") == (
+        "逻辑模型 深度求索 的默认绑定"
+    )
+    assert export._display_reason("会话级站点覆盖（配置默认是 relay-a）") == (
+        "会话级站点覆盖（配置默认是 relay-b）"
+    )
+    assert export._display_reason("relay-a-other / relay-b") == "relay-a-other / 备用站"

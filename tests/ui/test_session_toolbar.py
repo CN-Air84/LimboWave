@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import pytest
 from PySide6.QtCore import QPoint, Qt
 from PySide6.QtGui import QStandardItemModel
 from PySide6.QtTest import QTest
@@ -397,11 +398,13 @@ def test_detected_thinking_capability_controls_selector(qtbot: QtBot) -> None:
     bar.set_session_available(True)
 
     bar.set_thinking_capability(False)
-    assert not bar._thinking.isEnabled()
+    assert bar._thinking.isEnabled()  # 仍可展开并长按不可用项
+    assert not bar._thinking.model().item(4).isEnabled()
     assert "不支持思考" in bar._thinking.toolTip()
 
     bar.set_thinking_capability(True, locked_level="xhigh")
-    assert not bar._thinking.isEnabled()
+    assert bar._thinking.isEnabled()
+    assert not bar._thinking.model().item(4).isEnabled()
     assert bar._thinking.currentText() == "xhigh"
     assert "不可切换" in bar._thinking.toolTip()
 
@@ -813,3 +816,82 @@ def test_buttons_render_pixels_after_notice_animation(qtbot: QtBot) -> None:
         panel.close_panel()
         qtbot.wait(250)
         assert all_buttons_visible()
+
+
+def test_export_button_emits_request(qtbot: QtBot) -> None:
+    bar = SessionToolbar()
+    qtbot.addWidget(bar)
+    button = next(b for b in bar.findChildren(QPushButton) if b.text() == "导出会话")
+    with qtbot.waitSignal(bar.export_requested):
+        button.click()
+
+
+def test_unavailable_thinking_levels_have_gray_overlay(qtbot: QtBot) -> None:
+    from PySide6.QtCore import QRect
+    from PySide6.QtGui import QColor, QImage, QPainter
+    from PySide6.QtWidgets import QStyle, QStyledItemDelegate, QStyleOptionViewItem
+
+    bar = SessionToolbar()
+    qtbot.addWidget(bar)
+    bar.set_session_available(True)
+    bar.set_thinking_capability(True, available_levels=("low", "high"))
+    combo = bar._thinking
+    option = QStyleOptionViewItem()
+    option.rect = QRect(0, 0, 160, 30)
+    option.state = QStyle.StateFlag.State_Active
+    baseline = QStyledItemDelegate(combo)
+
+    def render(delegate, row):
+        image = QImage(160, 30, QImage.Format.Format_ARGB32)
+        image.fill(QColor(40, 40, 40))
+        painter = QPainter(image)
+        delegate.paint(painter, option, combo.model().index(row, 0))
+        painter.end()
+        return image
+
+    # 不可用行覆盖浅灰蒙版；可用行保持原绘制结果。
+    assert render(combo.itemDelegate(), 1) != render(baseline, 1)
+    assert render(combo.itemDelegate(), 2) == render(baseline, 2)
+    assert "按住 3 秒" in combo.itemData(1, Qt.ItemDataRole.ToolTipRole)
+    bar.set_thinking_capability(True, available_levels=("minimal", "low", "high"))
+    assert render(combo.itemDelegate(), 1) == render(baseline, 1)
+    assert not combo.itemData(1, Qt.ItemDataRole.ToolTipRole)
+
+
+def test_keyboard_skips_unavailable_thinking_levels(qtbot: QtBot) -> None:
+    bar = SessionToolbar()
+    qtbot.addWidget(bar)
+    bar.set_session_available(True)
+    bar.set_thinking_capability(True, available_levels=("low", "high"))
+    bar.set_thinking_level("low")
+    fired = []
+    bar.thinking_level_changed.connect(fired.append)
+    qtbot.keyClick(bar._thinking, Qt.Key.Key_Down)
+    assert bar._thinking.currentText() == "high"
+    assert fired == ["high"]
+
+
+@pytest.mark.parametrize(
+    ("declared", "runtime", "expected"),
+    [
+        ((), ("off",), ("off",)),
+        ((), ("off", "minimal", "low", "medium", "high"),
+         ("off", "minimal", "low", "medium", "high")),
+        (("low", "high", "max"), ("off", "low", "high", "max"),
+         ("off", "low", "high", "max")),
+        (("low", "high", "max"), ("off", "minimal", "low", "medium", "high"),
+         ("off", "low", "high")),
+    ],
+)
+def test_thinking_choices_intersect_runtime_capabilities(qtbot, declared, runtime, expected):
+    bar = SessionToolbar()
+    qtbot.addWidget(bar)
+    bar.set_session_available(True)
+    bar.set_thinking_capability(None, available_levels=declared, runtime_levels=runtime)
+    model = bar._thinking.model()
+    assert tuple(
+        level for i, level in enumerate(THINKING_LEVELS) if model.item(i).isEnabled()
+    ) == expected
+    # 切换到另一模型时，旧运行时范围不能残留。
+    bar.set_thinking_capability(True, runtime_levels=("off", "low"))
+    assert not model.item(THINKING_LEVELS.index("high")).isEnabled()

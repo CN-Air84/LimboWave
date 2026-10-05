@@ -36,7 +36,6 @@ def _config() -> AppConfiguration:
                     ModelBinding(endpoint_id="relay-a", model_id="deepseek-chat"),
                     ModelBinding(endpoint_id="relay-b", model_id="deepseek-chat"),
                 ],
-                default_binding=0,
             ),
             LogicalModel(
                 id="kimi",
@@ -48,7 +47,7 @@ def _config() -> AppConfiguration:
     )
 
 
-def test_route_default_picks_default_binding() -> None:
+def test_route_default_picks_highest_priority_binding() -> None:
     decision = RoutingService(_config()).route()
     assert decision.model.id == "deepseek-chat"
     assert decision.endpoint.id == "relay-a"
@@ -83,6 +82,6 @@ def test_route_no_models_raises() -> None:
 def test_no_silent_cross_endpoint_failover() -> None:
     """路由永远落在默认绑定；不存在"失败后换站"的隐式路径。"""
     decision = RoutingService(_config()).route("deepseek-chat")
-    # 即便存在第二个绑定，默认也只选 default_binding=0 的那个
+    # 即便存在第二个绑定，默认也只选优先级最高的第一条
     assert decision.binding.endpoint_id == "relay-a"
     assert decision.binding is decision.model.bindings[0]

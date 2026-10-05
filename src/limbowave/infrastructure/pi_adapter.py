@@ -45,6 +45,7 @@ from limbowave.domain.runtime_state import (
     fingerprint_from_entry,
 )
 from limbowave.infrastructure.pi_rpc import PiRpcProcess, SpawnSpec, resolve_pi_argv
+from limbowave.infrastructure.pi_runtime.context_usage import estimate_message_tokens
 
 _LOG = logging.getLogger(__name__)
 
@@ -152,6 +153,8 @@ class PiKernelAdapter(AgentKernel):
         self._ui_handler: Callable[[dict[str, Any]], Any] | None = None
         self._memory_ack: asyncio.Future[None] | None = None
         self._memory_run_id: str | None = None
+        self._attachment_ack: asyncio.Future[None] | None = None
+        self._attachment_run_id: str | None = None
         self._observation_handler: Callable[[dict[str, Any]], None] | None = None
         self._ui_tasks: set[asyncio.Task[None]] = set()
         self._runtime_instance_id: str | None = None
@@ -410,6 +413,7 @@ class PiKernelAdapter(AgentKernel):
         """
         env = dict(self._spec.env or {})
         env.pop("LIMBOWAVE_TOOL_IPC", None)
+        # 保留独立的限流令牌：不能调用工具，但后台请求仍共用站点 RPM。
         spec = SpawnSpec(
             argv=list(self._spec.argv),
             cwd=self._spec.cwd,
@@ -444,17 +448,37 @@ class PiKernelAdapter(AgentKernel):
     async def get_context_usage(self) -> ContextUsage | None:
         """上下文占用估算（``get_session_stats.contextUsage``，合同 §三.7 已确认）。
 
-        **这是估算**：token 计数来自 Pi/站点的估算策略，不是精确值。
+        **这是估算**：优先使用 Pi/站点用量。压缩后旧用量无效时，按
+        ``get_messages`` 的有效上下文内容重新估算，不等待下一轮模型回复。
         """
         response = await self._rpc.request({"type": "get_session_stats"})
         data = response.get("data") or {}
         usage = data.get("contextUsage")
         if not isinstance(usage, dict):
             return None
+        if usage.get("tokens") is not None and usage.get("percent") is not None:
+            return ContextUsage(
+                tokens=int(usage["tokens"]),
+                context_window=int(usage.get("contextWindow", 0)),
+                percent=float(usage["percent"]),
+            )
+
+        # Pi invalidates pre-compaction usage until the next model response.
+        # Its effective messages already contain the accepted summary and retained
+        # tail, unlike get_entries (the full immutable history). Estimate content
+        # only: even retained assistant messages can carry pre-compaction usage.
+        context_window = int(usage.get("contextWindow") or 0)
+        if context_window <= 0:
+            return None
+        response = await self._rpc.request({"type": "get_messages"})
+        messages = (response.get("data") or {}).get("messages")
+        if not isinstance(messages, list) or not all(isinstance(m, dict) for m in messages):
+            return None
+        tokens = sum(estimate_message_tokens(message) for message in messages)
         return ContextUsage(
-            tokens=int(usage.get("tokens", 0)),
-            context_window=int(usage.get("contextWindow", 0)),
-            percent=float(usage.get("percent", 0.0)),
+            tokens=tokens,
+            context_window=context_window,
+            percent=tokens / context_window * 100.0,
         )
 
     async def set_model(self, provider: str, model_id: str) -> None:
@@ -478,6 +502,25 @@ class PiKernelAdapter(AgentKernel):
         finally:
             self._memory_ack = None
             self._memory_run_id = None
+
+    async def set_attachment_context(self, context: dict[str, object]) -> None:
+        self._attachment_run_id = str(context["run_id"])
+        self._attachment_ack = asyncio.get_running_loop().create_future()
+        payload = json.dumps({"token": self._control_token, "context": context}, ensure_ascii=False)
+        try:
+            response = await self._rpc.request(
+                {"type": "prompt", "message": f"/limbowave-attachments {payload}"}
+            )
+            if response.get("success") is not True:
+                raise RuntimeError("附件上下文同步失败")
+            # Pi can acknowledge a command even if its handler rejected the payload.
+            # Only a matching extension observation proves the manifest was installed.
+            await asyncio.wait_for(self._attachment_ack, timeout=10)
+        except TimeoutError as exc:
+            raise RuntimeError("附件上下文同步超时，未发送不完整请求") from exc
+        finally:
+            self._attachment_ack = None
+            self._attachment_run_id = None
 
     async def reload_models(
         self, env: dict[str, str], expected: tuple[tuple[str, str], ...]
@@ -508,6 +551,15 @@ class PiKernelAdapter(AgentKernel):
             else:
                 spawn_env.pop(name, None)
         self._spec.env = spawn_env
+
+    async def get_available_thinking_levels(self) -> tuple[str, ...] | None:
+        response = await self._rpc.request({"type": "get_available_thinking_levels"})
+        if response.get("success") is not True:
+            raise RuntimeError("读取运行时可用思考等级失败")
+        levels = (response.get("data") or {}).get("levels")
+        if not isinstance(levels, list) or not all(isinstance(level, str) for level in levels):
+            raise RuntimeError("运行时返回了无效的思考等级列表")
+        return tuple(levels)
 
     async def set_thinking_level(self, level: str) -> None:
         response = await self._rpc.request({"type": "set_thinking_level", "level": level})
@@ -595,6 +647,11 @@ class PiKernelAdapter(AgentKernel):
                     "status", "run_id", "toolName", "provider", "model", "endpoint_id",
                 ) if isinstance(payload.get(key), (str, int, bool))},
             })
+        if payload.get("kind") == "attachments.ready":
+            if (payload.get("run_id") == self._attachment_run_id
+                    and self._attachment_ack is not None and not self._attachment_ack.done()):
+                self._attachment_ack.set_result(None)
+            return
         if payload.get("kind") == "memory.ready":
             if (payload.get("run_id") == self._memory_run_id
                     and self._memory_ack is not None and not self._memory_ack.done()):

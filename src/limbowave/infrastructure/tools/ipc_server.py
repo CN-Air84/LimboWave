@@ -41,6 +41,7 @@ MAX_FRAME_BYTES = 1024 * 1024
 
 # 环境变量名：把 {host, port, token} 交给扩展（与 Python 侧同源）
 IPC_ENV = "LIMBOWAVE_TOOL_IPC"
+RATE_LIMIT_IPC_ENV = "LIMBOWAVE_RATE_LIMIT_IPC"
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,8 +87,11 @@ class ToolIpcServer:
         *,
         conversation_provider: Callable[[], str | None] | None = None,
         host: str = "127.0.0.1",
+        rate_limit: Callable[[str], float] | None = None,
     ) -> None:
         self._dispatch = dispatch
+        self._rate_limit = rate_limit
+        self._rate_session: ToolIpcSession | None = None
         # 会话标识**只由服务端提供**（运行时可能切换，不能烘进 session）
         self._conversation_provider = conversation_provider or (lambda: None)
         self._host = host
@@ -110,7 +114,16 @@ class ToolIpcServer:
         self._session = ToolIpcSession(
             host=self._host, port=int(port), token=secrets.token_urlsafe(32)
         )
+        if self._rate_limit is not None:
+            self._rate_session = ToolIpcSession(
+                host=self._host, port=int(port), token=secrets.token_urlsafe(32)
+            )
         return self._session
+
+    @property
+    def rate_limit_session(self) -> ToolIpcSession | None:
+        """独立令牌只可请求限流额度，绝不能用于调用工具。"""
+        return self._rate_session
 
     async def stop(self) -> None:
         if self._server is not None:
@@ -120,6 +133,7 @@ class ToolIpcServer:
             self._server = None
         # 令牌作废：旧会话不能再连（新内核会拿到新令牌）
         self._session = None
+        self._rate_session = None
 
     @property
     def session(self) -> ToolIpcSession | None:
@@ -170,6 +184,21 @@ class ToolIpcServer:
             return {"ok": False, "error": "通道未启用", "_close": True}
 
         token = request.get("token")
+        if request.get("operation") == "rate_limit":
+            rate_session = self._rate_session
+            if (rate_session is None or not isinstance(token, str)
+                    or not secrets.compare_digest(token, rate_session.token)):
+                self.stats.rejected += 1
+                return {"ok": False, "error": "认证失败", "_close": True}
+            endpoint_id = request.get("endpoint_id")
+            if not isinstance(endpoint_id, str) or not endpoint_id:
+                return {"ok": False, "error": "缺少 endpoint_id"}
+            assert self._rate_limit is not None
+            try:
+                delay = self._rate_limit(endpoint_id)
+            except Exception:
+                return {"ok": False, "error": "站点请求已停止"}
+            return {"ok": True, "data": {"delay_seconds": delay}}
         if not isinstance(token, str) or not secrets.compare_digest(token, session.token):
             self.stats.rejected += 1
             return {"ok": False, "error": "认证失败", "_close": True}

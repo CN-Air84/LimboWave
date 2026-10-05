@@ -15,6 +15,7 @@ from __future__ import annotations
 import enum
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Any
 
 from limbowave.domain.permissions import PermissionPreset
 from limbowave.domain.tool_step import ToolStep
@@ -52,6 +53,32 @@ class Branch:
     parent_branch_id: str | None = None
     forked_from_message_id: str | None = None
     title: str | None = None
+    # Fork 保留起点消息；旧版编辑/重生成分支仍截在起点之前。
+    include_fork_message: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class AssistantMessageSegment:
+    """一轮内的模型输出顺序；工具以调用 ID 引用同消息的权威审计记录。"""
+
+    content: str = ""
+    thinking: str = ""
+    tool_call_ids: tuple[str, ...] = ()
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "content": self.content,
+            "thinking": self.thinking,
+            "tool_call_ids": list(self.tool_call_ids),
+        }
+
+    @classmethod
+    def from_json(cls, data: dict[str, Any]) -> AssistantMessageSegment:
+        return cls(
+            content=str(data.get("content") or ""),
+            thinking=str(data.get("thinking") or ""),
+            tool_call_ids=tuple(str(key) for key in data.get("tool_call_ids", ())),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,3 +100,5 @@ class Message:
     is_whitelisted: bool = False
     # 工具步骤审计（§三.2）：隐藏开关只影响展示，这些数据始终保留
     tool_steps: tuple[ToolStep, ...] = ()
+    # 展示顺序独立于最终正文；旧记录为空，保持兼容。
+    segments: tuple[AssistantMessageSegment, ...] = ()

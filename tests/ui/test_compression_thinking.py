@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import pytest
+from PySide6.QtCore import Qt
 from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import QWidget
 from pytestqt.qtbot import QtBot
@@ -68,6 +69,24 @@ def test_compression_thinking_goes_to_floating_panel_not_bubble(qtbot: QtBot) ->
     assert panel.status_text == CompressionThinkingPanel.SUMMARIZING
 
 
+def test_thinking_panel_stop_requests_stop_and_marks_cancelled(qtbot: QtBot) -> None:
+    view = _view(qtbot)
+    view.begin_compression(40.0)
+    view.append_thinking_delta("先停一下")
+    panel = view.compression_thinking_panel
+    assert panel is not None
+    assert panel._stop.isEnabled()
+
+    with qtbot.waitSignal(view.stop_requested, timeout=1000):
+        qtbot.mouseClick(panel._stop, Qt.MouseButton.LeftButton)
+
+    view.note_compression_stopping()
+    assert panel.status_text == CompressionThinkingPanel.STOPPING
+    view.finish_compression(None, stopped=True)
+    assert panel.status_text == CompressionThinkingPanel.STOPPED
+    assert not panel._stop.isEnabled()
+
+
 def test_compression_without_thinking_pops_nothing(qtbot: QtBot) -> None:
     view = _view(qtbot)
     view.begin_compression(40.0)
@@ -88,6 +107,7 @@ def test_panel_outlives_compression_and_replies_use_bubbles_again(qtbot: QtBot) 
 
     view.finish_compression(12.0)
     assert panel.status_text == CompressionThinkingPanel.FINISHED
+    assert not panel._stop.isEnabled()
     qtbot.waitUntil(lambda: not view.compressing, timeout=3000)
     assert panel.isVisible()  # 压缩结束后留着给用户看完，由用户自己关
 
@@ -101,7 +121,7 @@ def test_panel_outlives_compression_and_replies_use_bubbles_again(qtbot: QtBot) 
     row = view._rows[-1]
     assert "正常的回答" in row.content_text()
     assert row._thinking is not None
-    assert row._thinking._content.text() == "正常的思考"
+    assert row._thinking.text() == "正常的思考"
     assert panel.thinking_text == "想一想"
 
 
@@ -121,7 +141,7 @@ def test_compression_does_not_hijack_a_streaming_reply(qtbot: QtBot) -> None:
     row = view._rows[-1]
     assert "回复" in row.content_text()
     assert row._thinking is not None
-    assert row._thinking._content.text() == "回复的思考"
+    assert row._thinking.text() == "回复的思考"
 
 
 def test_dismissed_panel_stays_closed_until_next_round(qtbot: QtBot) -> None:

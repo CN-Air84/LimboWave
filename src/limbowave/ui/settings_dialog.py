@@ -43,6 +43,7 @@ from limbowave.infrastructure.crypto.vault import InvalidPassword, Vault
 from limbowave.ui import theme
 from limbowave.ui.about_page import AboutPage
 from limbowave.ui.appearance_editor import AppearanceEditor
+from limbowave.ui.endpoint_delete_panel import EndpointDeletePanel
 from limbowave.ui.logical_models_tab import LogicalModelsTab
 from limbowave.ui.marquee_list import MarqueeListWidget
 
@@ -149,6 +150,7 @@ class _EndpointsTab(QWidget):
         self._credentials = credentials
         self._preferences = preferences
         self._vault = vault
+        self._delete_panel: EndpointDeletePanel | None = None
         self._discovery_timer = QTimer(self)
         self._discovery_timer.setSingleShot(True)
         self._discovery_timer.setInterval(450)
@@ -196,10 +198,15 @@ class _EndpointsTab(QWidget):
         self._secret.setToolTip("密钥只存入加密库；留空不会删除或覆盖已有密钥")
         form.addRow("密钥", self._secret)
         form.addRow("协议", self._api)
-        self._priority = QSpinBox()
-        self._priority.setRange(-100, 100)
-        self._priority.setToolTip("数字越大越优先；用于备用站点候选排序")
-        form.addRow("优先级", self._priority)
+        self._rpm = QSpinBox()
+        self._rpm.setRange(1, 60_000)
+        self._rpm.setValue(5)
+        self._rpm.setSuffix(" 次/分钟")
+        self._rpm.setToolTip(
+            "同一站点的测活与对话共用额度；平滑发送，超限时等待。"
+            "默认 5 RPM（约每 12 秒一次）。"
+        )
+        form.addRow("RPM", self._rpm)
         # 参数白名单与删除规则（§二.4）不常用，收进「高级」悬浮面板；这里只存草稿值
         self._param_whitelist: tuple[str, ...] = ()
         self._strip_params: tuple[str, ...] = ()
@@ -264,7 +271,7 @@ class _EndpointsTab(QWidget):
                 self._api.setCurrentText(endpoint.api.value)
                 self._param_whitelist = endpoint.param_whitelist
                 self._strip_params = endpoint.strip_params
-                self._priority.setValue(endpoint.priority)
+                self._rpm.setValue(endpoint.rpm)
                 self._refresh_identity_hint()
                 self._refresh_advanced_label()
                 self.endpoint_selected.emit(endpoint)
@@ -279,7 +286,7 @@ class _EndpointsTab(QWidget):
         self._api.setCurrentIndex(0)
         self._param_whitelist = ()
         self._strip_params = ()
-        self._priority.setValue(0)
+        self._rpm.setValue(5)
         self._refresh_identity_hint()
         self._refresh_advanced_label()
         self._name.setFocus()
@@ -322,7 +329,8 @@ class _EndpointsTab(QWidget):
     def _form_endpoint(self) -> EndpointConfig:
         ref = self._derived_ref()
         keep_ref = self._editing is not None and self._editing.credential_ref == ref
-        return EndpointConfig(
+        values = self._editing.model_dump() if self._editing is not None else {}
+        values.update(
             id=self._derived_id(),
             name=self._name.text().strip(),
             base_url=self._base_url.text().strip(),
@@ -333,8 +341,9 @@ class _EndpointsTab(QWidget):
             ),
             param_whitelist=self._param_whitelist,
             strip_params=self._strip_params,
-            priority=self._priority.value(),
+            rpm=self._rpm.value(),
         )
+        return EndpointConfig.model_validate(values)
 
     def _schedule_discovery(self, _value: object = None) -> None:
         self._discovery_timer.start()
@@ -392,11 +401,28 @@ class _EndpointsTab(QWidget):
 
     def _on_delete(self) -> None:
         endpoint_id = self._selected_id()
-        if endpoint_id is None:
+        if endpoint_id is None or self._delete_panel is not None:
             return
+        config = self._settings.load()
+        endpoint = next((e for e in config.endpoints if e.id == endpoint_id), None)
+        if endpoint is None:
+            self.reload()
+            return
+        bound_models = [
+            model for model in config.models
+            if any(binding.endpoint_id == endpoint_id for binding in model.bindings)
+        ]
+        panel = EndpointDeletePanel(
+            self.window(), endpoint, bound_models,
+            lambda: self._delete_confirmed(endpoint_id, unbind_models=bool(bound_models)),
+        )
+        self._delete_panel = panel
+        panel.closed.connect(lambda: setattr(self, "_delete_panel", None))
+
+    def _delete_confirmed(self, endpoint_id: str, *, unbind_models: bool) -> None:
         try:
-            self._settings.delete_endpoint(endpoint_id)
-        except ValueError as exc:
+            self._settings.delete_endpoint(endpoint_id, unbind_models=unbind_models)
+        except (ValueError, OSError) as exc:
             _show_error(self, exc)
             return
         self.reload()
@@ -544,16 +570,25 @@ class _SecurityTab(QWidget):
         from limbowave.ui.floating import ask_alert, ask_prompt
 
         def _enable(password: str) -> None:
-            try:
-                notice = self._vault.enable_recovery(password)
-            except InvalidPassword:
-                ask_alert(self, "验证失败", "主密码错误，未做任何改动。")
-                return
-            except Exception as exc:
-                ask_alert(self, "启用失败", str(exc))
-                return
-            ask_alert(self, "已启用", notice)
-            self.reload()
+            from limbowave.ui.background_tasks import BackgroundTasks
+
+            jobs = BackgroundTasks(self)
+            vault = self._vault
+            self._enable_btn.setEnabled(False)
+
+            def ready(notice: str) -> None:
+                self._enable_btn.setEnabled(True)
+                ask_alert(self, "已启用", notice)
+                self.reload()
+
+            def failed(exc: Exception) -> None:
+                self._enable_btn.setEnabled(True)
+                if isinstance(exc, InvalidPassword):
+                    ask_alert(self, "验证失败", "主密码错误，未做任何改动。")
+                else:
+                    ask_alert(self, "启用失败", str(exc))
+
+            jobs.submit(lambda: vault.enable_recovery(password), ready, failed)
 
         ask_prompt(
             self, "启用系统保护", "先验证主密码：", _enable,
@@ -566,12 +601,11 @@ class _SecurityTab(QWidget):
         def _do_disable(ok: bool) -> None:
             if not ok:
                 return
-            try:
-                self._vault.disable_recovery()
-            except Exception as exc:
-                ask_alert(self, "关闭失败", str(exc))
-                return
-            self.reload()
+            from limbowave.ui.background_tasks import BackgroundTasks
+
+            jobs = BackgroundTasks(self)
+            jobs.submit(self._vault.disable_recovery, lambda _value: self.reload(),
+                        lambda exc: ask_alert(self, "关闭失败", str(exc)))
 
         ask_confirm(
             self,

@@ -10,15 +10,58 @@ import json
 import secrets
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from threading import Event
 from typing import Any
 from urllib.parse import quote
 
 import httpx
 
+from limbowave.application.services.endpoint_rate_limiter import (
+    DEFAULT_RATE_LIMITER,
+    EndpointRateLimiter,
+)
 from limbowave.domain.models import ModelBinding
 from limbowave.domain.providers import EndpointConfig, ProviderProtocol
 
 PROBE_LEVELS = ("minimal", "low", "medium", "high", "xhigh", "max")
+
+
+@dataclass(frozen=True, slots=True)
+class ModelProbeProgress:
+    completed: int
+    total: int
+
+
+def model_probe_request_total(endpoint: EndpointConfig) -> int:
+    """预留协议对应的请求上限；工具轮数/基础失败导致的跳过在结束时扣除。"""
+    thinking = len(PROBE_LEVELS) if endpoint.api in (
+        ProviderProtocol.OPENAI_COMPLETIONS, ProviderProtocol.OPENAI_RESPONSES,
+    ) else 1
+    return 1 + thinking + _TOOL_ROUNDS
+
+
+class _ProbeProgress:
+    def __init__(
+        self, endpoint: EndpointConfig, callback: Callable[[ModelProbeProgress], None] | None,
+    ) -> None:
+        self.completed = 0
+        self.total = model_probe_request_total(endpoint)
+        self.callback = callback
+        self._notify()
+
+    def _notify(self) -> None:
+        if self.callback is not None:
+            self.callback(ModelProbeProgress(self.completed, self.total))
+
+    def advance(self) -> None:
+        self.completed += 1
+        self._notify()
+
+    def finish(self) -> None:
+        # 不把跳过的请求冒充已完成请求，也不让正常提前结束停在未满进度。
+        if self.total != self.completed:
+            self.total = self.completed
+            self._notify()
 
 @dataclass(frozen=True, slots=True)
 class DiscoveredModel:
@@ -153,12 +196,26 @@ def _parse_models(endpoint: EndpointConfig, payload: object) -> tuple[Discovered
     return tuple(result)
 
 
-def discover_models(endpoint: EndpointConfig, secret: str | None) -> DiscoveryResult:
+def _limited_client(
+    endpoint: EndpointConfig, limiter: EndpointRateLimiter, cancelled: Event | None,
+) -> httpx.Client:
+    def before_request(_request: httpx.Request) -> None:
+        limiter.wait(endpoint, cancelled=cancelled)
+
+    return httpx.Client(
+        timeout=20.0, follow_redirects=False, event_hooks={"request": [before_request]},
+    )
+
+
+def discover_models(
+    endpoint: EndpointConfig, secret: str | None, *,
+    limiter: EndpointRateLimiter = DEFAULT_RATE_LIMITER, cancelled: Event | None = None,
+) -> DiscoveryResult:
     """拉取端点模型清单，不记录密钥，也不把响应正文放进错误消息。"""
     if endpoint.credential_ref and not secret:
         return DiscoveryResult((), "找不到端点密钥")
     try:
-        with httpx.Client(timeout=20.0, follow_redirects=False) as client:
+        with _limited_client(endpoint, limiter, cancelled) as client:
             response = client.get(_model_url(endpoint), headers=_auth_headers(endpoint, secret))
         if response.status_code != 200:
             return DiscoveryResult((), f"模型清单请求失败（HTTP {response.status_code}）")
@@ -386,25 +443,31 @@ def _request_stream(
     client: httpx.Client,
     request: tuple[str, dict[str, str], dict[str, object]],
     predicate: Callable[[dict[str, object]], bool] | None = None,
+    *, progress: _ProbeProgress | None = None,
 ) -> tuple[bool, bool, str, str | None]:
     url, headers, body = request
     try:
         with client.stream("POST", url, headers=headers, json=body) as response:
-            return _stream_result(response, predicate=predicate)
+            result = _stream_result(response, predicate=predicate)
     except (httpx.HTTPError, ValueError):
-        return False, False, "请求异常，请检查站点连接", None
+        result = False, False, "请求异常，请检查站点连接", None
+    # 收完流并关闭响应后才计数；RPM 等待/取消不等同于完成请求。
+    if progress is not None:
+        progress.advance()
+    return result
 
 
 def _probe_thinking(
     client: httpx.Client, endpoint: EndpointConfig, model_id: str, secret: str | None,
-    stream: StreamProbeResult
+    stream: StreamProbeResult, *, progress: _ProbeProgress | None = None,
 ) -> ThinkingProbeResult:
     if not stream.alive:
         return ThinkingProbeResult(False, None, "基础流式失败，未测试思考", inconclusive=True)
     if endpoint.api not in (ProviderProtocol.OPENAI_COMPLETIONS, ProviderProtocol.OPENAI_RESPONSES):
         # 这些协议使用 token budget，不支持逐级 effort；不能把同一个预算冒充多个等级。
         alive, observed, detail, _ = _request_stream(
-            client, _plain_request(endpoint, model_id, secret, level="high"), _has_reasoning
+            client, _plain_request(endpoint, model_id, secret, level="high"), _has_reasoning,
+            progress=progress,
         )
         supported = alive and observed
         return ThinkingProbeResult(
@@ -419,7 +482,8 @@ def _probe_thinking(
     rejected: list[str] = []
     for level in candidates:
         alive, observed, detail, _ = _request_stream(
-            client, _plain_request(endpoint, model_id, secret, level=level), _has_reasoning
+            client, _plain_request(endpoint, model_id, secret, level=level), _has_reasoning,
+            progress=progress,
         )
         if alive and observed:
             available.append(level)
@@ -621,7 +685,7 @@ def _tool_results(
 
 def _request_tool_turn(
     client: httpx.Client, endpoint: EndpointConfig, model_id: str, secret: str | None,
-    history: list[dict[str, Any]],
+    history: list[dict[str, Any]], *, progress: _ProbeProgress | None = None,
 ) -> tuple[_ToolTurn | None, str]:
     events: list[dict[str, object]] = []
 
@@ -630,7 +694,7 @@ def _request_tool_turn(
         return False
 
     alive, _, detail, _ = _request_stream(
-        client, _tool_request(endpoint, model_id, secret, history), collect
+        client, _tool_request(endpoint, model_id, secret, history), collect, progress=progress,
     )
     if not alive:
         return None, detail
@@ -644,7 +708,7 @@ def _request_tool_turn(
 
 def _probe_tools(
     client: httpx.Client, endpoint: EndpointConfig, model_id: str, secret: str | None,
-    stream: StreamProbeResult
+    stream: StreamProbeResult, *, progress: _ProbeProgress | None = None,
 ) -> ToolProbeResult:
     """让模型调用 read_file 读一个虚拟文件并复述内容；复述对了才算支持工具调用。"""
     if not stream.alive:
@@ -654,7 +718,9 @@ def _probe_tools(
     history = _tool_history(endpoint)
     called = False
     for _ in range(_TOOL_ROUNDS):
-        turn, detail = _request_tool_turn(client, endpoint, model_id, secret, history)
+        turn, detail = _request_tool_turn(
+            client, endpoint, model_id, secret, history, progress=progress,
+        )
         if turn is None:
             stage = "回传工具结果" if called else "带工具的请求"
             return ToolProbeResult(False, called, f"{stage}：{detail}", True)
@@ -670,8 +736,11 @@ def _probe_tools(
 
 
 def probe_model_capabilities(
-    endpoint: EndpointConfig, model_id: str, secret: str | None
+    endpoint: EndpointConfig, model_id: str, secret: str | None, *,
+    limiter: EndpointRateLimiter = DEFAULT_RATE_LIMITER, cancelled: Event | None = None,
+    on_progress: Callable[[ModelProbeProgress], None] | None = None,
 ) -> ModelProbeResult:
+    progress = _ProbeProgress(endpoint, on_progress)
     if endpoint.credential_ref and not secret:
         failed = StreamProbeResult(False, "找不到端点密钥")
         return ModelProbeResult(
@@ -679,22 +748,26 @@ def probe_model_capabilities(
             ThinkingProbeResult(False, None, "未测思考", inconclusive=True),
             ToolProbeResult(False, False, "未测工具", True),
         )
-    with httpx.Client(timeout=20.0, follow_redirects=False) as client:
+    with _limited_client(endpoint, limiter, cancelled) as client:
         alive, _, detail, actual_model_id = _request_stream(
-            client, _plain_request(endpoint, model_id, secret)
+            client, _plain_request(endpoint, model_id, secret), progress=progress,
         )
         stream = StreamProbeResult(alive, detail, actual_model_id)
         # 探测请求复用相同密钥，但结果与响应正文始终不包含密钥。
-        thinking = _probe_thinking(client, endpoint, model_id, secret, stream)
-        tools = _probe_tools(client, endpoint, model_id, secret, stream)
+        thinking = _probe_thinking(client, endpoint, model_id, secret, stream, progress=progress)
+        tools = _probe_tools(client, endpoint, model_id, secret, stream, progress=progress)
+    progress.finish()
     return ModelProbeResult(model_id, stream, thinking, tools)
 
 
-def probe_model(endpoint: EndpointConfig, binding: ModelBinding, secret: str | None) -> ProbeResult:
+def probe_model(
+    endpoint: EndpointConfig, binding: ModelBinding, secret: str | None, *,
+    limiter: EndpointRateLimiter = DEFAULT_RATE_LIMITER, cancelled: Event | None = None,
+) -> ProbeResult:
     """兼容旧调用方：复用与实际模型页面相同的工具探测流程。"""
     if endpoint.credential_ref and not secret:
         return ProbeResult(False, False, "找不到端点密钥")
-    with httpx.Client(timeout=20.0, follow_redirects=False) as client:
+    with _limited_client(endpoint, limiter, cancelled) as client:
         alive, _, detail, actual_model_id = _request_stream(
             client, _plain_request(endpoint, binding.model_id, secret)
         )

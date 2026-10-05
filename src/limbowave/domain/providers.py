@@ -75,9 +75,11 @@ class EndpointConfig(BaseModel):
     param_whitelist: tuple[str, ...] = ()
     # 参数删除规则（§二.4）：发送前一律去掉这些参数
     strip_params: tuple[str, ...] = ()
-    # 站点优先级（§二.4）：数字越大越优先。**只用于给备用站点候选排序**——
-    # 逻辑模型的默认站点仍由 bindings 顺序与 default_binding 决定（§四.3）
+    # 已废弃：仅兼容旧配置的读写，不参与路由或自动匹配排序。
+    # 优先级改由每个逻辑模型的 bindings 顺序独立维护。
     priority: int = 0
+    # 每分钟请求数；同一站点的测活与对话共用额度，平滑发送以避免突发 429。
+    rpm: int = Field(default=5, ge=1, le=60_000, strict=True)
 
     @field_validator("base_url")
     @classmethod

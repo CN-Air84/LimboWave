@@ -39,7 +39,7 @@ def test_loading_animation_preserves_draft_and_availability(qtbot: QtBot) -> Non
     view._input.setPlainText("未发送的草稿")
     view.set_history_loading(True, "正在加载分支…")
     overlay = view._history_loading_overlay
-    assert overlay.isVisible()
+    qtbot.waitUntil(overlay.isVisible)
     assert overlay.accessibleName() == "正在加载分支…"
     assert not view._input.isEnabled()
     assert not view._send_btn.isEnabled()
@@ -53,11 +53,153 @@ def test_loading_animation_preserves_draft_and_availability(qtbot: QtBot) -> Non
     qtbot.waitUntil(lambda: overlay.geometry() == view._scroll.viewport().rect())
     view.set_available(False)
     view.set_history_loading(False)
+    qtbot.waitUntil(overlay.isHidden)
     assert not overlay._timer.isActive()
     assert overlay.isHidden()
     assert not view._input.isEnabled()
     view.set_available(True)
     assert view._send_btn.isEnabled()
+
+
+def test_loading_waits_for_composer_to_finish_docking(qtbot: QtBot) -> None:
+    view = ChatView()
+    qtbot.addWidget(view)
+    view.resize(900, 700)
+    view.show()
+    qtbot.waitUntil(lambda: view.composer_lift > 0)
+    view.set_history_loading(True)
+    overlay = view._history_loading_overlay
+    assert view.docked
+    assert not view.advanced_expanded
+    assert not view._input.isEnabled()
+    animation = view._dock_anim
+    assert animation is not None
+    animation.pause()
+    for progress in (0.0, 0.5, 0.95):
+        animation.setCurrentTime(round(animation.duration() * progress))
+        QApplication.processEvents()
+        assert overlay.isHidden()
+        assert not overlay._timer.isActive()
+    animation.setCurrentTime(animation.duration())
+    qtbot.waitUntil(overlay.isVisible)
+    assert view._dock_anim is None
+    assert view.composer_lift == 0
+    assert overlay.geometry() == view._scroll.viewport().rect()
+    assert overlay._opacity < 1.0
+    qtbot.waitUntil(lambda: overlay._opacity == 1.0)
+
+
+@pytest.mark.parametrize("has_messages", [False, True])
+def test_loading_finished_before_docking_never_shows_overlay(
+    qtbot: QtBot, has_messages: bool
+) -> None:
+    view = ChatView()
+    qtbot.addWidget(view)
+    view.resize(900, 700)
+    view.show()
+    view.set_history_loading(True)
+    overlay = view._history_loading_overlay
+    if has_messages:
+        view.load_history([HistoryEntry("user", "已加载", "", "u1")])
+    view.set_history_loading(False)
+    qtbot.waitUntil(lambda: view._dock_anim is None)
+    assert overlay.isHidden()
+    assert not overlay._timer.isActive()
+    assert view.docked == has_messages
+    assert view._input.isEnabled()
+
+
+def test_docked_loading_fades_in_and_out_without_restarting(qtbot: QtBot) -> None:
+    view = ChatView()
+    qtbot.addWidget(view)
+    view.load_history([HistoryEntry("user", "原会话", "", "u1")])
+    view.resize(900, 700)
+    view.show()
+    view.set_history_loading(True)
+    overlay = view._history_loading_overlay
+    assert overlay.isVisible()
+    assert overlay._opacity == 0.0
+    animation = overlay._fade_anim
+    animation.pause()
+    animation.setCurrentTime(animation.duration() // 2)
+    opacity = overlay._opacity
+    assert 0.0 < opacity < 1.0
+    view.set_history_loading(True, "正在加载分支…")
+    assert overlay._opacity == opacity
+    assert animation.currentTime() == animation.duration() // 2
+    assert overlay.accessibleName() == "正在加载分支…"
+    animation.setCurrentTime(animation.duration())
+    view.set_history_loading(False)
+    assert view._input.isEnabled()
+    assert overlay.isVisible()
+    assert overlay.accessibleName() == "正在加载分支…"
+    assert overlay._opacity == 1.0
+    assert overlay._timer.isActive()
+    animation.pause()
+    animation.setCurrentTime(animation.duration() // 2)
+    assert 0.0 < overlay._opacity < 1.0
+    animation.setCurrentTime(animation.duration())
+    assert overlay.isHidden()
+    assert not overlay._timer.isActive()
+
+
+def test_loading_can_reverse_an_unfinished_fade(qtbot: QtBot) -> None:
+    view = ChatView()
+    qtbot.addWidget(view)
+    view.load_history([HistoryEntry("user", "原会话", "", "u1")])
+    view.show()
+    view.set_history_loading(True)
+    overlay = view._history_loading_overlay
+    animation = overlay._fade_anim
+    animation.pause()
+    animation.setCurrentTime(animation.duration() // 2)
+    opacity = overlay._opacity
+    view.set_history_loading(False)
+    assert overlay._opacity == opacity
+    animation.pause()
+    animation.setCurrentTime(animation.duration() // 2)
+    opacity = overlay._opacity
+    view.set_history_loading(True)
+    assert overlay._opacity == opacity
+    qtbot.waitUntil(lambda: overlay._opacity == 1.0)
+    assert overlay.isVisible()
+    assert overlay._timer.isActive()
+    view.set_history_loading(False)
+    qtbot.waitUntil(overlay.isHidden)
+
+
+def test_empty_history_stays_docked_until_loading_finishes(qtbot: QtBot) -> None:
+    view = ChatView()
+    qtbot.addWidget(view)
+    view.resize(900, 700)
+    view.show()
+    view.set_history_loading(True)
+    overlay = view._history_loading_overlay
+    qtbot.waitUntil(lambda: overlay._opacity == 1.0)
+    view.load_history([])
+    assert view.docked
+    assert view._dock_anim is None
+    assert overlay.isVisible()
+    view.set_history_loading(False)
+    qtbot.waitUntil(lambda: overlay.isHidden() and view._dock_anim is None)
+    assert not view.docked
+    assert view.composer_lift > 0
+    assert not overlay._timer.isActive()
+
+
+def test_disabling_overlay_cancels_pending_show(qtbot: QtBot) -> None:
+    view = ChatView()
+    qtbot.addWidget(view)
+    view.resize(900, 700)
+    view.show()
+    view.set_history_loading(True)
+    view.set_history_loading(True, show_overlay=False)
+    qtbot.waitUntil(lambda: view._dock_anim is None)
+    assert view.history_loading
+    assert not view._input.isEnabled()
+    assert view._history_loading_overlay.isHidden()
+    assert not view._history_loading_overlay._timer.isActive()
+    assert not view.docked
 
 
 async def test_incremental_render_yields_and_uses_prepared_markdown(
@@ -279,12 +421,18 @@ def test_qasync_keeps_loading_animation_alive_during_slow_read(
             await asyncio.sleep(0.15)
             assert window.chat.history_loading
             overlay = window.chat._history_loading_overlay
-            assert overlay.isVisible()
-            assert overlay._angle != 0
+            assert overlay.isHidden()
+            async with asyncio.timeout(5):
+                while not overlay.isVisible() or overlay._angle == 0:
+                    await asyncio.sleep(0.01)
+            assert window.chat.composer_lift == 0
+            assert window.chat._dock_anim is None
             assert sum(ticks) >= 3
             release.set()
             async with asyncio.timeout(5):
                 while window.chat.history_loading:
+                    await asyncio.sleep(0.01)
+                while not overlay.isHidden():
                     await asyncio.sleep(0.01)
             assert overlay.isHidden()
             assert not overlay._timer.isActive()
@@ -297,3 +445,24 @@ def test_qasync_keeps_loading_animation_alive_during_slow_read(
             loop.run_until_complete(shutdown())
         loop.close()
         asyncio.set_event_loop(None)
+
+
+def test_send_preparation_locks_without_loading_animation(qtbot):
+    from limbowave.ui.chat_view import ChatView
+
+    view = ChatView()
+    qtbot.addWidget(view)
+    view.show()
+    view.set_available(True)
+    view.set_history_loading(True, show_overlay=False)
+    assert view.history_loading
+    assert not view._history_loading_overlay.isVisible()
+    assert not view._history_loading_overlay._timer.isActive()
+    assert not view.docked
+    assert view._dock_anim is None
+    assert not view._input.isEnabled()
+    view.set_history_loading(False)
+    assert view._input.isEnabled()
+    view.set_history_loading(True)
+    qtbot.waitUntil(view._history_loading_overlay.isVisible)
+    view.set_history_loading(False)

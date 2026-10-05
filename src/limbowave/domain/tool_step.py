@@ -43,10 +43,15 @@ class ToolStep:
     args: dict[str, Any] = field(default_factory=dict)
     result_summary: str = ""
     error: str | None = None
+    # Transient backend projection; deliberately excluded from audit JSON/equality.
+    display_summary: str | None = field(default=None, compare=False, repr=False)
+    display_detail: str | None = field(default=None, compare=False, repr=False)
 
     @property
     def summary(self) -> str:
         """折叠态的一行摘要：状态 + 参数要点或错误。"""
+        if self.display_summary is not None:
+            return self.display_summary
         if self.status is ToolStatus.ERROR:
             return self.error or "执行失败"
         if self.result_summary:
@@ -93,6 +98,8 @@ def finish(
         step,
         status=ToolStatus.ERROR if is_error else ToolStatus.OK,
         duration_ms=duration_ms,
+        display_summary=None,
+        display_detail=None,
         result_summary="" if is_error else _summarize_result(result),
         error=_error_text(result) if is_error else None,
     )

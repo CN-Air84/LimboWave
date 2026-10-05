@@ -294,3 +294,31 @@ def test_parse_session_rejects_bad_input(value: str | None) -> None:
 def test_env_name_is_stable() -> None:
     """扩展侧按这个名字读——改名字要同步改 TS。"""
     assert IPC_ENV == "LIMBOWAVE_TOOL_IPC"
+
+
+async def test_rate_limit_capability_is_separate_from_tool_authorization() -> None:
+    from limbowave.application.services.endpoint_rate_limiter import EndpointRateLimiter
+
+    recorder = _Recorder()
+    limiter = EndpointRateLimiter(clock=lambda: 0)
+    ipc = ToolIpcServer(recorder, rate_limit=limiter.try_acquire)
+    await ipc.start()
+    try:
+        rate = ipc.rate_limit_session
+        tools = ipc.session
+        assert rate is not None and tools is not None and rate.token != tools.token
+        payload = {"token": rate.token, "operation": "rate_limit", "endpoint_id": "a"}
+        assert (await _call(ipc, payload))["data"]["delay_seconds"] == 0
+        assert (await _call(ipc, payload))["data"]["delay_seconds"] == 12
+        assert (await _call(ipc, {**payload, "endpoint_id": "b"}))["data"]["delay_seconds"] == 0
+        assert not (await _call(ipc, {**payload, "token": "wrong"}))["ok"]
+        assert not (await _call(ipc, {**payload, "token": tools.token}))["ok"]
+        assert not (await _call(ipc, {
+            "token": rate.token, "tool": "run_command", "params": {}, "confirmed": True,
+        }))["ok"]
+        assert not recorder.calls
+        limiter.stop()
+        assert not (await _call(ipc, payload))["ok"]
+    finally:
+        await ipc.stop()
+    assert ipc.rate_limit_session is None

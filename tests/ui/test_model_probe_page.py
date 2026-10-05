@@ -4,7 +4,15 @@ from itertools import pairwise
 
 import pytest
 from PySide6.QtCore import QAbstractAnimation, Qt
-from PySide6.QtWidgets import QAbstractItemView, QCheckBox, QLabel, QPushButton, QScrollArea
+from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QCheckBox,
+    QLabel,
+    QPushButton,
+    QScrollArea,
+    QStyle,
+    QStyleOptionButton,
+)
 from pytestqt.qtbot import QtBot
 
 from limbowave.application.services.model_probe import (
@@ -270,7 +278,7 @@ def test_saved_catalog_restores_without_network_and_is_endpoint_scoped(qtbot: Qt
     page.activate_endpoint(_endpoint(), discover=False, actual_models=(actual, other))
     row = _row(page)
     assert set(page._rows) == {"m"}
-    assert row.selected.isChecked()
+    assert not row.selected.isChecked()
     assert row.checkboxes["supports_streaming"].checkState() == Qt.CheckState.Unchecked
     assert row.checkboxes["supports_thinking"].isChecked()
     assert row.checkboxes["supports_thinking"].accessibleDescription() == "low、high"
@@ -285,7 +293,7 @@ def test_saved_catalog_restores_without_network_and_is_endpoint_scoped(qtbot: Qt
     assert set(page._rows) == {"other-model"}
 
 
-def test_saved_selection_restores_on_reentry_but_refresh_preserves_user_choice(
+def test_saved_models_do_not_select_detection_on_reentry_or_refresh(
     qtbot: QtBot,
 ) -> None:
     page = _page(qtbot)
@@ -296,12 +304,12 @@ def test_saved_selection_restores_on_reentry_but_refresh_preserves_user_choice(
     page.capability_save_requested.connect(emitted.append)
     page.activate_endpoint(_endpoint(), discover=False, actual_models=(actual,))
     row = _row(page)
-    assert row.selected.isChecked()
+    assert not row.selected.isChecked()
 
     discovery = DiscoveryResult((DiscoveredModel("m", "M"), DiscoveredModel("new", "New")), "ok")
     page.apply_discovery("relay", discovery)
     assert _row(page) is row
-    assert row.selected.isChecked()
+    assert not row.selected.isChecked()
     assert not _row(page, "new").selected.isChecked()
 
     row.selected.setChecked(False)
@@ -315,7 +323,7 @@ def test_saved_selection_restores_on_reentry_but_refresh_preserves_user_choice(
     page.activate_endpoint(_endpoint("other"), discover=False, actual_models=(updated,))
     assert not page._rows
     page.activate_endpoint(_endpoint(), discover=False, actual_models=(updated,))
-    assert _row(page).selected.isChecked()
+    assert not _row(page).selected.isChecked()
     assert not emitted
 
 
@@ -332,8 +340,8 @@ def test_checked_models_move_to_top_and_keep_catalog_order(qtbot: QtBot) -> None
     _row(page, "b").selected.click()
     assert _displayed_ids(page) == ["d", "a", "b", "c"]
     page._select_all.click()
-    assert _displayed_ids(page) == ["a", "b", "c", "d"]
-    assert all(row.selected.isChecked() for row in page._items())
+    assert _displayed_ids(page) == ["d", "a", "b", "c"]
+    assert [row.model_id for row in page._items() if row.selected.isChecked()] == ["d"]
     assert not emitted
 
 
@@ -439,17 +447,17 @@ def test_row_moves_settle_when_page_context_changes(qtbot: QtBot, action: str) -
     assert all(row.width() <= page._models.viewport().width() for row in page._items())
 
 
-def test_saved_models_stay_above_unchecked_models_after_discovery(qtbot: QtBot) -> None:
+def test_saved_models_follow_catalog_order_without_detection_selection(qtbot: QtBot) -> None:
     page = _page(qtbot)
     actuals = tuple(ActualModel(endpoint_id="relay", model_id=id) for id in ("b", "local"))
     page.activate_endpoint(_endpoint(), discover=False, actual_models=actuals)
     discovery = DiscoveryResult(tuple(DiscoveredModel(id, id) for id in ("a", "b", "c")), "ok")
     page.apply_discovery("relay", discovery)
-    assert _displayed_ids(page) == ["b", "local", "a", "c"]
+    assert _displayed_ids(page) == ["a", "b", "c", "local"]
     page.apply_saved_models((*actuals, ActualModel(endpoint_id="relay", model_id="late")))
-    assert _displayed_ids(page) == ["b", "local", "late", "a", "c"]
+    assert _displayed_ids(page) == ["a", "b", "c", "local", "late"]
     page.apply_discovery("relay", discovery)
-    assert _displayed_ids(page) == ["b", "local", "late", "a", "c"]
+    assert _displayed_ids(page) == ["a", "b", "c", "local", "late"]
 
 
 def test_detected_model_can_be_retested_and_failed_retest_keeps_declarations(qtbot: QtBot) -> None:
@@ -477,7 +485,8 @@ def test_empty_discovery_allows_manual_add_without_probing(qtbot: QtBot) -> None
     with qtbot.waitSignal(page.manual_save_requested) as signal:
         page._manual_add.click()
     assert signal.args[0] == ModelProbeTask(_endpoint(), "custom-model-v1", "custom-model-v1")
-    assert _row(page, "custom-model-v1").selected.isChecked()
+    assert not _row(page, "custom-model-v1").selected.isChecked()
+    _row(page, "custom-model-v1").selected.setChecked(True)
     assert not probes
     page.apply_manual_save("relay", "custom-model-v1")
     assert page._manual_id.text() == ""
@@ -492,6 +501,7 @@ def test_manual_model_survives_late_discovery_and_can_retry(qtbot: QtBot) -> Non
         page._manual_id.returnPressed.emit()
     page.apply_manual_save("relay", "manual-model")
     row = _row(page, "manual-model")
+    row.selected.setChecked(True)
     row.detect.click()
     page.show_probe_error("relay", "manual-model", "连接超时")
     page.apply_discovery("relay", DiscoveryResult((DiscoveredModel("listed", "Listed"),), "ok"))
@@ -513,7 +523,7 @@ def test_manual_duplicate_is_not_added_and_endpoint_change_resets_rows(qtbot: Qt
     with qtbot.waitSignal(page.manual_save_requested):
         page._manual_add.click()
     assert len(page._rows) == 1
-    assert _row(page).selected.isChecked()
+    assert not _row(page).selected.isChecked()
     page.activate_endpoint(_endpoint("other"), discover=False)
     assert not page._rows
     assert page._manual_id.text() == ""
@@ -557,7 +567,9 @@ def test_add_all_and_batch_run_only_affect_pending_rows(qtbot: QtBot) -> None:
     )
     page._select_all.click()
     assert not emitted
-    assert all(row.selected.isChecked() for row in page._items())
+    assert not any(row.selected.isChecked() for row in page._items())
+    for row in page._items():
+        row.selected.setChecked(True)
     assert not page._select_all.isEnabled()
     assert page._run.text() == "批量检测（3）"
     page._run.click()
@@ -572,7 +584,7 @@ def test_add_all_and_batch_run_only_affect_pending_rows(qtbot: QtBot) -> None:
     page._run.click()
     assert [task.model_id for task in emitted] == ["b"]
     _row(page, "a").selected.setChecked(False)
-    assert page._select_all.isEnabled()
+    assert not page._select_all.isEnabled()
 
 
 def test_add_all_disabled_for_empty_or_already_added_and_checked_list(qtbot: QtBot) -> None:
@@ -629,7 +641,7 @@ def test_model_id_and_capabilities_share_one_compact_row(qtbot: QtBot, width: in
     qtbot.waitExposed(page)
     first, second = page._items()
     for row in (first, second):
-        controls = [row.selected, row.id_label, *row.checkboxes.values(), row.detect]
+        controls = [row.selected, row.id_label, *row.checkboxes.values(), row.add, row.detect]
         centers = [control.geometry().center().y() for control in controls]
         assert max(centers) - min(centers) <= 1
         assert row.height() <= row.detect.sizeHint().height() + 14
@@ -662,7 +674,7 @@ def test_model_table_header_and_action_positions(qtbot: QtBot, width: int) -> No
     assert page._select_all.y() < page._run.y()
     header = page._model_header
     labels = header.findChildren(QLabel)
-    assert [label.text() for label in labels] == ["模型id", "能力"]
+    assert [label.text() for label in labels] == ["模型id", "能力", "添加"]
     row = _row(page, "a")
     assert header.isVisible()
     assert header.geometry().bottom() < row.y()
@@ -671,6 +683,7 @@ def test_model_table_header_and_action_positions(qtbot: QtBot, width: int) -> No
     last = row.checkboxes["supports_tools"]
     assert abs(labels[1].x() - first.x()) <= 1
     assert abs(labels[1].geometry().right() - last.geometry().right()) <= 1
+    assert abs(labels[2].x() - row.add.x()) <= 1
     row.selected.click()
     _wait_for_row_moves(qtbot, page)
     assert page._model_layout.itemAt(0).widget() is header
@@ -703,7 +716,7 @@ def test_add_all_saves_unsaved_models_without_probing_or_overwriting(qtbot: QtBo
     page._select_all.click()
     assert [task.model_id for task in saves] == ["checked", "new"]
     assert not probes
-    assert all(row.selected.isChecked() for row in page._items())
+    assert [row.model_id for row in page._items() if row.selected.isChecked()] == ["checked"]
     assert _row(page, "saved").actual == actual
     assert _row(page, "saved").checkboxes["supports_tools"].isChecked()
     assert not page._select_all.isEnabled()
@@ -715,7 +728,7 @@ def test_add_all_saves_unsaved_models_without_probing_or_overwriting(qtbot: QtBo
     assert saves[-1].model_id == "busy"
 
 
-def test_adding_saved_model_only_selects_it_without_overwriting(qtbot: QtBot) -> None:
+def test_adding_saved_model_does_not_select_it_or_overwrite_capabilities(qtbot: QtBot) -> None:
     page = _page(qtbot, "m")
     actual = ActualModel(endpoint_id="relay", model_id="m", supports_tools=True)
     page.apply_saved_models((actual,))
@@ -726,7 +739,79 @@ def test_adding_saved_model_only_selects_it_without_overwriting(qtbot: QtBot) ->
     page.probe_requested.connect(emitted.append)
     page._manual_id.setText("m")
     page._manual_add.click()
-    assert row.selected.isChecked()
+    assert not row.selected.isChecked()
     assert not emitted
     assert row.actual == actual
     assert row.checkboxes["supports_tools"].isChecked()
+
+
+@pytest.mark.parametrize("palette", ["dark", "light"])
+def test_add_button_has_no_horizontal_inset(qtbot: QtBot, palette: str) -> None:
+    previous_palette = theme.current_palette().name
+    try:
+        theme.set_palette(palette)
+        page = _page(qtbot, "m")
+        page.setStyleSheet(theme.app_stylesheet())
+        page.resize(600, 640)
+        page.show()
+        qtbot.waitExposed(page)
+        row = _row(page)
+        for saved in (False, True):
+            if saved:
+                page.apply_manual_save("relay", "m")
+            option = QStyleOptionButton()
+            row.add.initStyleOption(option)
+            content = row.add.style().subElementRect(
+                QStyle.SubElement.SE_PushButtonContents, option, row.add,
+            )
+            assert content.left() == 1  # Only the button border remains.
+            assert content.right() == row.add.width() - 2
+            assert content.width() >= row.add.fontMetrics().horizontalAdvance(row.add.text())
+            assert row.add.height() == row.detect.height()
+    finally:
+        theme.set_palette(previous_palette)
+
+
+def test_add_column_is_independent_of_detection_selection(qtbot: QtBot) -> None:
+    page = _page(qtbot, "m", "other")
+    row = _row(page)
+    saves: list[ModelProbeTask] = []
+    probes: list[object] = []
+    page.manual_save_requested.connect(saves.append)
+    page.probe_requested.connect(probes.append)
+    assert row.add.text() == "添加"
+    row.selected.click()
+    assert not saves
+    assert not row.saved
+    row.selected.click()
+    row.add.click()
+    assert len(saves) == 1
+    assert not row.selected.isChecked()
+    assert not probes
+    page.apply_manual_save("relay", "m")
+    assert row.add.text() == "已添加"
+    assert not row.add.isEnabled()
+    assert not row.selected.isChecked()
+    row.selected.click()
+    assert row.add.text() == "已添加"
+    with qtbot.waitSignal(page.probe_requested):
+        page._run.click()
+
+
+def test_add_column_tracks_probe_and_capability_save_states(qtbot: QtBot) -> None:
+    page = _page(qtbot, "m")
+    row = _row(page)
+    row.detect.click()
+    assert not row.add.isEnabled()
+    page.show_probe_error("relay", "m", "timeout")
+    assert row.add.isEnabled()
+    assert row.add.text() == "添加"
+    row.checkboxes["supports_tools"].click()
+    assert not row.add.isEnabled()
+    change = ModelCapabilityChange(_endpoint(), "m", row.display_name, "supports_tools", True)
+    page.show_capability_save_error(change, "failed")
+    assert row.add.isEnabled()
+    page.apply_probe_result("relay", _result())
+    assert row.add.text() == "已添加"
+    assert not row.add.isEnabled()
+    assert not row.selected.isChecked()

@@ -18,7 +18,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 # 当前 schema 版本。新增迁移时递增。
-CURRENT_VERSION = 10
+CURRENT_VERSION = 13
 
 
 @dataclass(frozen=True, slots=True)
@@ -339,6 +339,24 @@ def _migration_010(conn: sqlite3.Connection) -> None:
     conn.execute("ALTER TABLE runs ADD COLUMN retry_of_message_id TEXT")
 
 
+def _migration_011(conn: sqlite3.Connection) -> None:
+    """区分保留起点的 Fork 与替换起点的编辑/重生成；旧分支语义不变。"""
+    conn.execute("ALTER TABLE branches ADD COLUMN include_fork_message INTEGER NOT NULL DEFAULT 0")
+
+
+def _migration_012(conn: sqlite3.Connection) -> None:
+    """保存助手分段的正文、思考和工具归属；旧消息不伪造丢失的中间正文。"""
+    conn.execute("ALTER TABLE messages ADD COLUMN segments_enc TEXT NOT NULL DEFAULT ''")
+
+
+def _migration_013(conn: sqlite3.Connection) -> None:
+    from limbowave.infrastructure.database.compression_repair import (
+        repair_missing_branch_compressions,
+    )
+
+    repair_missing_branch_compressions(conn)
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(
         from_version=0,
@@ -382,6 +400,9 @@ MIGRATIONS: tuple[Migration, ...] = (
     ),
     Migration(from_version=8, description="分层记忆与分支快照", apply=_migration_009),
     Migration(from_version=9, description="手动重试来源关联", apply=_migration_010),
+    Migration(from_version=10, description="Fork 保留起点消息", apply=_migration_011),
+    Migration(from_version=11, description="助手分段与工具步骤顺序", apply=_migration_012),
+    Migration(from_version=12, description="修复旧分支缺失的压缩继承", apply=_migration_013),
 )
 
 

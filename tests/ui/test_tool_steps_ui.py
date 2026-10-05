@@ -16,8 +16,9 @@ from PySide6.QtCore import QAbstractAnimation, Qt
 from PySide6.QtWidgets import QApplication, QVBoxLayout, QWidget
 from pytestqt.qtbot import QtBot
 
+from limbowave.domain.conversation import AssistantMessageSegment
 from limbowave.domain.tool_step import ToolStatus, ToolStep
-from limbowave.ui.chat_view import ChatView
+from limbowave.ui.chat_view import ChatView, HistoryEntry
 from limbowave.ui.tool_steps import ToolStepsView, make_tool_steps
 
 
@@ -92,7 +93,7 @@ def test_hide_only_affects_display(qtbot: QtBot) -> None:
     assert not row._tool_steps_view.isHidden()
 
     view.set_tool_steps_visible(False)
-    assert row._tool_steps_view.isHidden()
+    qtbot.waitUntil(row._tool_steps_view.isHidden)
 
     # 数据没丢：重新显示就回来（内容与折叠态都还在）
     view.set_tool_steps_visible(True)
@@ -110,6 +111,115 @@ def test_new_rows_respect_hidden_state(qtbot: QtBot) -> None:
     row.set_tool_steps(_steps())
     assert row._tool_steps_view is not None
     assert row._tool_steps_view.isHidden()
+
+
+def _assert_no_body_bar(browser: QWidget | None) -> None:
+    assert browser is not None
+    bar = browser.horizontalScrollBar()
+    assert browser.horizontalScrollBarPolicy() is Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+    assert bar.maximum() == 0
+    assert bar.height() == 0
+    assert bar.isHidden()
+
+
+def test_hiding_steps_also_hides_long_run_dividers(qtbot: QtBot) -> None:
+    """隐藏工具步骤时，长任务的正文分段线也一起消失。"""
+    view = ChatView()
+    qtbot.addWidget(view)
+    view.show()
+    view.set_busy(True)
+    view.begin_assistant()
+    view.end_assistant("我先查一下。", "m1")
+    view.note_tool_step("read", "call-1", is_error=False, phase="start")
+    view.begin_assistant()
+    view.end_assistant("这是结论。", "m2")
+    row = view._rows[-1]
+    divider = row._assistant_panel.findChild(QWidget, "assistantSegmentDivider")
+    assert divider is not None and not divider.isHidden()
+
+    view.set_tool_steps_visible(False)
+
+    qtbot.waitUntil(divider.isHidden)
+    assert all(not segment.isHidden() for segment in row._segments)
+
+    view.set_tool_steps_visible(True)
+    assert not divider.isHidden()
+
+
+def test_hidden_tool_only_segments_collapse_and_body_has_no_horizontal_bar(
+    qtbot: QtBot,
+) -> None:
+    """纯工具段隐藏后不留空位；空正文浏览器和圆角横条都不再占位。"""
+    view = ChatView()
+    qtbot.addWidget(view)
+    view.show()
+    view.set_busy(True)
+    view.begin_assistant()
+    view.end_assistant("", "m1")
+    view.note_tool_step("read", "call-1", is_error=False, phase="start")
+    row = view._rows[-1]
+    tool_only = row._segments[0]
+    assert tool_only.content is not None
+    assert tool_only.content.isHidden()
+    assert tool_only.content.height() == 0
+    _assert_no_body_bar(tool_only.content)
+
+    view.begin_assistant()
+    view.end_assistant("最终结论", "m2")
+    final = row._segments[1]
+    _assert_no_body_bar(final.content)
+
+    view.set_tool_steps_visible(False)
+    qtbot.waitUntil(tool_only.isHidden)
+    assert not final.isHidden()
+    assert all(divider.isHidden() for divider in row._segment_dividers)
+    _assert_no_body_bar(tool_only.content)
+    _assert_no_body_bar(final.content)
+
+    view.set_tool_steps_visible(True)
+    assert not tool_only.isHidden()
+    assert tool_only.content.isHidden()
+    assert tool_only.content.height() == 0
+
+
+def test_hidden_empty_leading_segment_leaves_no_bar_or_divider(qtbot: QtBot) -> None:
+    """历史里的空前置段隐藏后，不能留下分割线或空白横条。"""
+    view = ChatView()
+    qtbot.addWidget(view)
+    view.resize(980, 600)
+    view.show()
+    step = ToolStep(tool_call_id="c1", name="read", status=ToolStatus.OK, duration_ms=12)
+    view.load_history(
+        [
+            HistoryEntry(
+                "assistant",
+                "读到第60000行，7月22日这场令人精疲力竭的聚餐终于在这一句决绝的总结里落下了帷幕：",
+                "",
+                "m1",
+                "run",
+                (step,),
+                False,
+                True,
+                (
+                    AssistantMessageSegment(content="", tool_call_ids=(step.tool_call_id,)),
+                    AssistantMessageSegment(
+                        content="读到第60000行，7月22日这场令人精疲力竭的聚餐终于在这一句决绝的总结里落下了帷幕："
+                    ),
+                ),
+            )
+        ]
+    )
+    row = view._rows[-1]
+    empty, final = row._segments
+    view.set_tool_steps_visible(False)
+    qtbot.waitUntil(lambda: empty.isHidden())
+    assert empty.content is not None
+    assert empty.content.isHidden()
+    assert empty.content.height() == 0
+    assert all(divider.isHidden() for divider in row._segment_dividers)
+    assert not final.isHidden()
+    _assert_no_body_bar(empty.content)
+    _assert_no_body_bar(final.content)
 
 
 def test_user_message_ignores_tool_steps(qtbot: QtBot) -> None:

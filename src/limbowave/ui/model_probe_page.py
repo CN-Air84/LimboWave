@@ -11,10 +11,12 @@ from PySide6.QtCore import (
     QPoint,
     QPropertyAnimation,
     QRect,
+    QRectF,
     Qt,
+    QVariantAnimation,
     Signal,
 )
-from PySide6.QtGui import QHideEvent, QPainter, QPaintEvent
+from PySide6.QtGui import QColor, QHideEvent, QPainter, QPainterPath, QPaintEvent
 from PySide6.QtWidgets import (
     QCheckBox,
     QFrame,
@@ -28,9 +30,15 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from limbowave.application.services.model_probe import DiscoveryResult, ModelProbeResult
+from limbowave.application.services.model_probe import (
+    DiscoveryResult,
+    ModelProbeProgress,
+    ModelProbeResult,
+    model_probe_request_total,
+)
 from limbowave.domain.models import ActualModel, ModelCapability
 from limbowave.domain.providers import EndpointConfig
+from limbowave.ui import theme
 
 CAPABILITIES: tuple[tuple[ModelCapability, str], ...] = (
     ("supports_streaming", "流式"),
@@ -83,6 +91,7 @@ class ActualModelRow(QFrame):
 
     capability_changed = Signal(str, bool)
     probe_requested = Signal()
+    add_requested = Signal()
 
     def __init__(self, model_id: str, name: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -91,6 +100,13 @@ class ActualModelRow(QFrame):
         self.display_name = name
         self.saved = False
         self.probe_succeeded = False
+        self._probe_progress: ModelProbeProgress | None = None
+        self._displayed_probe_progress = 0.0
+        self._probe_progress_target = 0.0
+        self._probe_progress_animation = QVariantAnimation(self)
+        self._probe_progress_animation.setDuration(320)
+        self._probe_progress_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._probe_progress_animation.valueChanged.connect(self._set_displayed_probe_progress)
         self.actual: ActualModel | None = None
         self._layout_position: QPoint | None = None
         self._move_animation = QPropertyAnimation(self, b"pos", self)
@@ -120,6 +136,14 @@ class ActualModelRow(QFrame):
             root.addWidget(checkbox)
             self.set_capability(key, None, "未测")
 
+        self.add = QPushButton("添加")
+        self.add.setObjectName("actualModelAdd")
+        self.add.setFixedWidth(self.add.fontMetrics().horizontalAdvance("已添加") + 28)
+        self.add.setAccessibleName(f"添加模型 {model_id}")
+        self.add.setToolTip("添加到模型列表；不改变检测选择")
+        self.add.clicked.connect(self.add_requested.emit)
+        root.addWidget(self.add)
+
         self.detect = QPushButton("检测能力")
         self.detect.clicked.connect(self.probe_requested.emit)
         root.addWidget(self.detect)
@@ -136,8 +160,60 @@ class ActualModelRow(QFrame):
         )
         self.set_status(self.status_text)
 
+    def _set_displayed_probe_progress(self, value: float) -> None:
+        self._displayed_probe_progress = value
+        self.update()
+
+    def set_probe_progress(self, progress: ModelProbeProgress) -> None:
+        self._probe_progress = progress
+        self.set_status(self.status_text)
+        target = (
+            min(1.0, max(0.0, progress.completed / progress.total)) if progress.total > 0 else 0.0
+        )
+        self._probe_progress_target = target
+        animation = self._probe_progress_animation
+        # 重测立即清零；不可见的行直接同步，回来时不重播已过去的检测进度。
+        if target == 0.0 or not self.isVisible():
+            animation.stop()
+            self._set_displayed_probe_progress(target)
+            return
+        if animation.state() == QAbstractAnimation.State.Running and animation.endValue() == target:
+            return
+        animation.stop()
+        if self._displayed_probe_progress == target:
+            return
+        # 连续完成请求时从当前画面续接，不退回上一个请求对应的刻度。
+        animation.setStartValue(self._displayed_probe_progress)
+        animation.setEndValue(target)
+        animation.start()
+
+    def finish_probe_progress(self) -> None:
+        if self._probe_progress is not None:
+            completed = self._probe_progress.completed or self._probe_progress.total
+            self.set_probe_progress(ModelProbeProgress(completed, completed))
+
+    def paintEvent(self, event: QPaintEvent) -> None:
+        super().paintEvent(event)
+        if self._displayed_probe_progress <= 0:
+            return
+        # 在既有背景上绘制、在子控件下方填充；不增加会截获点击的覆盖控件。
+        rect = QRectF(self.rect()).adjusted(1, 1, -1, -1)
+        path = QPainterPath()
+        radius = max(0, theme.RADIUS_MD - 1)
+        path.addRoundedRect(rect, radius, radius)
+        color = QColor(theme.ACCENT)
+        color.setAlpha(40)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setClipPath(path)
+        rect.setWidth(rect.width() * self._displayed_probe_progress)
+        painter.fillRect(rect, color)
+
     def set_status(self, text: str) -> None:
         self.status_text = text
+        if self._probe_progress is not None:
+            progress = self._probe_progress
+            text += f"\n请求进度：{progress.completed}/{progress.total}"
         self.setToolTip(f"{self.id_label.toolTip()}\n{text}")
         self.setAccessibleDescription(text)
         self.detect.setToolTip(
@@ -208,6 +284,8 @@ class ActualModelRow(QFrame):
         animation.start()
 
     def hideEvent(self, event: QHideEvent) -> None:
+        self._probe_progress_animation.stop()
+        self._set_displayed_probe_progress(self._probe_progress_target)
         self._move_animation.stop()
         if self._layout_position is not None:
             self.move(self._layout_position)
@@ -217,6 +295,7 @@ class ActualModelRow(QFrame):
         for checkbox in self.checkboxes.values():
             checkbox.setEnabled(not busy)
         self.detect.setEnabled(not busy)
+        self.add.setEnabled(not busy and not self.saved)
 
 
 class _ModelListHeader(QFrame):
@@ -230,13 +309,15 @@ class _ModelListHeader(QFrame):
         self._layout.setSpacing(14)
         self.id_label = QLabel("模型id")
         self.capabilities_label = QLabel("能力")
-        for label in (self.id_label, self.capabilities_label):
+        self.add_label = QLabel("添加")
+        for label in (self.id_label, self.capabilities_label, self.add_label):
             label.setProperty("hint", True)
             font = label.font()
             font.setBold(True)
             label.setFont(font)
         self._layout.addWidget(self.id_label, 1)
         self._layout.addWidget(self.capabilities_label)
+        self._layout.addWidget(self.add_label)
 
     def align_to_row(self, row: ActualModelRow) -> None:
         layout = row.layout()
@@ -245,10 +326,11 @@ class _ModelListHeader(QFrame):
         first = row.checkboxes[CAPABILITIES[0][0]].geometry()
         last = row.checkboxes[CAPABILITIES[-1][0]].geometry()
         self._layout.setContentsMargins(
-            row.id_label.x(), 6, row.width() - last.right() - 1, 6,
+            row.id_label.x(), 6, row.width() - row.add.geometry().right() - 1, 6,
         )
         self._layout.setSpacing(first.left() - row.id_label.geometry().right() - 1)
         self.capabilities_label.setFixedWidth(last.right() - first.left() + 1)
+        self.add_label.setFixedWidth(row.add.width())
 
 
 class _ModelRowsLayout(QVBoxLayout):
@@ -311,7 +393,7 @@ class ActualModelsPage(QWidget):
         self._status.setProperty("hint", True)
         actions.addWidget(self._status, 1)
         self._select_all = QPushButton("全部添加")
-        self._select_all.setToolTip("将全部模型添加到模型列表并勾选；不会自动检测或覆盖已有能力")
+        self._select_all.setToolTip("将全部模型添加到模型列表；不改变检测选择或覆盖已有能力")
         self._select_all.clicked.connect(self._add_all_models)
         self._select_all.setEnabled(False)
         actions.addWidget(self._select_all)
@@ -364,7 +446,8 @@ class ActualModelsPage(QWidget):
         root.addWidget(self._models, 1)
 
         note = QLabel(
-            "行首复选框仅选择待检测模型；流式、思考、工具可直接勾选，修改后自动保存。"
+            "添加列显示是否已添加，添加操作不改变检测选择；行首复选框仅选择待检测模型。"
+            "流式、思考、工具可直接勾选，修改后自动保存。"
             "半选表示尚未确认。主动检测会更新能力声明，检测完成后仍可手动调整。"
         )
         note.setWordWrap(True)
@@ -408,6 +491,7 @@ class ActualModelsPage(QWidget):
         row.selected.setChecked(selected)
         row.selected.toggled.connect(self._on_selection_changed)
         row.probe_requested.connect(partial(self._probe_row, model_id))
+        row.add_requested.connect(partial(self._save_model, row))
         row.capability_changed.connect(partial(self._save_capability, model_id))
         self._rows[model_id] = row
         self._model_layout.insertWidget(self._model_layout.count() - 1, row)
@@ -417,9 +501,9 @@ class ActualModelsPage(QWidget):
         for actual in models:
             if actual.endpoint_id != self.endpoint_id:
                 continue
-            # 本地已保存的模型默认勾选；刷新已有行时保留用户当前的选择。
+            # 添加状态与检测选择独立；刷新已有行时保留用户当前的选择。
             row = self._item(actual.model_id) or self._new_row(
-                actual.model_id, actual.display_name, selected=True,
+                actual.model_id, actual.display_name,
             )
             row.saved = True
             if (
@@ -520,7 +604,6 @@ class ActualModelsPage(QWidget):
         if model_id not in self._manual_ids:
             self._manual_ids.append(model_id)
         row = self._item(model_id) or self._new_row(model_id, model_id)
-        row.selected.setChecked(True)
         self._update_actions()
         return row
 
@@ -559,9 +642,19 @@ class ActualModelsPage(QWidget):
             return
         row = self._item(model_id) or self._new_row(model_id, model_id)
         self._probing.add(model_id)
+        if self._endpoint is not None:
+            row.set_probe_progress(ModelProbeProgress(0, model_probe_request_total(self._endpoint)))
         row.set_busy(True)
-        row.set_status("检测中…当前能力声明暂不变")
+        row.set_status("检测中（按站点 RPM 排队）…当前能力声明暂不变")
         self._update_actions()
+
+    def apply_probe_progress(
+        self, endpoint_id: str, model_id: str, progress: ModelProbeProgress,
+    ) -> None:
+        if self.endpoint_id != endpoint_id or model_id not in self._probing:
+            return
+        if (row := self._item(model_id)) is not None:
+            row.set_probe_progress(progress)
 
     def apply_probe_result(
         self, endpoint_id: str, result: ModelProbeResult, actual: ActualModel | None = None,
@@ -569,6 +662,7 @@ class ActualModelsPage(QWidget):
         if self.endpoint_id != endpoint_id or (row := self._item(result.model_id)) is None:
             return
         self._probing.discard(result.model_id)
+        row.finish_probe_progress()
         if actual is not None:
             row.apply_actual(actual)
         row.set_busy(False)
@@ -636,9 +730,7 @@ class ActualModelsPage(QWidget):
         rows = list(self._rows.values())
         self._updating = True
         try:
-            for row in rows:
-                row.selected.setChecked(True)
-            self._status.setText(f"已选择 {len(rows)} 个模型，按「批量检测」执行检测")
+            self._status.setText("添加模型到模型列表；检测选择保持不变")
             for row in rows:
                 if self._can_add_model(row):
                     self._save_model(row)
@@ -680,12 +772,15 @@ class ActualModelsPage(QWidget):
     def _update_actions(self) -> None:
         if self._updating:
             return
+        for row in self._rows.values():
+            row.add.setText("已添加" if row.saved else "添加")
+            row.add.setEnabled(self._endpoint is not None and self._can_add_model(row))
         self._sort_rows()
         self._empty.setVisible(not self._rows)
         self._select_all.setEnabled(
             self._endpoint is not None
             and any(
-                not row.selected.isChecked() or self._can_add_model(row)
+                self._can_add_model(row)
                 for row in self._rows.values()
             )
         )

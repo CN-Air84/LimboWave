@@ -12,6 +12,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QMouseEvent, QTextCursor
 from PySide6.QtWidgets import (
@@ -32,9 +34,48 @@ from PySide6.QtWidgets import (
 from limbowave.application.services.compression_service import (
     CompressionService,
 )
-from limbowave.domain.compaction import CompressionVersion
+from limbowave.domain.compaction import CompressionContext, CompressionVersion
 from limbowave.ui import theme
 from limbowave.ui.floating import FloatingPanel
+
+
+class CompressionDivider(QWidget):
+    """A persistent, presentation-only boundary after the compacted messages."""
+
+    def __init__(self, context: CompressionContext, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.context = context
+        self.setObjectName("compressionDivider")
+        version = context.version
+        title = "会话已压缩" if context.is_active else "历史压缩"
+        detail = "当前生效版本" if context.is_active else "非当前生效版本"
+        timestamp = version.created_at.astimezone().strftime("%Y-%m-%d %H:%M")
+        tooltip = (
+            f"{timestamp} · {detail}\n"
+            "此分隔线上方为本次压缩覆盖的历史，原始消息仍保留。"
+        )
+        if version.tokens_before > 0 and version.tokens_after > 0:
+            tooltip += (f"\n上下文 tokens（估算）：{version.tokens_before:,}"
+                        f" → {version.tokens_after:,}")
+        self.setToolTip(tooltip)
+        self.setAccessibleName(title)
+        self.setAccessibleDescription(tooltip)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(8, 12, 8, 12)
+        layout.setSpacing(12)
+        self._label = QLabel(title)
+        self._label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._label.setStyleSheet(
+            f"color: {theme.TEXT_SECONDARY}; font-size: {theme.FS_SMALL}px;"
+            " border: none; background: transparent;"
+        )
+        for index in range(2):
+            line = QWidget()
+            line.setFixedHeight(1)
+            line.setStyleSheet(f"background: {theme.BORDER}; border: none;")
+            layout.addWidget(line, 1)
+            if index == 0:
+                layout.addWidget(self._label)
 
 
 class ContextUsageBar(QWidget):
@@ -124,6 +165,8 @@ class CompressionPreviewDialog(QDialog):
     """
 
     # 操作结果外发，供上层刷新占用条与状态
+    apply_requested = Signal(str, str)  # version_id, edited_summary
+    rollback_requested = Signal(str)  # branch_id
     accepted = Signal(str)  # version_id
     retry_requested = Signal(str)  # version_id
     rolled_back = Signal(str)  # branch_id
@@ -133,17 +176,21 @@ class CompressionPreviewDialog(QDialog):
         service: CompressionService,
         version_id: str,
         parent: QWidget | None = None,
+        *, runtime_managed: bool = False,
     ) -> None:
         super().__init__(parent)
+        self._runtime_managed = runtime_managed
+        from limbowave.ui.background_tasks import BackgroundTasks
+
+        self._jobs = BackgroundTasks(self)
+        self._reload_generation = 0
+        self._version_cache: dict[str, CompressionVersion] = {}
         self._service = service
         self._version_id = version_id
         self.setWindowTitle("压缩预览")
         self.resize(720, 540)
 
-        version = service.get(version_id)
-        if version is None:
-            raise ValueError(f"压缩版本不存在：{version_id}")
-        self._branch_id = version.branch_id
+        self._branch_id = ""
 
         root = QVBoxLayout(self)
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -199,29 +246,55 @@ class CompressionPreviewDialog(QDialog):
         close_box.button(QDialogButtonBox.StandardButton.Close).clicked.connect(self.accept)
         root.addWidget(close_box)
 
-        self._reload_versions()
-        self._render(version)
+        self.setEnabled(False)
+        self._jobs.submit(
+            lambda: service.get(version_id), self._loaded,
+            lambda exc: self._meta.setText(str(exc)),
+        )
 
     # ---------- 数据 ----------
 
+    def _loaded(self, version: CompressionVersion | None) -> None:
+        if version is None:
+            self._meta.setText("压缩版本不存在")
+            return
+        self._branch_id = version.branch_id
+        self._version_cache[version.id] = version
+        self._render(version)
+        self.setEnabled(True)
+        self._reload_versions()
+
     def _reload_versions(self) -> None:
-        self._versions.clear()
-        active = self._service.get_active(self._branch_id)
-        for v in self._service.list_versions(self._branch_id):
-            status_text = {
-                "draft": "草稿",
-                "previewed": "预览",
-                "accepted": "已接受",
-                "rejected": "已拒绝",
-                "failed": "失败",
-            }.get(v.status.value, v.status.value)
-            mark = "● " if active is not None and v.id == active.id else ""
-            error_mark = " ⚠" if v.status.value == "failed" else ""
-            item = QListWidgetItem(
-                f"{mark}{v.created_at.astimezone():%m-%d %H:%M}  {status_text}{error_mark}"
-            )
-            item.setData(Qt.ItemDataRole.UserRole, v.id)
-            self._versions.addItem(item)
+        self._reload_generation += 1
+        generation = self._reload_generation
+        service, branch_id = self._service, self._branch_id
+
+        def read() -> tuple[CompressionVersion | None, list[CompressionVersion]]:
+            return service.get_active(branch_id), service.list_versions(branch_id)
+
+        def apply(data: tuple[CompressionVersion | None, list[CompressionVersion]]) -> None:
+            if generation != self._reload_generation:
+                return
+            active, versions = data
+            self._version_cache = {version.id: version for version in versions}
+            self._versions.clear()
+            for v in versions:
+                status_text = {
+                    "draft": "草稿",
+                    "previewed": "预览",
+                    "accepted": "已接受",
+                    "rejected": "已拒绝",
+                    "failed": "失败",
+                }.get(v.status.value, v.status.value)
+                mark = "● " if active is not None and v.id == active.id else ""
+                error_mark = " ⚠" if v.status.value == "failed" else ""
+                item = QListWidgetItem(
+                    f"{mark}{v.created_at.astimezone():%m-%d %H:%M}  {status_text}{error_mark}"
+                )
+                item.setData(Qt.ItemDataRole.UserRole, v.id)
+                self._versions.addItem(item)
+
+        self._jobs.submit(read, apply, lambda exc: self._meta.setText(str(exc)))
 
     def _render(self, version: CompressionVersion) -> None:
         self._version_id = version.id
@@ -248,34 +321,70 @@ class CompressionPreviewDialog(QDialog):
     ) -> None:
         if current is None:
             return
-        version = self._service.get(current.data(Qt.ItemDataRole.UserRole))
+        version = self._version_cache.get(current.data(Qt.ItemDataRole.UserRole))
         if version is not None:
             self._render(version)
 
     # ---------- 操作 ----------
 
+    def _change(self, work: Callable[[], bool], done: Callable[[], None]) -> None:
+        self.setEnabled(False)
+
+        def ready(changed: bool) -> None:
+            self.setEnabled(True)
+            if changed:
+                self._reload_versions()
+                done()
+
+        def failed(exc: Exception) -> None:
+            self.setEnabled(True)
+            self._meta.setText(str(exc))
+
+        self._jobs.submit(work, ready, failed)
+
     def _on_accept(self) -> None:
-        # 用户可能改过摘要——先存编辑版再接受
         edited = self._summary.toPlainText()
-        current = self._service.get(self._version_id)
-        if current is not None and edited != current.effective_summary:
-            self._service.edit_summary(self._version_id, edited)
-        if self._service.accept(self._version_id):
-            self._reload_versions()
-            self.accepted.emit(self._version_id)
+        service, version_id = self._service, self._version_id
+        if self._runtime_managed:
+            self.setEnabled(False)
+            self.apply_requested.emit(version_id, edited)
+            return
+
+        def work() -> bool:
+            current = service.get(version_id)
+            if current is not None and edited != current.effective_summary:
+                service.edit_summary(version_id, edited)
+            return service.accept(version_id)
+
+        self._change(work, lambda: self.accepted.emit(version_id))
 
     def _on_retry(self) -> None:
-        # 重试：通知上层重新生成（产出新版本），本对话框不关
         self.retry_requested.emit(self._version_id)
 
     def _on_reject(self) -> None:
-        if self._service.reject(self._version_id):
-            self._reload_versions()
+        version_id = self._version_id
+        self._change(lambda: self._service.reject(version_id), lambda: None)
 
     def _on_rollback(self) -> None:
-        if self._service.rollback(self._branch_id):
-            self._reload_versions()
+        branch_id = self._branch_id
+        if self._runtime_managed:
+            self.setEnabled(False)
+            self.rollback_requested.emit(branch_id)
+            return
+        self._change(lambda: self._service.rollback(branch_id),
+                     lambda: self.rolled_back.emit(branch_id))
+
+    def finish_runtime_change(self, success: bool, *, rollback: bool = False) -> None:
+        """Called only after the runtime transition and database commit have settled."""
+        self.setEnabled(True)
+        if not success:
+            self._meta.setText('未能应用：请确认当前分支空闲且运行时可恢复。启用版本未擅自改变。')
+            return
+        self._reload_versions()
+        if rollback:
             self.rolled_back.emit(self._branch_id)
+        else:
+            self.accepted.emit(self._version_id)
 
 
 class CompressionThinkingPanel(FloatingPanel):
@@ -288,15 +397,26 @@ class CompressionThinkingPanel(FloatingPanel):
 
     THINKING = "压缩模型正在思考…"
     SUMMARIZING = "思考结束，正在生成摘要…"
+    STOPPING = "正在停止…"
+    STOPPED = "压缩已停止"
     FINISHED = "压缩已结束"
+
+    cancel_requested = Signal()
 
     def __init__(self, parent: QWidget) -> None:
         super().__init__(parent, "压缩 · 思考过程", width=520)
+        header = QHBoxLayout()
         self._status = QLabel(self.THINKING)
         self._status.setStyleSheet(
             f"color: {theme.TEXT_SECONDARY}; font-size: {theme.FS_SMALL}px;"
         )
-        self.content_layout.addWidget(self._status)
+        header.addWidget(self._status, 1)
+        self._stop = QPushButton("停止")
+        self._stop.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._stop.setToolTip("停止压缩")
+        self._stop.clicked.connect(self.cancel_requested.emit)
+        header.addWidget(self._stop)
+        self.content_layout.addLayout(header)
 
         self._text = QPlainTextEdit()
         self._text.setReadOnly(True)
@@ -331,8 +451,17 @@ class CompressionThinkingPanel(FloatingPanel):
         """思考结束、模型开始写摘要正文（正文不在这里展示，留给压缩预览）。"""
         self._status.setText(self.SUMMARIZING)
 
+    def note_stopping(self) -> None:
+        self._status.setText(self.STOPPING)
+        self._stop.setEnabled(False)
+
+    def note_stopped(self) -> None:
+        self._status.setText(self.STOPPED)
+        self._stop.setEnabled(False)
+
     def note_finished(self) -> None:
         self._status.setText(self.FINISHED)
+        self._stop.setEnabled(False)
 
     def _on_scrolled(self, value: int) -> None:
         self._follow = value >= self._text.verticalScrollBar().maximum()

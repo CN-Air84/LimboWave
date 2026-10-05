@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from itertools import count
 from typing import Any
 
 import httpx
@@ -248,3 +249,10 @@ def test_tool_rejection_keeps_stream_result_and_does_not_retry(
     assert len(bodies) == 2
     assert "tools" not in bodies[0]
     assert "tool_choice" not in bodies[1]
+
+
+@pytest.fixture(autouse=True)
+def fast_probe_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """真实限流逻辑仍运行；模拟时间避免已有协议测试每次等待 12 秒。"""
+    monkeypatch.setattr(model_probe.DEFAULT_RATE_LIMITER, "_clock", count(step=60).__next__)
+    monkeypatch.setattr(model_probe.DEFAULT_RATE_LIMITER, "_last", {})

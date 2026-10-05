@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from itertools import count
 from typing import Any
 
 import httpx
@@ -218,3 +219,53 @@ def test_budget_protocol_does_not_claim_untested_discrete_levels(
     assert result.thinking.levels == ()
     assert result.default_thinking_level is None
     assert len([body for body in bodies if "thinking" in body]) == 1
+
+
+@pytest.fixture(autouse=True)
+def fast_probe_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """真实限流逻辑仍运行；模拟时间避免已有协议测试每次等待 12 秒。"""
+    monkeypatch.setattr(model_probe.DEFAULT_RATE_LIMITER, "_clock", count(step=60).__next__)
+    monkeypatch.setattr(model_probe.DEFAULT_RATE_LIMITER, "_last", {})
+
+
+def test_every_probe_http_request_acquires_shared_site_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from limbowave.application.services.endpoint_rate_limiter import EndpointRateLimiter
+
+    now = 0.0
+    limiter = EndpointRateLimiter(clock=lambda: now)
+    endpoint = _endpoint()
+    limiter.configure([endpoint])
+    assert limiter.try_acquire(endpoint.id) == 0  # 模拟刚发出的对话请求。
+    waits: list[float] = []
+    requests: list[httpx.Request] = []
+
+    def advance(seconds: float) -> None:
+        nonlocal now
+        waits.append(seconds)
+        now += seconds
+
+    monkeypatch.setattr(limiter._stopped, "wait", advance)
+    original = httpx.Client
+
+    def client(**kwargs: object) -> httpx.Client:
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            # hook 已占用当前请求的额度，不能在同一时刻发出另一请求。
+            assert limiter.try_acquire(endpoint.id) == pytest.approx(12)
+            if request.method == "GET":
+                return httpx.Response(200, json={"data": [{"id": "m"}]})
+            body = json.loads(request.content)
+            if "tools" in body:
+                return _tool_turn(body)
+            return _event({"choices": [{"delta": {"content": "ok", "reasoning_content": "hmm"}}]})
+        return original(transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr(model_probe.httpx, "Client", client)
+    model_probe.discover_models(endpoint, "private", limiter=limiter)
+    result = model_probe.probe_model_capabilities(endpoint, "m", "private", limiter=limiter)
+    assert result.alive and result.supports_tools
+    # 清单 + 流式 + 每一个思考等级 + 工具调用/结果回传，不能只按模型数限流。
+    assert len(requests) == 1 + 1 + len(model_probe.PROBE_LEVELS) + 2
+    assert sum(waits) == pytest.approx(12 * len(requests))

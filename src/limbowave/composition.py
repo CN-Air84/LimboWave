@@ -110,8 +110,13 @@ def kernel_setup(kernel: AgentKernel, decision: RoutingDecision) -> KernelSetup:
         retry_policy=decision.endpoint.retry.to_policy(),
         default_thinking_level=decision.binding.default_thinking_level,
         thinking_level_locked=decision.binding.thinking_level_locked,
-        available_thinking_levels=decision.binding.available_thinking_levels,
-        supports_thinking=decision.binding.supports_thinking,
+        available_thinking_levels=tuple(dict.fromkeys((
+            *decision.binding.available_thinking_levels, *decision.binding.user_thinking_levels,
+        ))),
+        supports_thinking=(
+            True if any(level != "off" for level in decision.binding.user_thinking_levels)
+            else decision.binding.supports_thinking
+        ),
         supports_tools=decision.binding.supports_tools,
     )
 

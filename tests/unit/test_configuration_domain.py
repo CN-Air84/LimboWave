@@ -49,11 +49,12 @@ def test_default_model_must_exist() -> None:
         AppConfiguration(endpoints=[_endpoint()], models=[_model()], default_model_id="ghost")
 
 
-def test_default_binding_out_of_range_rejected() -> None:
-    model = _model()
-    bad = model.model_copy(update={"default_binding": 5})
-    with pytest.raises(ValidationError):
-        AppConfiguration(endpoints=[_endpoint()], models=[bad])
+def test_legacy_default_binding_is_ignored() -> None:
+    legacy = {**_model().model_dump(), "default_binding": 5}
+    model = LogicalModel.model_validate(legacy)
+    config = AppConfiguration(endpoints=[_endpoint()], models=[model])
+    assert config.models[0].bindings[0].endpoint_id == "ep1"
+    assert "default_binding" not in config.model_dump()["models"][0]
 
 
 def test_base_url_must_be_url() -> None:
@@ -71,3 +72,19 @@ def test_config_has_no_secret_field() -> None:
         assert "credential_ref" in endpoint
         for forbidden in ("api_key", "apiKey", "secret", "key", "token", "password"):
             assert forbidden not in endpoint, f"端点配置含密钥本体字段：{forbidden}"
+
+
+def test_endpoint_rpm_defaults_for_legacy_configuration() -> None:
+    payload = _endpoint().model_dump(mode="json")
+    payload.pop("rpm")
+    assert EndpointConfig.model_validate(payload).rpm == 5
+    payload["rpm"] = 42
+    assert EndpointConfig.model_validate_json(
+        EndpointConfig.model_validate(payload).model_dump_json()
+    ).rpm == 42
+
+
+@pytest.mark.parametrize("rpm", [0, -1, 60_001, 1.5, True, "5"])
+def test_endpoint_rpm_rejects_invalid_limits(rpm: object) -> None:
+    with pytest.raises(ValidationError):
+        EndpointConfig.model_validate({**_endpoint().model_dump(), "rpm": rpm})

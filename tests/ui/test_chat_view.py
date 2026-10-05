@@ -21,6 +21,13 @@ from limbowave.ui.chat_view import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _release_test_clipboard(qapp):
+    """Offscreen Qt must release its image MIME owner before QApplication teardown."""
+    yield
+    qapp.clipboard().clear()
+
+
 @pytest.mark.parametrize(
     ("available", "collapsed", "expanded"),
     [
@@ -38,6 +45,8 @@ def test_composer_span_keeps_width_and_centers(
     panel = 276  # 高级栏 260 + 间距 16
     assert _composer_span(available, panel, 0.0) == collapsed
     assert _composer_span(available, panel, 1.0) == expanded
+
+
 
 
 def test_attachment_chips_do_not_widen_composer(qtbot: QtBot) -> None:
@@ -386,7 +395,7 @@ def test_thinking_block_collapsed_by_default(qtbot: QtBot) -> None:
 
     row._thinking._on_toggle()
     assert not row._thinking._content.isHidden()
-    assert "在想" in row._thinking._content.text()
+    assert "在想" in row._thinking.text()
 
 
 def test_thinking_only_on_assistant(qtbot: QtBot) -> None:
@@ -405,7 +414,7 @@ def test_load_history_restores_thinking(qtbot: QtBot) -> None:
     view.load_history([("assistant", "回答", "当时的思考", "m9")])
     row = view._rows[-1]
     assert row._thinking is not None
-    assert row._thinking._content.text() == "当时的思考"
+    assert row._thinking.text() == "当时的思考"
     assert row._thinking._content.isHidden()
 
 
@@ -461,8 +470,8 @@ def test_edit_in_composer_submits_edit_and_cancel_clears(qtbot: QtBot) -> None:
     assert view._input.toPlainText() == ""
     assert view.attachments.attachment_ids() == []
 
-def test_assistant_fork_button_emits_regenerate(qtbot: QtBot) -> None:
-    """助手回复下方的 Fork：外发 message_id，应用层在新分支上重新生成这条回复。"""
+def test_assistant_fork_button_emits_fork(qtbot: QtBot) -> None:
+    """Fork 和重新生成是相邻但独立的动作。"""
     view = ChatView()
     qtbot.addWidget(view)
     view.show()
@@ -470,9 +479,28 @@ def test_assistant_fork_button_emits_regenerate(qtbot: QtBot) -> None:
     row = view._rows[-1]
     assert row._fork_btn is not None and row._fork_btn.isVisible()
 
-    with qtbot.waitSignal(view.regenerate_requested, timeout=1000) as blocker:
+    with qtbot.waitSignal(view.fork_requested, timeout=1000) as blocker:
         qtbot.mouseClick(row._fork_btn, Qt.MouseButton.LeftButton)
     assert blocker.args == ["m2"]
+
+
+def test_assistant_regenerate_button_is_adjacent_and_emits_regenerate(qtbot: QtBot) -> None:
+    view = ChatView()
+    qtbot.addWidget(view)
+    view.show()
+    view.load_history([("assistant", "回答", "", "m2")])
+    row = view._rows[-1]
+    assert row._regenerate_btn is not None and row._regenerate_btn.isVisible()
+    assert row._regenerate_btn.accessibleName() == "重新生成"
+    layout = row._actions.layout()
+    assert layout.indexOf(row._regenerate_btn) == layout.indexOf(row._fork_btn) + 1
+    assert "重新生成" not in row._fork_btn.toolTip()
+    forks = []
+    view.fork_requested.connect(forks.append)
+    with qtbot.waitSignal(view.regenerate_requested, timeout=1000) as blocker:
+        qtbot.mouseClick(row._regenerate_btn, Qt.MouseButton.LeftButton)
+    assert blocker.args == ["m2"]
+    assert forks == []
 
 
 def test_streaming_row_gets_actions_after_finalize(qtbot: QtBot) -> None:
@@ -487,11 +515,13 @@ def test_streaming_row_gets_actions_after_finalize(qtbot: QtBot) -> None:
     assert row is not None and row._actions is not None
     assert row._message_id is None
     assert row._actions.isHidden()
+    assert row._regenerate_btn.isHidden()
 
     view.end_assistant("定稿", "m-final")
     assert row._message_id == "m-final"
     assert row._copy_btn is not None and row._copy_btn.isVisible()
     assert row._fork_btn is not None and row._fork_btn.isVisible()
+    assert row._regenerate_btn is not None and row._regenerate_btn.isVisible()
     actions = row._actions
     qtbot.waitUntil(lambda: actions.y() > row.label.geometry().bottom())
 
@@ -944,9 +974,9 @@ def test_history_restores_thinking_per_segment(qtbot: QtBot) -> None:
     )
     card = view._rows[-1]
     assert card._segments[0].thinking is not None
-    assert card._segments[0].thinking._content.text() == "思考一"
+    assert card._segments[0].thinking.text() == "思考一"
     assert card._segments[1].thinking is not None
-    assert card._segments[1].thinking._content.text() == "思考二"
+    assert card._segments[1].thinking.text() == "思考二"
     # 两个思考块都默认折叠
     assert card._segments[0].thinking._content.isHidden()
     assert card._segments[1].thinking._content.isHidden()
@@ -1270,6 +1300,8 @@ def test_compression_masks_composer_and_drains_progress(qtbot: QtBot) -> None:
     assert overlay.geometry() == view._composer.rect()
     assert not view._input.isEnabled()
     assert not view._send_btn.isEnabled()
+    assert overlay._stop.isEnabled()
+    assert overlay._stop.toolTip() == "停止压缩"
     assert view.compression_progress == 40.0
     # 每秒千分之三：按 100ms 一步走，每步 0.03 个百分点
     view._drain_compression()
@@ -1290,6 +1322,22 @@ def test_compression_finish_settles_to_after_percent_then_unmasks(qtbot: QtBot) 
     assert not view._composer.compression_overlay.isVisible()
     assert view._input.isEnabled()
     assert view._send_btn.isEnabled()
+
+
+def test_compression_stop_button_requests_stop(qtbot: QtBot) -> None:
+    view = ChatView()
+    qtbot.addWidget(view)
+    view.resize(800, 640)
+    view.show()
+    view.begin_compression(40.0)
+    stop = view._composer.compression_overlay._stop
+
+    with qtbot.waitSignal(view.stop_requested, timeout=1000):
+        qtbot.mouseClick(stop, Qt.MouseButton.LeftButton)
+
+    view.note_compression_stopping()
+    assert view._composer.compression_overlay._label == "正在停止"
+    assert not stop.isEnabled()
 
 
 def test_compression_failure_returns_to_start_percent(qtbot: QtBot) -> None:

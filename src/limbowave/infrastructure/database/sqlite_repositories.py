@@ -38,7 +38,14 @@ from limbowave.application.repositories import (
     SnapshotRepository,
 )
 from limbowave.domain.compaction import CompressionStatus, CompressionVersion
-from limbowave.domain.conversation import Branch, Conversation, Message, MessageRole, MessageStatus
+from limbowave.domain.conversation import (
+    AssistantMessageSegment,
+    Branch,
+    Conversation,
+    Message,
+    MessageRole,
+    MessageStatus,
+)
 from limbowave.domain.files import FileDocument, FileKind, ImageAttachment, ImageFormat
 from limbowave.domain.permissions import (
     Capability,
@@ -69,6 +76,16 @@ def _load_tool_steps(blob: str) -> tuple[ToolStep, ...]:
         return tuple(ToolStep.from_json(item) for item in json.loads(blob))
     except (ValueError, TypeError, KeyError):
         return ()
+
+
+def _dump_segments(segments: tuple[AssistantMessageSegment, ...]) -> str:
+    return json.dumps([segment.to_json() for segment in segments], ensure_ascii=False)
+
+
+def _load_segments(blob: str) -> tuple[AssistantMessageSegment, ...]:
+    if not blob:
+        return ()
+    return tuple(AssistantMessageSegment.from_json(item) for item in json.loads(blob))
 
 
 def _iso(value: datetime) -> str:
@@ -216,7 +233,7 @@ class _Branches:
         self._conn.execute(
             "INSERT INTO branches "
             "(id, conversation_id, created_at, parent_branch_id, forked_from_message_id, "
-            "title_enc) VALUES (?, ?, ?, ?, ?, ?)",
+            "title_enc, include_fork_message) VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
                 branch.id,
                 branch.conversation_id,
@@ -224,6 +241,7 @@ class _Branches:
                 branch.parent_branch_id,
                 branch.forked_from_message_id,
                 self._key.encrypt(branch.title) if branch.title is not None else None,
+                int(branch.include_fork_message),
             ),
         )
 
@@ -239,7 +257,7 @@ class _Branches:
     def get(self, branch_id: str) -> Branch | None:
         row = self._conn.execute(
             "SELECT id, conversation_id, created_at, parent_branch_id, forked_from_message_id, "
-            "title_enc "
+            "title_enc, include_fork_message "
             "FROM branches WHERE id = ?",
             (branch_id,),
         ).fetchone()
@@ -248,7 +266,7 @@ class _Branches:
     def list_for_conversation(self, conversation_id: str) -> list[Branch]:
         rows = self._conn.execute(
             "SELECT id, conversation_id, created_at, parent_branch_id, forked_from_message_id, "
-            "title_enc "
+            "title_enc, include_fork_message "
             "FROM branches WHERE conversation_id = ? ORDER BY created_at, id",
             (conversation_id,),
         ).fetchall()
@@ -265,6 +283,7 @@ class _Branches:
             parent_branch_id=row[3],
             forked_from_message_id=row[4],
             title=self._key.decrypt(row[5]) if row[5] is not None else None,
+            include_fork_message=bool(row[6]),
         )
 
 
@@ -277,8 +296,8 @@ class _Messages:
         self._conn.execute(
             "INSERT INTO messages "
             "(id, conversation_id, branch_id, role, content_enc, thinking_enc, status, "
-            " created_at, run_id, pi_entry_id, is_whitelisted, tool_steps_enc) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " created_at, run_id, pi_entry_id, is_whitelisted, tool_steps_enc, segments_enc) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 message.id,
                 message.conversation_id,
@@ -292,13 +311,14 @@ class _Messages:
                 message.pi_entry_id,
                 1 if message.is_whitelisted else 0,
                 self._key.encrypt(_dump_tool_steps(message.tool_steps)),
+                self._key.encrypt(_dump_segments(message.segments)),
             ),
         )
 
     def update(self, message: Message) -> None:
         self._conn.execute(
             "UPDATE messages SET content_enc = ?, thinking_enc = ?, status = ?, "
-            "run_id = ?, pi_entry_id = ?, is_whitelisted = ?, tool_steps_enc = ? "
+            "run_id = ?, pi_entry_id = ?, is_whitelisted = ?, tool_steps_enc = ?, segments_enc = ? "
             "WHERE id = ?",
             (
                 self._key.encrypt(message.content),
@@ -308,13 +328,14 @@ class _Messages:
                 message.pi_entry_id,
                 1 if message.is_whitelisted else 0,
                 self._key.encrypt(_dump_tool_steps(message.tool_steps)),
+                self._key.encrypt(_dump_segments(message.segments)),
                 message.id,
             ),
         )
 
     _COLUMNS = (
         "id, conversation_id, branch_id, role, content_enc, thinking_enc, "
-        "status, created_at, run_id, pi_entry_id, is_whitelisted, tool_steps_enc"
+        "status, created_at, run_id, pi_entry_id, is_whitelisted, tool_steps_enc, segments_enc"
     )
 
     def get(self, message_id: str) -> Message | None:
@@ -352,6 +373,7 @@ class _Messages:
             pi_entry_id=row[9],
             is_whitelisted=bool(row[10]),
             tool_steps=_load_tool_steps(self._key.decrypt(row[11])),
+            segments=_load_segments(self._key.decrypt(row[12]) if row[12] else ""),
         )
 
 

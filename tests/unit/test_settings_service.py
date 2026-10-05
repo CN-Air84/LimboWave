@@ -204,38 +204,35 @@ def test_unbind_last_binding_keeps_logical_model(service: SettingsService) -> No
         RoutingService(config).route("deepseek-chat")
 
 
-def test_unbind_clamps_default_binding(service: SettingsService) -> None:
-    """默认绑定索引在删除后越界时收敛到 0，不留悬空索引。"""
+def test_unbind_highest_priority_promotes_next_binding(service: SettingsService) -> None:
+    """删除优先级第一的站点后，下一条绑定成为默认站点。"""
     service.upsert_endpoint(_endpoint())
     service.upsert_endpoint(_endpoint(id="relay-b", name="B"))
     service.upsert_endpoint(_endpoint(id="relay-c", name="C"))
     service.upsert_model(_model())
     service.bind_endpoint("deepseek-chat", ModelBinding(endpoint_id="relay-b", model_id="ds"))
     service.bind_endpoint("deepseek-chat", ModelBinding(endpoint_id="relay-c", model_id="ds"))
-    service.set_default_binding("deepseek-chat", 2)
+    service.reorder_bindings("deepseek-chat", ["relay-c", "relay-a", "relay-b"])
 
     config = service.unbind_endpoint("deepseek-chat", "relay-c")
     model = config.models[0]
     assert len(model.bindings) == 2
-    assert model.default_binding <= len(model.bindings) - 1
+    assert model.bindings[0].endpoint_id == "relay-a"
 
 
-def test_unbind_keeps_default_endpoint_not_index(service: SettingsService) -> None:
-    """默认站点跟着绑定走：解掉排在前面的绑定后，默认仍是原来那个站点。"""
+def test_unbind_backup_keeps_highest_priority(service: SettingsService) -> None:
+    """删除低优先级备用绑定，不改变第一位的默认站点。"""
     service.upsert_endpoint(_endpoint())
     service.upsert_endpoint(_endpoint(id="relay-b", name="B"))
     service.upsert_model(_model())
     service.bind_endpoint("deepseek-chat", ModelBinding(endpoint_id="relay-b", model_id="ds"))
-    service.set_default_binding("deepseek-chat", 1)
+    service.reorder_bindings("deepseek-chat", ["relay-b", "relay-a"])
     model = service.unbind_endpoint("deepseek-chat", "relay-a").models[0]
-    assert model.bindings[model.default_binding].endpoint_id == "relay-b"
+    assert model.bindings[0].endpoint_id == "relay-b"
 
 
-def test_set_default_binding_out_of_range(service: SettingsService) -> None:
-    service.upsert_endpoint(_endpoint())
-    service.upsert_model(_model())
-    with pytest.raises(ValueError, match="越界"):
-        service.set_default_binding("deepseek-chat", 5)
+def test_default_binding_has_no_separate_setter(service: SettingsService) -> None:
+    assert not hasattr(service, "set_default_binding")
 
 
 def test_updating_binding_keeps_default_endpoint(service: SettingsService) -> None:
@@ -249,13 +246,12 @@ def test_updating_binding_keeps_default_endpoint(service: SettingsService) -> No
                 ModelBinding(endpoint_id="relay-a", model_id="remote-a"),
                 ModelBinding(endpoint_id="relay-b", model_id="remote-b"),
             ],
-            default_binding=0,
         )
     )
     # 重新检测只更新实际模型目录；绑定上的能力随之投影，默认站点不变
     _probe(service, "relay-a", "remote-a", supports_tools=True)
     model = service.load().models[0]
-    assert model.bindings[model.default_binding].endpoint_id == "relay-a"
+    assert model.bindings[0].endpoint_id == "relay-a"
     assert model.bindings[0].supports_tools
 
 
@@ -628,3 +624,42 @@ def test_legacy_binding_capabilities_migrate_into_catalog(tmp_path: Path) -> Non
     reloaded = service.load().models[0].bindings[0]
     assert reloaded.supports_tools
     assert reloaded.available_thinking_levels == ("low", "high")
+
+
+def test_confirm_thinking_level_merges_only_requested_actual_model(service):
+    service.upsert_endpoint(_endpoint())
+    service.upsert_endpoint(_endpoint("other"))
+    _probe(service, "relay-a", "remote", supports_thinking=True,
+           available_thinking_levels=("low", "high"), supports_tools=True)
+    _probe(service, "other", "remote", supports_thinking=False)
+    before = service.load().actual_model("other", "remote")
+    config = service.confirm_thinking_level("relay-a", "remote", "max")
+    actual = config.actual_model("relay-a", "remote")
+    assert actual.available_thinking_levels == ("low", "high", "max")
+    assert actual.user_thinking_levels == ("max",)
+    assert actual.supports_tools
+    assert config.actual_model("other", "remote") == before
+    service.confirm_thinking_level("relay-a", "remote", "max")
+    assert service.load().actual_model("relay-a", "remote").user_thinking_levels == ("max",)
+
+
+def test_confirm_deleted_actual_model_does_not_recreate_it(service):
+    service.upsert_endpoint(_endpoint())
+    with pytest.raises(ValueError, match="已被删除"):
+        service.confirm_thinking_level("relay-a", "missing", "max")
+
+
+def test_confirmed_levels_survive_probe_but_explicit_disable_clears_them(service):
+    service.upsert_endpoint(_endpoint())
+    _probe(service, "relay-a", "remote", supports_thinking=False)
+    service.confirm_thinking_level("relay-a", "remote", "high")
+    config, _ = _probe(service, "relay-a", "remote", supports_thinking=False)
+    actual = config.actual_model("relay-a", "remote")
+    assert actual.supports_thinking is True
+    assert actual.user_thinking_levels == ("high",)
+    assert actual.available_thinking_levels == ("high",)
+    config, _ = service.set_model_capability(
+        endpoint_id="relay-a", model_id="remote", display_name="remote",
+        capability="supports_thinking", supported=False,
+    )
+    assert config.actual_model("relay-a", "remote").user_thinking_levels == ()

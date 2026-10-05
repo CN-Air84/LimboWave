@@ -450,3 +450,85 @@ async def test_contaminated_mirror_is_filtered_before_real_pi_restore(
     assert "CONTINUE-CLEAN-CANARY" in last
     assert "CURRENT-HISTORY-CANARY" in last
     assert "DELETED-PREFIX-CANARY" not in last
+
+
+async def test_runtime_thinking_levels_and_mapping_reload(
+    mock_models: Path, mock_provider: tuple[int, Path], tmp_path: Path
+):
+    from dataclasses import replace
+
+    from limbowave.application.services.routing_service import RoutingService
+    from limbowave.infrastructure.pi_runtime.environment_builder import EnvironmentBuilder
+    from tests.unit.test_environment_builder import _config
+
+    models_path = mock_models / ".pi" / "agent" / "models.json"
+    body = json.loads(models_path.read_text("utf-8"))
+    entry = body["providers"]["mock"]["models"][0]
+    entry["reasoning"] = False
+    models_path.write_text(json.dumps(body), encoding="utf-8")
+    adapter = PiKernelAdapter(
+        build_spawn_spec(provider="mock", model_id="mock-model", cwd=tmp_path)
+    )
+    try:
+        await adapter.start()
+        assert await adapter.get_available_thinking_levels() == ("off",)
+        entry["reasoning"] = True
+        models_path.write_text(json.dumps(body), encoding="utf-8")
+        await adapter.reload_models({}, (("mock", "mock-model"),))
+        assert await adapter.get_available_thinking_levels() == (
+            "off", "minimal", "low", "medium", "high"
+        )
+        decision = RoutingService(_config()).route()
+        decision = replace(decision, binding=decision.binding.model_copy(update={
+            "supports_thinking": True, "available_thinking_levels": ("low", "high", "max")
+        }))
+        entry["thinkingLevelMap"] = EnvironmentBuilder._model_entry(decision)["thinkingLevelMap"]
+        models_path.write_text(json.dumps(body), encoding="utf-8")
+        # reasoning 不变、仅等级映射变化也必须重申正在使用的模型。
+        await adapter.reload_models({}, (("mock", "mock-model"),))
+        levels = await adapter.get_available_thinking_levels()
+        assert levels == ("off", "low", "high", "max")
+        for level in levels:
+            await adapter.set_thinking_level(level)
+            assert (await adapter.get_state()).thinking_level == level
+        await adapter.send_message("Verify max effort")
+        await _wait_settled(adapter)
+        requests = [json.loads(line) for line in mock_provider[1].read_text("utf-8").splitlines()]
+        assert requests[-1]["body"]["reasoning_effort"] == "max"
+    finally:
+        await adapter.shutdown()
+
+
+async def test_forced_temporary_level_reaches_provider_and_can_be_removed(
+    mock_models: Path, mock_provider: tuple[int, Path], tmp_path: Path
+):
+    from limbowave.infrastructure.pi_runtime.environment_builder import EnvironmentBuilder
+
+    models_path = mock_models / ".pi" / "agent" / "models.json"
+    body = json.loads(models_path.read_text("utf-8"))
+    entry = body["providers"]["mock"]["models"][0]
+    entry["reasoning"] = False
+    models_path.write_text(json.dumps(body), encoding="utf-8")
+    original = dict(entry)
+    adapter = PiKernelAdapter(
+        build_spawn_spec(provider="mock", model_id="mock-model", cwd=tmp_path)
+    )
+    try:
+        await adapter.start()
+        assert await adapter.get_available_thinking_levels() == ("off",)
+        EnvironmentBuilder._allow_thinking_levels(entry, ("max",))
+        models_path.write_text(json.dumps(body), encoding="utf-8")
+        await adapter.reload_models({}, (("mock", "mock-model"),))
+        await adapter.set_thinking_level("max")
+        assert (await adapter.get_state()).thinking_level == "max"
+        await adapter.send_message("temporary trial")
+        await _wait_settled(adapter)
+        requests = [json.loads(line) for line in mock_provider[1].read_text("utf-8").splitlines()]
+        assert requests[-1]["body"]["reasoning_effort"] == "max"
+        body["providers"]["mock"]["models"][0] = original
+        models_path.write_text(json.dumps(body), encoding="utf-8")
+        await adapter.reload_models({}, (("mock", "mock-model"),))
+        assert await adapter.get_available_thinking_levels() == ("off",)
+        assert (await adapter.get_state()).thinking_level == "off"
+    finally:
+        await adapter.shutdown()

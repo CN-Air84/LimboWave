@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QEvent, QObject, QRectF, Qt, QTimer
+from typing import cast
+
+from PySide6.QtCore import QEasingCurve, QEvent, QObject, QRectF, Qt, QTimer, QVariantAnimation
 from PySide6.QtGui import QColor, QHideEvent, QPainter, QPaintEvent, QPen, QShowEvent
 from PySide6.QtWidgets import QWidget
 
 from limbowave.ui import theme
+
+_FADE_MS = 180
 
 
 class HistoryLoadingOverlay(QWidget):
@@ -14,6 +18,12 @@ class HistoryLoadingOverlay(QWidget):
         super().__init__(parent)
         self._text = "正在加载会话…"
         self._angle = 0
+        self._loading = False
+        self._opacity = 0.0
+        self._fade_anim = QVariantAnimation(self)
+        self._fade_anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
+        self._fade_anim.valueChanged.connect(self._set_opacity)
+        self._fade_anim.finished.connect(self._on_fade_finished)
         self._timer = QTimer(self)
         self._timer.setInterval(30)
         self._timer.timeout.connect(self._tick)
@@ -27,6 +37,34 @@ class HistoryLoadingOverlay(QWidget):
         self._text = text
         self.setAccessibleName(text)
         self.update()
+
+    def set_loading(self, loading: bool) -> None:
+        if loading == self._loading:
+            return
+        self._loading = loading
+        opacity = self._opacity
+        self._fade_anim.stop()
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, not loading)
+        if loading:
+            self.show()
+            self.raise_()
+        elif self.isHidden() or self._opacity == 0.0:
+            self._set_opacity(0.0)
+            self.hide()
+            return
+        target = 1.0 if loading else 0.0
+        self._fade_anim.setDuration(max(1, round(_FADE_MS * abs(target - opacity))))
+        self._fade_anim.setStartValue(opacity)
+        self._fade_anim.setEndValue(target)
+        self._fade_anim.start()
+
+    def _set_opacity(self, value: object) -> None:
+        self._opacity = float(cast(float, value))
+        self.update()
+
+    def _on_fade_finished(self) -> None:
+        if not self._loading:
+            self.hide()
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
         parent = self.parentWidget()
@@ -49,6 +87,7 @@ class HistoryLoadingOverlay(QWidget):
     def paintEvent(self, event: QPaintEvent) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setOpacity(self._opacity)
         veil = QColor(theme.BG_APP)
         veil.setAlpha(225)
         painter.fillRect(self.rect(), veil)

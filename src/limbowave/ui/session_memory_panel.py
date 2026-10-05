@@ -37,6 +37,10 @@ class MemoryPanel(QWidget):
         branch_id: str | None = None,
     ) -> None:
         super().__init__(parent)
+        from limbowave.ui.background_tasks import BackgroundTasks
+
+        self._jobs = BackgroundTasks(self)
+        self._reload_generation = 0
         self.service = service
         self.conversation_id = conversation_id
         self.branch_id = branch_id
@@ -135,7 +139,7 @@ class MemoryPanel(QWidget):
         self.policy_hint.setWordWrap(True)
         layout.addWidget(self.policy_hint)
         self.save_settings_button = QPushButton("保存记忆设置")
-        self.save_settings_button.clicked.connect(lambda: self._perform(self._save_settings))
+        self.save_settings_button.clicked.connect(self._save_settings)
         layout.addWidget(self.save_settings_button)
         layout.addStretch(1)
 
@@ -176,27 +180,46 @@ class MemoryPanel(QWidget):
         super().hideEvent(event)
 
     def reload(self) -> None:
-        self.items.clear()
-        for memory in self.service.list(self.conversation_id, self.branch_id):
-            item = QListWidgetItem(memory.content.splitlines()[0])
-            item.setData(Qt.ItemDataRole.UserRole, memory)
-            item.setToolTip(memory.content)
-            self.items.addItem(item)
-        self._select(None, None)
-        settings = self.service.settings()
-        self.global_interval.setValue(settings.global_interval)
-        self.session_interval.setValue(settings.session_interval)
-        policy = (
-            self.service.policy(self.conversation_id).value
-            if self.conversation_id
-            else settings.default_policy
-        )
-        self.policy.setCurrentIndex(self.policy.findData(policy))
-        default = settings.default_policy
-        self.policy_hint.setText(
-            f"全局默认：{'每次询问' if default == 'ask' else '自动允许'}。"
-            "记忆在首轮及到达各自间隔时提醒；内容修改后下一轮刷新。"
-        )
+        self.setEnabled(False)
+        self._reload_generation += 1
+        generation = self._reload_generation
+        conversation_id, branch_id = self.conversation_id, self.branch_id
+        service = self.service
+
+        def read() -> tuple[list[MemoryItem], MemorySettings, str]:
+            settings = service.settings()
+            policy = (
+                service.policy(conversation_id).value
+                if conversation_id else settings.default_policy
+            )
+            return service.list(conversation_id, branch_id), settings, policy
+
+        def apply(data: tuple[list[MemoryItem], MemorySettings, str]) -> None:
+            if generation != self._reload_generation:
+                return
+            self.setEnabled(True)
+            memories, settings, policy = data
+            self.items.clear()
+            for memory in memories:
+                item = QListWidgetItem(memory.content.splitlines()[0])
+                item.setData(Qt.ItemDataRole.UserRole, memory)
+                item.setToolTip(memory.content)
+                self.items.addItem(item)
+            self._select(None, None)
+            self.global_interval.setValue(settings.global_interval)
+            self.session_interval.setValue(settings.session_interval)
+            self.policy.setCurrentIndex(self.policy.findData(policy))
+            default = settings.default_policy
+            self.policy_hint.setText(
+                f"全局默认：{'每次询问' if default == 'ask' else '自动允许'}。"
+                "记忆在首轮及到达各自间隔时提醒；内容修改后下一轮刷新。"
+            )
+
+        def failed(exc: Exception) -> None:
+            self.setEnabled(True)
+            self.status.setText(str(exc))
+
+        self._jobs.submit(read, apply, failed)
 
     def _new(self) -> None:
         self.items.setCurrentRow(-1)
@@ -260,17 +283,26 @@ class MemoryPanel(QWidget):
         def submit() -> None:
             if self._editor_panel is not panel:
                 return
-            try:
-                self.service.save(
-                    editor.toPlainText(), conversation_id, branch_id, item_id=item_id,
-                )
-            except Exception as exc:
-                error.setText(str(exc))
-                editor.setFocus()
-                return
-            panel.close_panel()
-            self.reload()
-            self.status.setText("已保存")
+            text = editor.toPlainText()
+            service = self.service
+            save.setEnabled(False)
+
+            def ready(_value: object) -> None:
+                if self._editor_panel is panel:
+                    panel.close_panel()
+                self.reload()
+                self.status.setText("已保存")
+
+            def failed(exc: Exception) -> None:
+                if self._editor_panel is panel:
+                    save.setEnabled(True)
+                    error.setText(str(exc))
+                    editor.setFocus()
+
+            self._jobs.submit(
+                lambda: service.save(text, conversation_id, branch_id, item_id=item_id),
+                ready, failed,
+            )
 
         save.clicked.connect(submit)
         editor.setFocus()
@@ -283,27 +315,34 @@ class MemoryPanel(QWidget):
             self._editor_panel.close_panel()
 
     def _perform(self, action: Callable[[], object]) -> None:
-        try:
-            action()
+        self.setEnabled(False)
+
+        def ready(_value: object) -> None:
+            self.setEnabled(True)
             self.reload()
-        except Exception as exc:
-            self.status.setText(str(exc))
-        else:
             self.status.setText("已保存")
 
+        def failed(exc: Exception) -> None:
+            self.setEnabled(True)
+            self.status.setText(str(exc))
+
+        self._jobs.submit(action, ready, failed)
+
     def _save_settings(self) -> None:
-        if self.conversation_id:
-            self.service.set_policy(self.conversation_id, MemoryPolicy(self.policy.currentData()))
+        service, conversation_id = self.service, self.conversation_id
+        if conversation_id:
+            policy = MemoryPolicy(self.policy.currentData())
+            self._perform(lambda: service.set_policy(conversation_id, policy))
         else:
-            self.service.save_settings(
-                MemorySettings(
-                    global_interval=self.global_interval.value(),
-                    session_interval=self.session_interval.value(),
-                    default_policy=self.policy.currentData(),
-                )
+            settings = MemorySettings(
+                global_interval=self.global_interval.value(),
+                session_interval=self.session_interval.value(),
+                default_policy=self.policy.currentData(),
             )
+            self._perform(lambda: service.save_settings(settings))
 
     def _delete(self) -> None:
+        conversation_id, branch_id = self.conversation_id, self.branch_id
         item_id = self._selected_id
         if item_id is None:
             return
@@ -313,7 +352,7 @@ class MemoryPanel(QWidget):
             "将从当前有效记忆中移除；已有历史分支快照保持不变。",
             lambda yes: (
                 self._perform(
-                    lambda: self.service.delete(item_id, self.conversation_id, self.branch_id)
+                    lambda: self.service.delete(item_id, conversation_id, branch_id)
                 )
                 if yes
                 else None

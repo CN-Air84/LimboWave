@@ -65,6 +65,9 @@ class FakeKernel(AgentKernel):
         self.sent.append(text)
         self.sent_images.append(images)
 
+    async def set_attachment_context(self, context: dict[str, object]) -> None:
+        self.attachment_context = context
+
     async def new_session(self) -> None:
         self.entries = []
 
@@ -1352,3 +1355,18 @@ async def test_no_retry_when_policy_disabled(store: InMemoryStore) -> None:
     await coord.wait_idle()
 
     assert kernel.sent == ["不重试"]
+
+
+async def test_rate_limit_wait_is_visible_until_request_is_sent(
+    coordinator: RunCoordinator, kernel: FakeKernel,
+) -> None:
+    events: list[str] = []
+    coordinator.subscribe(lambda event: events.append(event.kind))
+    await coordinator.send("wait")
+    kernel.observe({"kind": "rate_limit.wait", "seconds": 12})
+    assert events[-1] == "rate_limited"
+    kernel.observe({"kind": "provider.request", "payload": {"model": "m"}})
+    assert events[-1] == "request_sending"
+    kernel.say("ok")
+    kernel.emit("run.settled", {})
+    await coordinator.wait_idle()

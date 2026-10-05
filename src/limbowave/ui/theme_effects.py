@@ -151,6 +151,7 @@ class _ComboFrame(QObject):
             QEvent.Type.FocusIn,
             QEvent.Type.FocusOut,
             QEvent.Type.EnabledChange,
+            QEvent.Type.DynamicPropertyChange,
         ):
             self._retarget()
         elif watched is self.combo and kind == QEvent.Type.Resize:
@@ -168,7 +169,9 @@ class _ComboFrame(QObject):
         if hovered is None:
             hovered = combo.underMouse()
         if opened is None:
-            opened = self._popup.isVisible()
+            # Cascading selectors do not show QComboBox's native list container.
+            custom_open = combo.property("comboPopupOpen")
+            opened = bool(custom_open) if custom_open is not None else self._popup.isVisible()
         emphasis = combo.isEnabled() and (hovered or combo.hasFocus())
         target = (1.0 if emphasis else 0.0, 1.0 if opened else 0.0)
         if target == self._to and (

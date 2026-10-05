@@ -30,6 +30,7 @@ Windows 上 `<data_root>` = `%LOCALAPPDATA%\LimboWave`。
       "base_url": "https://relay-a.example.com/v1",
       "api": "openai-completions",
       "credential_ref": "relay-a-key",
+      "rpm": 5,
       "headers": { "X-Tenant": "personal" },
       "compat": { "supportsDeveloperRole": false }
     }
@@ -50,7 +51,6 @@ Windows 上 `<data_root>` = `%LOCALAPPDATA%\LimboWave`。
       "id": "deepseek-chat",
       "name": "DeepSeek Chat",
       "bindings": [{ "endpoint_id": "relay-a", "model_id": "deepseek-chat", "auto_matched": true }],
-      "default_binding": 0,
       "context_window": 128000,
       "max_tokens": 8192,
       "supports_images": false
@@ -71,6 +71,17 @@ Windows 上 `<data_root>` = `%LOCALAPPDATA%\LimboWave`。
 | `credential_ref` | 否 | **密钥引用名**，不是密钥本身。本地端点（Ollama 等）可省略 |
 | `headers` | 否 | 默认请求头，原样透传给 Pi |
 | `compat` | 否 | Pi 的兼容开关，原样透传（见下） |
+| `rpm` | 否 | 每分钟请求数，1–60000 的整数，默认 **5**；在设置 → 站点端点中修改 |
+
+RPM 按站点 ID 在当前应用实例内共享，不按模型或会话各算一份。模型清单、流式测活、
+每个思考等级探测、工具测试、对话、工具续轮、重试与后台标题/压缩请求都在发送前申请额度。
+采用平滑发送：5 RPM 约每 12 秒放行一次，而不是瞬间发出 5 次。不同站点互不影响。
+等待时界面保持响应，对话状态提示等待并支持停止；关闭应用会取消尚未发送的检测。
+保存 RPM 会更新等待中的额度，且不会清空已用额度。旧配置没有该字段时自动使用 5。
+这是本机节流措施，不能保证消除服务端因其他设备/配额/令牌数限制产生的 429。
+
+旧版端点字段 `priority` 已废弃，仅保留读写兼容；不再影响自动匹配或备用排序。
+优先级改到「设置 → 逻辑模型 → 优先级排序」，每个逻辑模型独立配置。
 
 ### 实际模型目录（`actual_models`）
 
@@ -91,10 +102,17 @@ Windows 上 `<data_root>` = `%LOCALAPPDATA%\LimboWave`。
 | --- | --- | --- |
 | `id` | 是 | 应用侧稳定标识（用户认知中的模型） |
 | `name` | 是 | 显示名 |
-| `bindings` | 否 | 绑定的实际模型 `{endpoint_id, model_id, auto_matched}`；可以为空（先建后绑，路由会如实报错） |
-| `default_binding` | 否 | 默认绑定的下标，缺省 `0` |
+| `bindings` | 否 | 按优先级从高到低排列的实际模型 `{endpoint_id, model_id, auto_matched}`，第一条就是默认站点；可以为空（路由会如实报错） |
 | `context_window` / `max_tokens` | 否 | 缺省由 Pi 使用自身默认值 |
 | `supports_images` | 否 | 为真时派生 `input: ["text", "image"]` |
+
+在「优先级排序」页拖动已绑定的实际模型（或选中后点「上移 / 下移」），松手即保存。
+`bindings` 数组顺序就是候选与备用顺序，越靠上越优先；新绑定追加在末尾，替换同站点
+的实际模型不会改变位置。批量自动匹配的新候选按站点目录顺序追加，不再读取端点优先级。
+
+优先级第一的实际模型自动成为默认站点，拖动到首位即可更换默认站点。
+「模型绑定」页不再提供独立的「设为默认站点」。旧配置的 `default_binding` 字段
+加载时忽略、再次保存时移除；绑定顺序保持不变。不自动跨站点重发请求。
 
 绑定规则：
 
@@ -106,7 +124,7 @@ Windows 上 `<data_root>` = `%LOCALAPPDATA%\LimboWave`。
 - 旧版配置（能力字段写在绑定上）加载时自动迁入实际模型目录；再次保存后绑定里只剩引用。
 
 配置在加载时会被校验：端点/模型 id 不得重复、绑定必须指向存在的端点、
-一个实际模型不得被两个逻辑模型绑定、`default_binding` 不得越界、`default_model_id` 必须存在。
+一个实际模型不得被两个逻辑模型绑定、`default_model_id` 必须存在。
 校验失败会直接报错，不会静默降级。
 
 ## 三、密钥
@@ -150,7 +168,7 @@ vault.json（主密码包裹的主密钥）→ 解锁
 
 ## 四、路由语义
 
-- 逻辑模型 → 端点的选择是**确定**的：取 `default_binding` 指向的绑定。
+- 逻辑模型 → 端点的选择是**确定**的：取优先级最高的第一条绑定（`bindings[0]`）。
 - 每次路由都带 `reason`（可解释）。
 - **不自动跨站点重发**：端点失败就如实暴露错误，是否切换由用户决定。
 

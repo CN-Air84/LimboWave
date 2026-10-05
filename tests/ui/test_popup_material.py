@@ -244,6 +244,41 @@ def test_floating_panel_paints_shared_blur(workspace: MainWindow, qtbot: QtBot) 
     panel.close_panel()
 
 
+@pytest.mark.parametrize("nested", [False, True])
+def test_material_panel_keeps_outline_and_external_shadow(
+    workspace: MainWindow, qtbot: QtBot, nested: bool,
+) -> None:
+    parent: QWidget = workspace
+    if nested:
+        outer = FloatingPanel(workspace, "Outer")
+        outer.setFixedSize(620, 380)
+        outer.popup()
+        qtbot.waitUntil(lambda: outer._motion is None)
+        parent = outer
+    before = parent.grab().toImage()
+    panel = FloatingPanel(parent, "Chrome", width=300)
+    panel.setFixedSize(300, 180)
+    panel.popup()
+    qtbot.waitUntil(lambda: panel._motion is None)
+    image = panel.grab().toImage()
+    scale = image.devicePixelRatio()
+    for point in (QPoint(0, 90), QPoint(299, 90), QPoint(150, 0), QPoint(150, 179)):
+        actual = image.pixelColor(round(point.x() * scale), round(point.y() * scale))
+        surface = _expected(workspace, panel, point, card=True)
+        assert max(abs(actual.getRgb()[i] - surface.getRgb()[i]) for i in range(3)) > 15
+    # The material's inside pixels remain unchanged; only the outside is shadowed.
+    inside = QPoint(18, 162)
+    _assert_pixel(
+        image.pixelColor(round(inside.x() * scale), round(inside.y() * scale)),
+        _expected(workspace, panel, inside, card=True),
+    )
+    point = panel.pos() + QPoint(150, 182)
+    after = parent.grab().toImage()
+    x, y = round(point.x() * scale), round(point.y() * scale)
+    assert after.pixelColor(x, y).lightness() < before.pixelColor(x, y).lightness()
+    panel.close_panel()
+
+
 def test_popup_global_mapping_and_outside_workspace_fallback(
     workspace: MainWindow,
 ) -> None:

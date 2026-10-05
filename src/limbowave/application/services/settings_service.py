@@ -18,7 +18,7 @@
 - **删除默认模型前拒绝**：先把默认指向别处，再删。
 - **手动配对不抢占**：实际模型已绑定到别的逻辑模型时拒绝，先在那边解绑。
 - 所有写路径都**显式重建** ``AppConfiguration``，因此整配置校验
-  （id 唯一、引用有效、default_binding 不越界、一个实际模型只绑一个逻辑模型）
+  （id 唯一、引用有效、一个实际模型只绑一个逻辑模型）
   必然执行——校验失败抛 ``ValueError``，不写半截配置。
 
 **密钥红线**：本服务只碰 ``credential_ref`` 引用名；密钥本体走
@@ -114,15 +114,20 @@ class SettingsService:
         endpoints.append(endpoint)
         return self._save(_rebuild(config, endpoints=endpoints))
 
-    def delete_endpoint(self, endpoint_id: str) -> AppConfiguration:
-        """删除端点。仍有模型绑定它时拒绝（绑定是用户的显式决定，不静默级联）。"""
+    def delete_endpoint(
+        self, endpoint_id: str, *, unbind_models: bool = False
+    ) -> AppConfiguration:
+        """删除端点；仅在用户明确确认时批量解绑，一次校验并保存完整配置。
+
+        默认仍拒绝删除已绑定的端点。解绑保留逻辑模型与其他站点的默认路由。
+        """
         config = self.load()
         bound_by = [
             model.id
             for model in config.models
             if any(b.endpoint_id == endpoint_id for b in model.bindings)
         ]
-        if bound_by:
+        if bound_by and not unbind_models:
             raise ValueError(
                 f"端点 {endpoint_id} 仍被模型绑定：{', '.join(bound_by)}。请先解除绑定。"
             )
@@ -130,6 +135,7 @@ class SettingsService:
             config,
             endpoints=[e for e in config.endpoints if e.id != endpoint_id],
             actual_models=[a for a in config.actual_models if a.endpoint_id != endpoint_id],
+            models=[_without_endpoint(model, endpoint_id) for model in config.models],
         )
         return self._save(updated)
 
@@ -153,16 +159,24 @@ class SettingsService:
         已在目录里：只更新能力（绑定上的投影随之更新）；首次导入：按 ID 自动归入
         唯一最接近的已有逻辑模型。返回 (新配置, 自动归入的逻辑模型 id 或 None)。
         """
+        previous = self.load().actual_model(endpoint_id, model_id)
+        user_levels = previous.user_thinking_levels if previous else ()
         return self._record(
             ActualModel(
                 endpoint_id=endpoint_id,
                 model_id=model_id,
                 name=_display_name(display_name, model_id),
+                user_thinking_levels=user_levels,
                 supports_streaming=supports_streaming,
                 default_thinking_level=default_thinking_level,
                 thinking_level_locked=thinking_level_locked,
-                available_thinking_levels=available_thinking_levels,
-                supports_thinking=supports_thinking,
+                available_thinking_levels=tuple(dict.fromkeys((
+                    *available_thinking_levels, *user_levels,
+                ))),
+                supports_thinking=(
+                    True if any(level != "off" for level in user_levels)
+                    else supports_thinking
+                ),
                 supports_tools=supports_tools,
             )
         )
@@ -192,8 +206,30 @@ class SettingsService:
                 default_thinking_level=None,
                 thinking_level_locked=False,
                 available_thinking_levels=(),
+                user_thinking_levels=(),
             )
         return self._record(ActualModel.model_validate(fields))
+
+    def confirm_thinking_level(
+        self, endpoint_id: str, model_id: str, level: str
+    ) -> AppConfiguration:
+        """仅在用户确认后合并该站点实际模型的单个等级，不覆盖其他能力。"""
+        if level not in ("off", "minimal", "low", "medium", "high", "xhigh", "max"):
+            raise ValueError(f"未知思考等级：{level}")
+        config = self.load()
+        _require_endpoint(config, endpoint_id)
+        actual = config.actual_model(endpoint_id, model_id)
+        if actual is None:
+            raise ValueError("实际模型已被删除，不能标记思考能力")
+        updated = actual.model_copy(update={
+            "supports_thinking": actual.supports_thinking if level == "off" else True,
+            "thinking_level_locked": False,
+            "available_thinking_levels": tuple(dict.fromkeys((
+                *actual.available_thinking_levels, level,
+            ))),
+            "user_thinking_levels": tuple(dict.fromkeys((*actual.user_thinking_levels, level))),
+        })
+        return self._record(updated)[0]
 
     def record_unverified_model(
         self, *, endpoint_id: str, model_id: str, display_name: str
@@ -332,37 +368,46 @@ class SettingsService:
         """解除一条绑定。可以解到一条不剩（逻辑模型保留，之后再配）。"""
         config = self.load()
         model = _require_model(config, model_id)
-        remaining = [b for b in model.bindings if b.endpoint_id != endpoint_id]
-        # 默认站点跟着绑定走，而不是停在原下标上；解掉的正是默认站点时回到第一条
-        default = model.bindings[model.default_binding].endpoint_id if model.bindings else None
-        default_binding = next(
-            (index for index, b in enumerate(remaining) if b.endpoint_id == default), 0
-        )
-        updated_model = _rebuild_model(model, bindings=remaining, default_binding=default_binding)
+        updated_model = _without_endpoint(model, endpoint_id)
         return self._save(_rebuild(config, models=_replace_model(config, model_id, updated_model)))
 
-    def set_default_binding(self, model_id: str, index: int) -> AppConfiguration:
-        """设置默认绑定（设计计划 §四.3：每个逻辑模型有默认站点）。"""
+    def reorder_bindings(self, model_id: str, endpoint_ids: list[str]) -> AppConfiguration:
+        """保存该逻辑模型的优先级；第一条绑定即默认站点。
+
+        必须提交当前绑定的完整排列，避免过期页面覆盖新绑定或重复/漏掉站点。
+        """
         config = self.load()
         model = _require_model(config, model_id)
-        if not (0 <= index < len(model.bindings)):
-            raise ValueError(f"default_binding 越界：{index}（共 {len(model.bindings)} 条绑定）")
-        updated_model = _rebuild_model(model, default_binding=index)
+        by_endpoint = {binding.endpoint_id: binding for binding in model.bindings}
+        if len(endpoint_ids) != len(by_endpoint) or set(endpoint_ids) != set(by_endpoint):
+            raise ValueError("绑定列表已变化或排序无效，请刷新后重试")
+        if endpoint_ids == [binding.endpoint_id for binding in model.bindings]:
+            return config
+        updated_model = _rebuild_model(
+            model,
+            bindings=[by_endpoint[endpoint_id] for endpoint_id in endpoint_ids],
+        )
         return self._save(_rebuild(config, models=_replace_model(config, model_id, updated_model)))
+
+
+def _without_endpoint(model: LogicalModel, endpoint_id: str) -> LogicalModel:
+    """删除指定站点，保留其余优先级；若删除首位，下一条自然成为默认站点。"""
+    remaining = [b for b in model.bindings if b.endpoint_id != endpoint_id]
+    if len(remaining) == len(model.bindings):
+        return model
+    return _rebuild_model(model, bindings=remaining)
 
 
 def _rebuild_model(
     model: LogicalModel,
     *,
     bindings: list[ModelBinding] | None = None,
-    default_binding: int | None = None,
 ) -> LogicalModel:
     """显式重建逻辑模型，让 pydantic 校验生效。"""
     return LogicalModel(
         id=model.id,
         name=model.name,
         bindings=model.bindings if bindings is None else bindings,
-        default_binding=model.default_binding if default_binding is None else default_binding,
         context_window=model.context_window,
         max_tokens=model.max_tokens,
         supports_images=model.supports_images,

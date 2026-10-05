@@ -3,9 +3,8 @@
 存储模型（Task 3.2）：每条消息只落在**产生它的分支**上。分叉出的新分支只记录
 分叉之后的新消息，分叉点之前的内容仍归父分支所有。因此：
 
-- 分支的完整对话 = 父分支的完整对话截到分叉消息**之前** + 本分支自己的消息。
-  编辑与重新生成都从一条用户消息分叉（Pi 的 fork 回到该消息之前），所以分叉消息
-  本身不属于新分支的前缀。
+- 分支的完整对话 = 父分支截到分叉边界的前缀 + 本分支自己的消息。
+  Fork 保留起点助手回复；编辑与重新生成从用户消息之前分叉，替换而非保留起点。
 - 只用 ``messages.list_for_branch`` 渲染分支，会丢掉整段前缀；而拿"最新分支"代替
   "指定分支"，会让切回旧分支时看到新分支的内容——两者都是这里要堵住的错误。
 
@@ -43,15 +42,15 @@ def branch_messages(uow: UnitOfWork, branch_id: str) -> list[Message]:
     messages: list[Message] = []
     for child in reversed(chain):
         if child.forked_from_message_id is not None:
-            messages = _cut_before(messages, child)
+            messages = _cut_at_fork(messages, child)
         messages.extend(uow.messages.list_for_branch(child.id))
     return messages
 
 
-def _cut_before(messages: list[Message], child: Branch) -> list[Message]:
+def _cut_at_fork(messages: list[Message], child: Branch) -> list[Message]:
     for index, message in enumerate(messages):
         if message.id == child.forked_from_message_id:
-            return messages[:index]
+            return messages[:index + int(child.include_fork_message)]
     # 分叉消息找不到（数据不完整）：退到按分支创建时间截断
     return [m for m in messages if m.created_at < child.created_at]
 
@@ -77,7 +76,7 @@ def branch_leaf_entry(uow: UnitOfWork, branch_id: str) -> str | None:
     """分支叶子的运行时条目 ID（恢复该分支上下文用）。
 
     取本分支最近一轮有镜像的运行，其镜像链的尾巴就是叶子。本分支还没有运行记录
-    （刚分叉就失败）时，退到分叉点：分叉消息条目的父条目。都没有返回 None。
+    时退到分叉边界：Fork 用起点回复的整轮链尾，编辑/重生成用用户条目的父条目。
     """
     branch = uow.branches.get(branch_id)
     if branch is None:
@@ -105,16 +104,26 @@ def branch_leaf_entry_from_records(
         if mirror.run_id is not None:
             mirrors_by_run.setdefault(mirror.run_id, []).append(mirror)
     for run in branch_runs:
-        run_mirrors = sorted(
-            mirrors_by_run.get(run.id, ()), key=lambda mirror: (mirror.captured_at, mirror.id)
-        )
-        parents = {mirror.parent_entry_id for mirror in run_mirrors if mirror.parent_entry_id}
-        tips = [mirror for mirror in run_mirrors if mirror.entry_id not in parents]
-        if tips:
-            return tips[-1].entry_id
+        leaf = _mirror_leaf(mirrors_by_run.get(run.id, []))
+        if leaf is not None:
+            return leaf
 
     if branch.forked_from_message_id is not None:
+        if branch.include_fork_message:
+            # 一轮可包含多段助手消息和工具结果；应用回复不一定能按文本关联镜像。
+            for run in runs:
+                if run.assistant_message_id == branch.forked_from_message_id:
+                    leaf = _mirror_leaf(mirrors_by_run.get(run.id, []))
+                    if leaf is not None:
+                        return leaf
         for mirror in mirrors:
             if mirror.message_id == branch.forked_from_message_id:
-                return mirror.parent_entry_id
+                return mirror.entry_id if branch.include_fork_message else mirror.parent_entry_id
     return None
+
+
+def _mirror_leaf(mirrors: list[RuntimeEntryMirror]) -> str | None:
+    ordered = sorted(mirrors, key=lambda mirror: (mirror.captured_at, mirror.id))
+    parents = {mirror.parent_entry_id for mirror in ordered if mirror.parent_entry_id}
+    tips = [mirror for mirror in ordered if mirror.entry_id not in parents]
+    return tips[-1].entry_id if tips else None

@@ -167,6 +167,9 @@ class MainWindow(QMainWindow):
 
         self._sidebar = Sidebar()
         self._chat_view = ChatView()
+        self._history_preview: ChatView | None = None
+        self._chat_stack = QStackedWidget()
+        self._chat_stack.addWidget(self._chat_view)
         self._toolbar = SessionToolbar()
         self._chat_view.message_submitted.connect(self.command_requested)
         self._chat_view.stop_requested.connect(self.stop_requested)
@@ -182,7 +185,7 @@ class MainWindow(QMainWindow):
         content_layout = QHBoxLayout(content_host)
         content_layout.setContentsMargins(0, 0, 0, 0)
         content_layout.setSpacing(0)
-        content_layout.addWidget(self._chat_view, 1)
+        content_layout.addWidget(self._chat_stack, 1)
         self._toolbar.setParent(content_host)
         # 高级栏的投影层：同父级的兄弟控件，垫在高级栏之下、消息区之上
         self._toolbar_shadow = ToolbarShadowLayer(content_host)
@@ -252,6 +255,10 @@ class MainWindow(QMainWindow):
     def _place_toolbar(self) -> None:
         """高级栏并排在输入框右侧、上下与输入框对齐，按展开进度从左向右露出。"""
         toolbar = self._toolbar
+        if self._history_preview is not None and self._chat_stack.currentWidget() is not self.chat:
+            toolbar.hide()
+            self._toolbar_shadow.hide()
+            return
         progress = self._chat_view.advanced_progress
         if not self._chat_view.advanced_expanded and progress <= 0:
             toolbar.hide()
@@ -418,6 +425,31 @@ class MainWindow(QMainWindow):
         return self._chat_view
 
     @property
+    def history_preview(self) -> ChatView | None:
+        """Read-only navigation surface; the live chat keeps receiving its own events."""
+        return self._history_preview
+
+    def prepare_history_preview(self) -> ChatView:
+        if self._history_preview is None:
+            self._history_preview = ChatView(read_only=True)
+            self._chat_stack.addWidget(self._history_preview)
+            self._on_backdrop_changed()
+        return self._history_preview
+
+    def show_history_preview(self) -> None:
+        if self._history_preview is not None:
+            self._chat_stack.setCurrentWidget(self._history_preview)
+            self._place_toolbar()
+
+    def clear_history_preview(self) -> None:
+        preview, self._history_preview = self._history_preview, None
+        self._chat_stack.setCurrentWidget(self._chat_view)
+        if preview is not None:
+            self._chat_stack.removeWidget(preview)
+            preview.deleteLater()
+        self._place_toolbar()
+
+    @property
     def sidebar(self) -> Sidebar:
         """导航栏（供上层接线）。注意这是访问器，不在实例字典里。"""
         return self._sidebar
@@ -487,16 +519,19 @@ class MainWindow(QMainWindow):
             tint=self._tint(definition.colors.card, materials.sidebar_opacity),
             radius=materials.sidebar_blur_radius,
         )
-        self._chat_view.setStyleSheet(
-            "ChatView { background: transparent; }"
-            if content_active
-            else f"ChatView {{ background: {theme.BG_APP}; }}"
-        )
-        self._chat_view.set_backdrop_engine(
-            engine if content_active else None,
-            tint=self._tint(definition.colors.background, materials.content_opacity),
-            radius=materials.content_blur_radius,
-        )
+        for view in (self._chat_view, self._history_preview):
+            if view is None:
+                continue
+            view.setStyleSheet(
+                "ChatView { background: transparent; }"
+                if content_active
+                else f"ChatView {{ background: {theme.BG_APP}; }}"
+            )
+            view.set_backdrop_engine(
+                engine if content_active else None,
+                tint=self._tint(definition.colors.background, materials.content_opacity),
+                radius=materials.content_blur_radius,
+            )
         self._toolbar.set_backdrop(
             engine if content_active else None,
             tint=self._tint(definition.colors.card, materials.content_opacity),

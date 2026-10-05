@@ -9,9 +9,9 @@
   回退任意版本。**失败不修改有效上下文**——失败版本落 ``failed`` 状态，
   当前启用版本不变。
 
-压缩模型是**应用侧**的（设计计划 §7.2 的专用压缩模型），通过扩展的
-``session_before_compact`` 注入 Pi（GATE-03 已验证接管路径）。白名单与
-版本化在应用数据库——Pi 的原生压缩不懂这些。
+生产入口通过 ``generate_isolated`` 创建临时模型内核，不触碰主会话。
+接受/回退由 RunCoordinator 先恢复带原生压缩覆盖层的运行时快照，再提交版本。
+白名单与版本化仍由应用管理；原始历史永久保留。
 """
 
 from __future__ import annotations
@@ -22,8 +22,9 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from uuid import uuid4
 
+from limbowave.application.background import run_blocking
 from limbowave.application.branch_path import branch_messages
-from limbowave.application.kernel import AgentKernel, ContextUsage
+from limbowave.application.kernel import AgentKernel, ContextUsage, KernelEvent
 from limbowave.application.repositories import UnitOfWorkFactory
 from limbowave.domain.compaction import (
     COMPRESSION_PROMPT_VERSION,
@@ -168,13 +169,19 @@ class CompressionService:
             uow.commit()
             return version
 
-    def build_prompt(self, branch_id: str, *, goal: str = "", tasks: str = "") -> str:
+    def build_prompt(
+        self, branch_id: str, *, goal: str = "", tasks: str = "",
+        message_ids: tuple[str, ...] | None = None,
+    ) -> str:
         """组装压缩提示词（Task 5.2 的全部组成部分）。
 
         白名单消息原文注入，文件引用与目标/任务如实呈现。
         """
         with self._uow_factory() as uow:
             messages = branch_messages(uow, branch_id)
+        if message_ids is not None:
+            by_id = {m.id: m for m in messages}
+            messages = [by_id[mid] for mid in message_ids]
         whitelist_texts = [m.content for m in messages if m.is_whitelisted]
         file_refs = sorted(
             {
@@ -196,6 +203,44 @@ class CompressionService:
             messages=compressible,
         )
 
+    async def generate_isolated(
+        self, version_id: str, source: AgentKernel, *, timeout: float = 120.0,
+        on_event: Callable[[KernelEvent], None] | None = None,
+    ) -> bool:
+        """Generate a preview in a disposable kernel; never fall back to the live chat."""
+        import asyncio
+        import contextlib
+
+        isolated: AgentKernel | None = None
+        unsubscribe: Callable[[], None] | None = None
+        try:
+            async with asyncio.timeout(timeout):
+                isolated = source.create_isolated()
+                if isolated is None or isolated is source:
+                    isolated = None
+                    raise RuntimeError('当前内核不支持隔离压缩，未向主会话发送请求')
+                if on_event is not None:
+                    unsubscribe = isolated.subscribe(on_event)
+                state = await source.get_state()
+                await isolated.start()
+                if state.provider and state.model_id:
+                    await isolated.set_model(state.provider, state.model_id)
+                await isolated.set_thinking_level(state.thinking_level)
+                return await self.generate(version_id, isolated, timeout=timeout)
+        except asyncio.CancelledError:
+            await run_blocking(self.record_failure, version_id, '压缩已取消')
+            raise
+        except Exception as exc:
+            error = '压缩生成超时' if isinstance(exc, TimeoutError) else redact_text(str(exc))
+            await run_blocking(self.record_failure, version_id, error)
+            return False
+        finally:
+            if unsubscribe is not None:
+                unsubscribe()
+            if isolated is not None:
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(isolated.shutdown(), timeout=10.0)
+
     async def generate(
         self,
         version_id: str,
@@ -214,15 +259,18 @@ class CompressionService:
         返回是否成功。
         """
         import asyncio
-        import contextlib
 
-        version = self.get(version_id)
+        version = await run_blocking(self.get, version_id)
         if version is None:
             return False
 
-        prompt = self.build_prompt(version.branch_id, goal=goal, tasks=tasks)
+        prompt = await run_blocking(
+            self.build_prompt, version.branch_id, goal=goal, tasks=tasks,
+            message_ids=version.input_message_ids,
+        )
         chunks: list[str] = []
         settled = asyncio.Event()
+        runtime_error: list[str] = []
 
         def _on_event(event: object) -> None:
             kind = getattr(event, "kind", "")
@@ -230,6 +278,9 @@ class CompressionService:
             if kind == "message.end":
                 message = payload.get("message") or {}
                 if message.get("role") == "assistant":
+                    if message.get("stopReason") in {"error", "aborted"}:
+                        chunks.clear()
+                        return
                     content = message.get("content")
                     if isinstance(content, list):
                         chunks.clear()
@@ -240,26 +291,35 @@ class CompressionService:
                                 if isinstance(b, dict) and b.get("type") == "text"
                             )
                         )
+            elif kind == "runtime.exited":
+                runtime_error.append("压缩内核提前退出")
+                settled.set()
             elif kind == "run.settled":
                 settled.set()
 
         unsubscribe = kernel.subscribe(_on_event)
         try:
             await kernel.send_message(prompt)
-            with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(settled.wait(), timeout=timeout)
+            await asyncio.wait_for(settled.wait(), timeout=timeout)
+            if runtime_error:
+                raise RuntimeError(runtime_error[0])
         except Exception as exc:
-            self.record_failure(version_id, redact_text(str(exc)))
+            await run_blocking(
+                self.record_failure, version_id,
+                "压缩生成超时" if isinstance(exc, TimeoutError) else redact_text(str(exc)),
+            )
             return False
         finally:
             unsubscribe()
 
         summary = "".join(chunks).strip()
         if not summary:
-            self.record_failure(version_id, "压缩模型没有产出内容")
+            await run_blocking(self.record_failure, version_id, "压缩模型没有产出内容")
             return False
         # 压缩后 token 估算：按字符数粗估（中英混合约 2 字符/token），如实标记为估算
-        return self.record_result(version_id, summary, max(1, len(summary) // 2))
+        return await run_blocking(
+            self.record_result, version_id, summary, max(1, len(summary) // 2)
+        )
 
     def record_result(self, version_id: str, summary: str, tokens_after: int) -> bool:
         """生成完成：落摘要，状态转 previewed。"""

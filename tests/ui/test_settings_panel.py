@@ -271,6 +271,9 @@ def test_discovery_failure_routes_manual_add_then_explicit_batch_probe(
     with qtbot.waitSignal(page.manual_model_save_requested, timeout=1000):
         page.actual_models._manual_add.click()
     page.apply_manual_model_save(endpoint.id, "my-model")
+    row = page.actual_models._item("my-model")
+    assert row is not None and not row.selected.isChecked()
+    row.selected.click()
     with qtbot.waitSignal(page.model_probe_requested, timeout=1000) as blocker:
         page.actual_models._run.click()
     assert blocker.args[0].model_id == "my-model"
@@ -340,7 +343,7 @@ def test_capability_edit_roundtrips_through_service_and_reopens(
     reopened._on_endpoint_saved(endpoint)
     restored = reopened.actual_models._item("m")
     assert restored is not None
-    assert restored.selected.isChecked()
+    assert not restored.selected.isChecked()
     assert restored.checkboxes["supports_streaming"].checkState() == Qt.CheckState.Checked
     settings.set_model_capability(
         endpoint_id="relay", model_id="m", display_name="M",
@@ -775,7 +778,7 @@ def test_add_all_models_persists_catalog_without_probing(
     page.actual_models.activate_endpoint(
         endpoint, discover=False, actual_models=config.actual_models,
     )
-    assert all(row.saved and row.selected.isChecked() for row in page.actual_models._items())
+    assert all(row.saved and not row.selected.isChecked() for row in page.actual_models._items())
     assert not page.actual_models._select_all.isEnabled()
 
 

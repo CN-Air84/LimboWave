@@ -35,8 +35,8 @@ class RoutingService:
         if not model.bindings:
             # 逻辑模型由用户手动建立，可以先建后绑；没绑定就如实报错，不猜站点
             raise RoutingError(f"逻辑模型 {model.id} 还没有绑定实际模型")
-        binding = model.bindings[model.default_binding]
-        reason = f"逻辑模型 {model.id} 的默认绑定（第 {model.default_binding} 个）"
+        binding = model.bindings[0]
+        reason = f"逻辑模型 {model.id} 的默认绑定（优先级最高，第 1 位）"
         if endpoint_id is not None:
             default_endpoint = binding.endpoint_id
             selected = next((b for b in model.bindings if b.endpoint_id == endpoint_id), None)

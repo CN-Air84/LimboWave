@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from limbowave.domain.param_rules import rules_active
+from limbowave.domain.providers import ProviderProtocol
 from limbowave.domain.routing import RoutingDecision, RoutingError
 
 # 站点参数规则的传递通道（不含密钥，普通环境变量即可）
@@ -169,7 +170,10 @@ class EnvironmentBuilder:
             runtime_home=runtime_home,
         )
 
-    def refresh_catalog(self, catalog: Sequence[tuple[RoutingDecision, str | None]]) -> CatalogSync:
+    def refresh_catalog(
+        self, catalog: Sequence[tuple[RoutingDecision, str | None]], *,
+        temporary_thinking_levels: dict[tuple[str, str], tuple[str, ...]] | None = None,
+    ) -> CatalogSync:
         """热更新：就地重写**正在运行**的 Pi 的 models.json，并给出要同步进进程的环境。
 
         不重建 runtime home（Pi 正在用它），只覆盖 models.json。
@@ -178,7 +182,7 @@ class EnvironmentBuilder:
         entries = _usable(catalog)
         runtime_home = self._runtime_root / "pi-home"
         (runtime_home / ".pi" / "agent").mkdir(parents=True, exist_ok=True)
-        body = self._write_models_json(runtime_home, entries)
+        body = self._write_models_json(runtime_home, entries, temporary_thinking_levels)
         env = _catalog_env(entries)
         registered = tuple(dict.fromkeys((d.provider_key, d.model_id) for d, _ in entries))
         digest = hashlib.sha256(
@@ -197,7 +201,8 @@ class EnvironmentBuilder:
         return home
 
     def _write_models_json(
-        self, runtime_home: Path, entries: Sequence[tuple[RoutingDecision, str | None]]
+        self, runtime_home: Path, entries: Sequence[tuple[RoutingDecision, str | None]],
+        temporary_thinking_levels: dict[tuple[str, str], tuple[str, ...]] | None = None,
     ) -> str:
         providers: dict[str, dict[str, object]] = {}
         for decision, secret in entries:
@@ -208,7 +213,13 @@ class EnvironmentBuilder:
             models = provider["models"]
             assert isinstance(models, list)
             if all(existing["id"] != decision.model_id for existing in models):
-                models.append(self._model_entry(decision))
+                entry = self._model_entry(decision)
+                self._allow_thinking_levels(
+                    entry, (temporary_thinking_levels or {}).get(
+                        (decision.provider_key, decision.model_id), ()
+                    )
+                )
+                models.append(entry)
 
         payload = {"providers": providers}
         target = runtime_home / ".pi" / "agent" / "models.json"
@@ -253,7 +264,33 @@ class EnvironmentBuilder:
             model_entry["input"] = ["text", "image"]
         if decision.binding.supports_thinking is not None:
             model_entry["reasoning"] = decision.binding.supports_thinking
+        # OpenAI 逐档探测的 effort 必须传给 Pi，否则 xhigh/max 会被钳制到 high。
+        # Gemini/Anthropic 的预算探测不等同于逐档 effort 映射。
+        levels = decision.binding.available_thinking_levels
+        if levels and decision.binding.supports_thinking is True and decision.endpoint.api in (
+            ProviderProtocol.OPENAI_COMPLETIONS, ProviderProtocol.OPENAI_RESPONSES
+        ):
+            model_entry["thinkingLevelMap"] = {
+                level: level if level in levels else None
+                for level in ("minimal", "low", "medium", "high", "xhigh", "max")
+            }
+        EnvironmentBuilder._allow_thinking_levels(
+            model_entry, decision.binding.user_thinking_levels
+        )
         return model_entry
+
+    @staticmethod
+    def _allow_thinking_levels(entry: dict[str, object], levels: tuple[str, ...]) -> None:
+        if not levels:
+            return
+        if any(level != "off" for level in levels):
+            entry["reasoning"] = True
+        current = entry.get("thinkingLevelMap")
+        mapping = dict(current) if isinstance(current, dict) else {}
+        for level in levels:
+            # off 是协议关闭语义，不把它序列化成 effort="off"。
+            mapping[level] = "none" if level == "off" else level
+        entry["thinkingLevelMap"] = mapping
 
     def _write_settings_json(self, runtime_home: Path) -> None:
         """硬化基线（ADR 第七节 / GATE-05）+ 内置工具模式（§九.1）。

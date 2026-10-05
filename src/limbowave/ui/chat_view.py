@@ -34,16 +34,14 @@ from __future__ import annotations
 
 import asyncio
 import math
+import weakref
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from typing import NamedTuple, cast
+from typing import cast
 
 from PySide6.QtCore import (
     QAbstractAnimation,
-    QBuffer,
-    QByteArray,
     QEasingCurve,
     QEvent,
-    QIODevice,
     QMimeData,
     QObject,
     QParallelAnimationGroup,
@@ -77,6 +75,7 @@ from PySide6.QtGui import (
     QPaintEvent,
     QPen,
     QResizeEvent,
+    QTextCursor,
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -91,23 +90,33 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QTextBrowser,
     QVBoxLayout,
     QWidget,
 )
 
+from limbowave.application.history_payload import HistoryEntry as HistoryEntry
+from limbowave.domain.conversation import AssistantMessageSegment
 from limbowave.domain.permissions import PermissionPreset
-from limbowave.domain.tool_step import ToolStatus, ToolStep
+from limbowave.domain.tool_step import ToolStep, finish
 from limbowave.ui import markdown_render, soft_shadow, theme
 from limbowave.ui.attachment_bar import AttachmentBar, AttachmentMenu
 from limbowave.ui.backdrop import BackdropEngine
-from limbowave.ui.compression_widgets import CompressButton, CompressionThinkingPanel
+from limbowave.ui.compression_widgets import (
+    CompressButton,
+    CompressionDivider,
+    CompressionThinkingPanel,
+)
 from limbowave.ui.history_loading import HistoryLoadingOverlay
 from limbowave.ui.message_motion import MessageSendEffect
+from limbowave.ui.model_selector import ModelSelector, ModelSite
 from limbowave.ui.popup_material import install_popup_material
-from limbowave.ui.popup_motion import PopupMotion, UpwardComboBox
+from limbowave.ui.popup_motion import PopupMotion
+from limbowave.ui.run_state_label import RunStateLabel
 from limbowave.ui.sent_attachments import SentAttachment, SentAttachmentStrip
-from limbowave.ui.tool_steps import make_tool_steps
+from limbowave.ui.thinking_block import ThinkingBlock as _ThinkingBlock
+from limbowave.ui.tool_steps import ToolStepsView, make_tool_steps
 
 # 一次物化多少条历史消息。每条消息是一个富文本组件，全量物化会卡死长会话。
 HISTORY_PAGE = 60
@@ -123,6 +132,7 @@ _HISTORY_FADE_OUT_MS = 120
 _HISTORY_FADE_IN_MS = 210
 _RETRY_FADE_MS = 330
 _SEND_ENTER_MS = 260
+_TOOL_STEPS_FADE_MS = 220
 # 空白页进入历史会话只从下方轻抬一点；跟随输入框的大位移会让起点显得过低。
 _HISTORY_ENTER_OFFSET = 8
 _COMPOSER_WRAP_BOTTOM = 14  # 输入框外包布局的底边距
@@ -146,75 +156,6 @@ _STICK_THRESHOLD = 24  # 距底部多少像素以内视为「停在底部」，�
 _JUMP_BUTTON_GAP = 16  # 「回到底部」按钮与消息区可见底边的间距
 _JUMP_BUTTON_MS = 200  # 「回到底部」按钮进出场时长
 _JUMP_BUTTON_RISE = 16  # 进场时从就位点下方多少像素浮上来（退场沉回同样距离）
-
-
-class HistoryEntry(NamedTuple):
-    """历史载荷：一条消息的展示数据。
-
-    ``run_id`` 相同且相邻的助手条目渲染进**同一张卡片**（一轮 Agent run 一卡，
-    卡内按消息分段）。``run_id`` / ``tool_steps`` 有默认值：不带这两个字段的
-    旧 4 元组载荷仍可用，此时每条消息一张卡，行为与合并前一致。
-    """
-
-    role: str
-    content: str
-    thinking: str
-    message_id: str | None
-    run_id: str | None = None
-    tool_steps: tuple[ToolStep, ...] = ()
-    retry_available: bool = False
-    can_fork: bool = True
-
-
-class _ThinkingBlock(QWidget):
-    """可折叠的思考内容。默认折叠（设计计划 §13.2）。
-
-    不套框：折叠时只是一行次要色的开关；展开后正文带一条左侧竖线，
-    与助手正文同在一栏，层级靠颜色与缩进区分。
-    """
-
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(6)
-
-        self._toggle = QPushButton("▸ 思考过程")
-        self._toggle.setStyleSheet(
-            f"QPushButton {{ color: {theme.TEXT_SECONDARY}; font-size: {theme.FS_SMALL}px;"
-            f" padding: 2px 8px 2px 0; border: none; border-radius: {theme.RADIUS_SM}px;"
-            " background: transparent; }"
-            f"QPushButton:hover {{ color: {theme.TEXT_PRIMARY}; }}"
-        )
-        self._toggle.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._toggle.clicked.connect(self._on_toggle)
-        layout.addWidget(self._toggle, 0, Qt.AlignmentFlag.AlignLeft)
-
-        self._content = QLabel("")
-        self._content.setWordWrap(True)
-        self._content.setTextFormat(Qt.TextFormat.PlainText)
-        self._content.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self._content.setStyleSheet(
-            f"color: {theme.TEXT_SECONDARY}; font-size: {theme.FS_SMALL}px;"
-            f" background: transparent; border: none; border-left: 2px solid {theme.BORDER};"
-            " padding: 2px 0 2px 12px;"
-        )
-        self._content.setVisible(False)  # 默认折叠
-        layout.addWidget(self._content)
-
-    def append(self, delta: str) -> None:
-        self._content.setText(self._content.text() + delta)
-
-    def set_text(self, text: str) -> None:
-        self._content.setText(text)
-
-    def has_content(self) -> bool:
-        return bool(self._content.text().strip())
-
-    def _on_toggle(self) -> None:
-        expanded = not self._content.isVisible()
-        self._content.setVisible(expanded)
-        self._toggle.setText(("▾" if expanded else "▸") + " 思考过程")
 
 
 class _ComposingHint(QLabel):
@@ -271,8 +212,9 @@ class _AssistantSegment(QWidget):
         self.raw_text = ""  # 流式期间的纯文本累积，定稿时渲染
         self.thinking: _ThinkingBlock | None = None
         self.content: QTextBrowser | None = None
-        self.tool_steps_view: QWidget | None = None
+        self.tool_steps_view: ToolStepsView | None = None
         self.live_tool_steps: list[ToolStep] = []
+        self._tool_motion_has_body = False
         self.hint: _ComposingHint | None = None
         self.setStyleSheet("background: transparent;")
         column = QVBoxLayout(self)
@@ -302,9 +244,66 @@ class _AssistantSegment(QWidget):
         )
 
 
+def _set_tool_motion_spacing(
+    layout: QVBoxLayout, weights: Mapping[QWidget, float] | None,
+) -> None:
+    """Keep gap items between visible neighbors; update only their pixel sizes."""
+    if weights is None:
+        if layout.spacing() == 8:
+            return
+        for index in range(layout.count() - 1, -1, -1):
+            item = layout.itemAt(index)
+            if item is not None and item.spacerItem() is not None:
+                layout.takeAt(index)
+        layout.setSpacing(8)
+        return
+    layout.setSpacing(0)
+    previous = 0.0
+    seen = False
+    index = 0
+    changed = False
+    while index < layout.count():
+        item = layout.itemAt(index)
+        if item is None:
+            break
+        spacer = item.spacerItem()
+        widget_item = layout.itemAt(index + 1) if spacer is not None else item
+        widget = widget_item.widget() if widget_item is not None else None
+        visible = widget is not None and not widget.isHidden()
+        if spacer is not None and (not seen or not visible):
+            layout.takeAt(index)
+            changed = True
+            continue
+        if not visible or widget is None:
+            index += 1
+            continue
+        weight = weights.get(widget, 1.0)
+        if seen:
+            if spacer is None:
+                layout.insertSpacing(index, 0)
+                inserted = layout.itemAt(index)
+                assert inserted is not None
+                spacer = inserted.spacerItem()
+                changed = True
+            gap = round(8 * min(previous, weight))
+            if spacer is not None and spacer.sizeHint().height() != gap:
+                spacer.changeSize(0, gap, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
+                changed = True
+            index += 1
+        previous = max(previous, weight)
+        seen = True
+        index += 1
+    if changed:
+        layout.invalidate()
+        parent = layout.parentWidget()
+        if parent is not None:
+            parent.updateGeometry()
+
+
 def _make_segment_divider() -> QFrame:
     """段与段之间的细分隔线：一眼能分出是两段模型输出，又同属一张卡。"""
     line = QFrame()
+    line.setObjectName("assistantSegmentDivider")
     line.setFixedHeight(1)
     line.setStyleSheet(f"background: {theme.qss_alpha(theme.BORDER, 0.8)}; border: none;")
     return line
@@ -455,7 +454,7 @@ class _BubbleRow(QWidget):
     """
 
     edit_clicked = Signal(str)  # message_id
-    # Fork：从这条回复分叉出新分支，并在新分支上重新生成它（应用层的 regenerate）
+    fork_clicked = Signal(str)  # message_id：保留起点回复，不触发生成
     regenerate_clicked = Signal(str)  # message_id
     retry_clicked = Signal(str)  # message_id：重试发送失败的用户消息
 
@@ -476,13 +475,18 @@ class _BubbleRow(QWidget):
         self._thinking: _ThinkingBlock | None = None  # 最新一段的思考块（测试与旧接口用）
         # 助手卡的分段：一轮 run 里每条模型消息一段，全部落在这张卡里
         self._segments: list[_AssistantSegment] = []
+        self._segment_dividers: list[QFrame] = []
         # 一轮 Agent run 的卡级状态行：提示整轮进行到哪一步，收敛后隐藏
-        self._run_state: QLabel | None = None
+        self._run_state: RunStateLabel | None = None
+        self._run_error: str | None = None
         # 工具步骤视图已下沉到分段；这里保留字段语义：全局隐藏只影响展示，数据仍在
         self._parent_hides_steps = False
+        self._tool_steps_progress = 1.0
+        self._tool_steps_animation: QVariantAnimation | None = None
         self._actions: QWidget | None = None
         self._copy_btn: _ActionButton | None = None
         self._fork_btn: _ActionButton | None = None
+        self._regenerate_btn: _ActionButton | None = None
         self._can_fork = True
         self._edit_btn: _ActionButton | None = None
         self._retry_btn: _ActionButton | None = None
@@ -517,23 +521,12 @@ class _BubbleRow(QWidget):
 
         # 正文按分段挂进 panel（一段 = 一条模型消息，见 begin_segment）；
         # 状态行与动作栏留在卡级共享，位于所有分段之后。
-        run_state = QLabel()
-        run_state.setObjectName("assistantRunState")
-        run_state.setTextFormat(Qt.TextFormat.PlainText)
-        run_state.setWordWrap(True)
-        run_state.setContentsMargins(10, 6, 10, 6)
-        run_state.setStyleSheet(
-            f"color: {theme.TEXT_SECONDARY};"
-            f" background: {theme.qss_alpha(theme.ACCENT, 0.10)};"
-            f" border: 1px solid {theme.qss_alpha(theme.ACCENT, 0.24)};"
-            f" border-radius: {theme.RADIUS_SM}px;"
-            f" font-size: {theme.FS_SMALL}px;"
-        )
+        run_state = RunStateLabel()
         run_state.setVisible(False)
         self._run_state = run_state
         layout.addWidget(run_state)
 
-        # 正文下方的动作栏：复制 Markdown 原文、Fork。流式中的半截回复不提供动作。
+        # 正文下方的动作栏：复制 Markdown 原文、Fork、重新生成。流式中的半截回复不提供动作。
         bar = QWidget()
         bar.setStyleSheet("background: transparent;")
         bar_layout = QHBoxLayout(bar)
@@ -543,10 +536,15 @@ class _BubbleRow(QWidget):
         self._copy_btn.clicked.connect(self._copy_text)
         bar_layout.addWidget(self._copy_btn)
         self._fork_btn = _ActionButton(
-            "fork", "Fork", "Fork：从这里分叉出新分支，并在新分支上重新生成这条回复"
+            "fork", "Fork", "Fork：从这里分叉出新分支（保留这条回复）"
         )
         self._fork_btn.clicked.connect(self._on_fork)
         bar_layout.addWidget(self._fork_btn)
+        self._regenerate_btn = _ActionButton(
+            "retry", "重新生成", "重新生成这条回复（在新分支上生成，保留原回复）"
+        )
+        self._regenerate_btn.clicked.connect(self._on_regenerate)
+        bar_layout.addWidget(self._regenerate_btn)
         bar_layout.addStretch(1)
         bar.setVisible(False)
         self._actions = bar
@@ -610,9 +608,10 @@ class _BubbleRow(QWidget):
         column.insertWidget(0, SentAttachmentStrip(items))
 
     def _sync_actions(self) -> None:
-        """Fork 需要 message_id（流式行定稿后才补上）；没有时不露出。"""
-        if self._fork_btn is not None:
-            self._fork_btn.setVisible(self._message_id is not None and self._can_fork)
+        """完整回复定稿且有 ID 后，才显示 Fork 与重新生成。"""
+        for button in (self._fork_btn, self._regenerate_btn):
+            if button is not None:
+                button.setVisible(self._message_id is not None and self._can_fork)
 
     def set_fork_available(self, available: bool) -> None:
         self._can_fork = available
@@ -663,6 +662,7 @@ class _BubbleRow(QWidget):
         """保留回复栏，只清掉旧尝试的分段与动作状态。"""
         assert self._column_layout is not None
         self.cancel_retry_animation()
+        self._settle_tool_steps_visibility()
         for segment in self._segments:
             segment.stop_composing()
         # 分段和分隔线在前，末尾两项是复用的状态行与动作栏。
@@ -674,10 +674,12 @@ class _BubbleRow(QWidget):
                 widget.setParent(None)
                 widget.deleteLater()
         self._segments.clear()
+        self._segment_dividers.clear()
         self._content = None
         self._thinking = None
         self._raw_text = ""
         self._message_id = None
+        self._run_error = None
         self.set_fork_available(False)
         if self._actions is not None:
             self._actions.hide()
@@ -712,6 +714,7 @@ class _BubbleRow(QWidget):
 
     def hideEvent(self, event: QHideEvent) -> None:
         self.cancel_send_animation()
+        self._settle_tool_steps_visibility()
         super().hideEvent(event)
 
     def animate_retry(self) -> None:
@@ -739,6 +742,10 @@ class _BubbleRow(QWidget):
         self._assistant_panel.setGraphicsEffect(None)  # type: ignore[arg-type]
 
     def _on_fork(self) -> None:
+        if self._message_id is not None:
+            self.fork_clicked.emit(self._message_id)
+
+    def _on_regenerate(self) -> None:
         if self._message_id is not None:
             self.regenerate_clicked.emit(self._message_id)
 
@@ -768,14 +775,19 @@ class _BubbleRow(QWidget):
 
     def _make_browser(self) -> QTextBrowser:
         browser = QTextBrowser()
+        browser.setUndoRedoEnabled(False)
         browser.setFrameShape(QFrame.Shape.NoFrame)
         browser.setOpenExternalLinks(True)
-        browser.setStyleSheet("background: transparent; border: none;")
+        browser.setStyleSheet(
+            "QTextBrowser { background: transparent; border: none; }"
+            "QTextBrowser QScrollBar:horizontal { height: 0px; width: 0px; margin: 0; }"
+        )
         # 正文与思考块、工具步骤、动作栏左缘对齐
         browser.document().setDocumentMargin(0)
         browser.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        # 代码块长行不换行，允许横向滚动而不是裁掉
-        browser.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        # 工具往返会留下空正文段。空浏览器加上主题圆角滚动条，会退化成一根
+        # 没有语义的横条；这里直接拆掉横向滚动条，空段也先不占位。
+        self._present_segment_body(browser, False)
         # 高度随内容自适应：documentSizeChanged 在文档完成排版后发出，
         # 比 contentsChanged 可靠（后者可能在定宽前触发，拿到错误高度）。
         # 多分段后每段一个文档，回调须指回各自的内容组件。
@@ -834,9 +846,12 @@ class _BubbleRow(QWidget):
             self._content = self._segments[-1].content
             return
         layout = self._column_layout
+        _set_tool_motion_spacing(layout, None)
         # 段与段之间的细分隔线插在状态行之前；首段之前不画
         if self._segments:
-            layout.insertWidget(layout.count() - 2, _make_segment_divider())
+            divider = _make_segment_divider()
+            layout.insertWidget(layout.count() - 2, divider)
+            self._segment_dividers.append(divider)
         segment = _AssistantSegment()
         browser = self._make_browser()
         segment.column.addWidget(browser)
@@ -847,6 +862,7 @@ class _BubbleRow(QWidget):
         self._segments.append(segment)
         segment.start_composing()
         self._content = browser
+        self._sync_segment_presentation()
 
     def append_delta(self, delta: str) -> None:
         """流式期间：纯文本追加，不做 Markdown 重排。"""
@@ -858,10 +874,15 @@ class _BubbleRow(QWidget):
             return
         segment = self._latest_segment()
         assert segment is not None and segment.content is not None
+        had_text = bool(segment.raw_text.strip())
         segment.raw_text += delta
         self._raw_text = segment.raw_text
-        segment.content.setPlainText(segment.raw_text)
+        cursor = QTextCursor(segment.content.document())
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        cursor.insertText(delta)
         segment.stop_composing()  # 落字即构思结束
+        if not had_text:
+            self._sync_segment_presentation()
 
     def finalize_segment(
         self, text: str, message_id: str | None = None, *, html: str | None = None
@@ -880,6 +901,7 @@ class _BubbleRow(QWidget):
         assert segment.content is not None
         segment.content.setHtml(html if html is not None else markdown_render.render(text))
         segment.stop_composing()
+        self._sync_segment_presentation()
         if message_id is not None:
             segment.message_id = message_id
             self._message_id = message_id
@@ -901,17 +923,30 @@ class _BubbleRow(QWidget):
         """显示这张卡在当前 Agent run 中所处的阶段（卡级状态行）。"""
         if self._run_state is None:
             return
-        self._run_state.setText(text)
+        if self._run_state.text() != text:
+            self._run_state.setText(text)
+        self._run_state.set_animated(True)
         self._run_state.setVisible(True)
+
+    def set_run_error(self, message: str) -> None:
+        """失败属于当前回复，直接复用状态行，不另建错误气泡。"""
+        self._run_error = message
+        self.set_run_state(f"⚠ {message}")
+        if self._run_state is not None:
+            self._run_state.set_animated(False)
+        self.set_fork_available(False)
+        for segment in self._segments:
+            segment.stop_composing()
 
     def mark_final(self) -> None:
         """整轮 run 收敛后，这张卡才成为可操作的最终回复。"""
         if self._run_state is not None:
-            self._run_state.setVisible(False)
+            self._run_state.setVisible(self._run_error is not None)
         if self._actions is not None:
-            self._actions.setVisible(True)
+            self._actions.setVisible(self.has_content())
         for segment in self._segments:
             segment.stop_composing()
+        self._sync_segment_presentation()
 
     def has_content(self) -> bool:
         """这张卡是否出现过任何可见内容（正文 / 思考 / 工具步骤）。
@@ -929,7 +964,9 @@ class _BubbleRow(QWidget):
         if segment.thinking is None:
             block = _ThinkingBlock()
             # 构思计时挂在本段最上方，思考块插在它之下
-            segment.column.insertWidget(1 if segment.hint is not None else 0, block)
+            segment.column.insertWidget(
+                segment.column.indexOf(segment.hint) + 1 if segment.hint is not None else 0, block
+            )
             segment.thinking = block
         self._thinking = segment.thinking
         return segment.thinking
@@ -938,39 +975,56 @@ class _BubbleRow(QWidget):
         """追加思考内容。"""
         if self._role != "assistant":
             return
-        self._ensure_thinking().append(delta)
+        if not delta:
+            return
+        block = self._ensure_thinking()
+        had_content = block.has_content()
+        block.append(delta)
+        if not had_content and block.has_content():
+            self._sync_segment_presentation()
 
     def set_thinking(self, text: str) -> None:
         """设置完整思考内容（加载历史时），落到最新一段。"""
         if self._role != "assistant" or not text.strip():
             return
         self._ensure_thinking().set_text(text)
+        self._sync_segment_presentation()
 
     @property
     def _tool_steps_view(self) -> QWidget | None:
         """最新一段的工具步骤视图（兼容旧访问口径：§三.2 的测试按行读）。"""
         return self._segments[-1].tool_steps_view if self._segments else None
 
-    def note_tool_step(self, name: str, tool_call_id: str, *, is_error: bool, phase: str) -> None:
-        """实时累积一个工具步骤到最新一段（流式期间先把 chip 显示出来）。"""
-        segment = self._latest_segment()
+    def note_tool_step(
+        self, name: str, tool_call_id: str, *, is_error: bool, phase: str,
+        step: ToolStep | None = None,
+    ) -> None:
+        """按调用 ID 更新所属分段，直接使用协调器的完整审计记录。"""
+        call_key = step.tool_call_id if step is not None else tool_call_id or name
+        segment = next(
+            (part for part in self._segments
+             if any(item.tool_call_id == call_key for item in part.live_tool_steps)),
+            None,
+        )
+        if segment is None:
+            segment = self._latest_segment()
         if segment is None:
             return
-        if phase == "start":
-            segment.live_tool_steps.append(ToolStep(tool_call_id=tool_call_id or name, name=name))
-            segment.stop_composing()  # 模型开始动手执行，构思结束
+        previous = next((item for item in segment.live_tool_steps
+                         if item.tool_call_id == call_key), None)
+        if step is None:
+            step = previous or ToolStep(tool_call_id=call_key, name=name)
+            if phase != "start":
+                step = finish(step, is_error=is_error)
+        for index, item in enumerate(segment.live_tool_steps):
+            if item.tool_call_id == call_key:
+                segment.live_tool_steps[index] = step
+                break
         else:
-            for index, step in enumerate(segment.live_tool_steps):
-                if step.tool_call_id == (tool_call_id or name):
-                    segment.live_tool_steps[index] = ToolStep(
-                        tool_call_id=step.tool_call_id,
-                        name=step.name,
-                        status=ToolStatus.ERROR if is_error else ToolStatus.OK,
-                        args=step.args,
-                    )
-                    break
+            segment.live_tool_steps.append(step)
+        if phase == "start":
+            segment.stop_composing()
         self._set_segment_steps(segment, tuple(segment.live_tool_steps))
-        self.set_tool_steps_visible(not self._parent_hides_steps)
 
     def set_tool_steps(self, steps: tuple[ToolStep, ...]) -> None:
         """给最新一段挂工具步骤（§三.2）。重复调用会替换。"""
@@ -991,26 +1045,125 @@ class _BubbleRow(QWidget):
         self.set_tool_steps(steps)  # 没有匹配的段 id：退回最新一段
 
     def _set_segment_steps(self, segment: _AssistantSegment, steps: tuple[ToolStep, ...]) -> None:
-        """渲染（替换）一段的工具步骤视图。"""
+        """就地更新工具步骤，保持展开状态和所在布局位置。"""
+        segment.live_tool_steps = list(steps)
         if segment.tool_steps_view is not None:
-            segment.column.removeWidget(segment.tool_steps_view)
-            # 先脱离子树再延迟删除，免得旧组件在删除前还画在原处
-            segment.tool_steps_view.setParent(None)
-            segment.tool_steps_view.deleteLater()
-            segment.tool_steps_view = None
-        view = make_tool_steps(steps)
-        if view is not None:
-            segment.tool_steps_view = view
-            segment.column.addWidget(view)  # 该段的 chip 跟在该段正文之后
-            # 立即遵守当前隐藏状态（否则新消息的工具步骤会突然冒出来）
-            view.setVisible(not self._parent_hides_steps)
+            segment.tool_steps_view.update_steps(steps)
+        else:
+            view = make_tool_steps(steps)
+            if view is not None:
+                segment.tool_steps_view = view
+                segment.column.addWidget(view)
+        self._sync_segment_presentation()
 
-    def set_tool_steps_visible(self, visible: bool) -> None:
-        """全局隐藏/显示工具步骤。**只影响展示**——审计数据不受影响。"""
+    def set_tool_steps_visible(self, visible: bool, *, animate: bool = True) -> None:
+        """工具区滑入/滑出并淡化，背景板高度和段间距同步过渡。"""
+        if self._parent_hides_steps == (not visible):
+            return
         self._parent_hides_steps = not visible
+        if (
+            not animate
+            or not self.isVisible()
+            or not any(segment.tool_steps_view is not None for segment in self._segments)
+            or not QApplication.isEffectEnabled(Qt.UIEffect.UI_General)
+        ):
+            self._settle_tool_steps_visibility()
+            return
+        if self._tool_steps_animation is None:
+            animation = QVariantAnimation(self)
+            animation.setDuration(_TOOL_STEPS_FADE_MS)
+            animation.setStartValue(0.0)
+            animation.setEndValue(1.0)
+            animation.setEasingCurve(QEasingCurve.Type.InOutCubic)
+            animation.valueChanged.connect(self._set_tool_steps_progress)
+            animation.finished.connect(self._settle_tool_steps_visibility)
+            self._tool_steps_animation = animation
+        animation = self._tool_steps_animation
+        animation.setDirection(
+            QAbstractAnimation.Direction.Forward
+            if visible else QAbstractAnimation.Direction.Backward
+        )
+        # 同一时间线反向，快速切换时透明度和缓动进度都不跳变。
+        if animation.state() == QAbstractAnimation.State.Stopped:
+            animation.start()
+        elif animation.state() == QAbstractAnimation.State.Paused:
+            animation.resume()
+        self._sync_segment_presentation()
+
+    def _set_tool_steps_progress(self, progress: float) -> None:
+        self._tool_steps_progress = progress
+        self._sync_tool_steps_motion()
+
+    def _sync_tool_steps_motion(self) -> None:
+        animating = (
+            self._tool_steps_animation is not None
+            and self._tool_steps_animation.state() != QAbstractAnimation.State.Stopped
+        )
+        progress = self._tool_steps_progress
+        weights: dict[QWidget, float] = {}
         for segment in self._segments:
+            tools = segment.tool_steps_view
+            if tools is not None:
+                tools.set_reveal_progress(progress)
+            _set_tool_motion_spacing(
+                segment.column, {tools: progress} if animating and tools is not None
+                else {} if animating else None,
+            )
+            weights[segment] = 1.0 if segment._tool_motion_has_body else progress
+        for divider in self._segment_dividers:
+            divider.setFixedHeight(round(progress) if animating else 1)
+            weights[divider] = progress
+        if self._column_layout is not None:
+            _set_tool_motion_spacing(self._column_layout, weights if animating else None)
+        targets: list[QWidget] = [
+            segment.tool_steps_view for segment in self._segments
+            if segment.tool_steps_view is not None
+        ]
+        targets.extend(self._segment_dividers)
+        for widget in targets:
+            effect = widget.graphicsEffect()
+            if animating:
+                if not isinstance(effect, QGraphicsOpacityEffect):
+                    effect = QGraphicsOpacityEffect(widget)
+                    widget.setGraphicsEffect(effect)
+                effect.setOpacity(self._tool_steps_progress)
+            elif effect is not None:
+                # 静止时不保留离屏合成效果，避免滚动/流式更新持续承担绘图开销。
+                widget.setGraphicsEffect(None)  # type: ignore[arg-type]
+
+    def _settle_tool_steps_visibility(self) -> None:
+        if self._tool_steps_animation is not None:
+            self._tool_steps_animation.stop()
+        self._tool_steps_progress = float(not self._parent_hides_steps)
+        self._sync_segment_presentation()
+
+    def _sync_segment_presentation(self) -> None:
+        """隐藏工具时收起纯工具分段和段间分割线；空正文浏览器不占位。"""
+        previous_visible = False
+        # 淡出期间保持纯工具段可见，避免父段提前隐藏而截断子元素动画。
+        tools_visible = not self._parent_hides_steps or self._tool_steps_progress > 0.0
+        for index, segment in enumerate(self._segments):
+            has_text = bool(segment.raw_text.strip())
+            has_thinking = segment.thinking is not None and segment.thinking.has_content()
+            is_composing = segment.hint is not None and not segment.hint.isHidden()
+            segment._tool_motion_has_body = has_text or has_thinking or is_composing
+            has_visible_tools = tools_visible and bool(segment.live_tool_steps)
             if segment.tool_steps_view is not None:
-                segment.tool_steps_view.setVisible(visible)
+                segment.tool_steps_view.setVisible(tools_visible)
+            if segment.content is not None:
+                self._present_segment_body(segment.content, has_text)
+            segment_visible = has_text or has_thinking or is_composing or has_visible_tools
+            segment.setVisible(segment_visible)
+
+            if index:
+                divider = self._segment_dividers[index - 1]
+                divider.setVisible(
+                    tools_visible and previous_visible and segment_visible
+                )
+            previous_visible = previous_visible or segment_visible
+        for leftover in self._segment_dividers[max(0, len(self._segments) - 1):]:
+            leftover.hide()
+        self._sync_tool_steps_motion()
 
     def set_message_id(self, message_id: str) -> None:
         """定稿后补挂 message_id（流式行创建时还没有 ID），Fork 随之可用。"""
@@ -1044,12 +1197,44 @@ class _BubbleRow(QWidget):
         natural = max(metrics.horizontalAdvance(line) for line in label.text().split("\n"))
         label.setFixedWidth(min(natural + 2, limit))
 
+    def _suppress_body_scrollbar(self, browser: QTextBrowser) -> None:
+        """主题圆角滚动条在空段里会退化成一根横条，这里直接拆掉。"""
+        if browser.horizontalScrollBarPolicy() is not Qt.ScrollBarPolicy.ScrollBarAlwaysOff:
+            browser.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        bar = browser.horizontalScrollBar()
+        if bar.maximum() != 0 or bar.height() != 0 or not bar.isHidden():
+            bar.setRange(0, 0)
+            bar.hide()
+            bar.setFixedHeight(0)
+
+    def _present_segment_body(self, browser: QTextBrowser, has_text: bool) -> None:
+        """空正文不占位；有正文时只显示文档本身。"""
+        self._suppress_body_scrollbar(browser)
+        if not has_text:
+            if browser.height() != 0 or not browser.isHidden():
+                browser.setFixedHeight(0)
+                browser.hide()
+                self._invalidate_browser_layout(browser)
+            return
+        if browser.isHidden():
+            browser.show()
+
     def _fit_browser_height(self, browser: QTextBrowser, size: QSizeF) -> None:
-        """正文高度随文档自适应；代码块超宽出现横向滚动条时，把滚动条的高度也算上。"""
+        """正文高度随文档自适应，空文档和横向滚动条都不占位。"""
+        has_text = not browser.document().isEmpty()
+        if not has_text:
+            self._present_segment_body(browser, False)
+            return
         height = math.ceil(size.height())
-        if size.width() > browser.viewport().width() + 0.5:
-            height += browser.horizontalScrollBar().sizeHint().height()
-        browser.setFixedHeight(height)
+        if height <= 0:
+            self._present_segment_body(browser, True)
+            return
+        if browser.height() != height:
+            browser.setFixedHeight(height)
+            self._invalidate_browser_layout(browser)
+        self._present_segment_body(browser, True)
+
+    def _invalidate_browser_layout(self, browser: QTextBrowser) -> None:
         # 固定高度变了要立即作废父级布局的尺寸缓存：正文套进分段容器后，
         # 外层布局读到缓存的旧 sizeHint 会晚一轮事件才长高，流式期间
         # 「贴底跟随 / 上翻阅读」就会读到中间态的滚动范围。显式失效让
@@ -1120,21 +1305,6 @@ class _ContextUsageRing(QWidget):
                 QPen(QColor(color), 3.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
             )
             painter.drawArc(rect, 90 * 16, -int(360 * 16 * self._percent / 100.0))
-        painter.end()
-
-
-class _UpwardModelCombo(UpwardComboBox):
-    """无底色的逻辑模型选择器；弹层固定从控件上方展开。"""
-
-    def paintEvent(self, event: QPaintEvent) -> None:
-        super().paintEvent(event)
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setPen(QPen(QColor(theme.TEXT_SECONDARY), 1.5))
-        x = self.width() - 10
-        y = self.height() // 2 + 2
-        painter.drawLine(x - 4, y, x, y - 4)
-        painter.drawLine(x, y - 4, x + 4, y)
         painter.end()
 
 
@@ -1329,11 +1499,21 @@ class _CompressionOverlay(QWidget):
     """压缩进行中盖在组合输入框上的遮罩：整个输入框当进度条，中间写「正在压缩」。
 
     遮罩本身接住鼠标事件，下面的输入框点不到；输入框另外也会被禁用。
+    右下角的停止键留在遮罩之上，用来中止这一次压缩。
     """
+
+    cancel_requested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._progress = 0.0  # 0–100
+        self._label = "正在压缩"
+        self._stop = QPushButton("■", self)
+        self._stop.setFixedSize(36, 36)
+        self._stop.setProperty("iconOnly", True)
+        self._stop.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._stop.setToolTip("停止压缩")
+        self._stop.clicked.connect(self.cancel_requested.emit)
         self.hide()
 
     @property
@@ -1343,6 +1523,17 @@ class _CompressionOverlay(QWidget):
     def set_progress(self, percent: float) -> None:
         self._progress = max(0.0, min(100.0, percent))
         self.update()
+
+    def set_label(self, text: str) -> None:
+        self._label = text
+        self.update()
+
+    def resizeEvent(self, event: QResizeEvent) -> None:
+        super().resizeEvent(event)
+        self._stop.move(
+            self.width() - self._stop.width() - 12,
+            self.height() - self._stop.height() - 10,
+        )
 
     def paintEvent(self, event: QPaintEvent) -> None:
         painter = QPainter(self)
@@ -1366,7 +1557,9 @@ class _CompressionOverlay(QWidget):
         font.setBold(True)
         painter.setFont(font)
         painter.setPen(QColor(theme.TEXT_PRIMARY))
-        painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "正在压缩")
+        painter.drawText(
+            self.rect().adjusted(48, 0, -48, 0), Qt.AlignmentFlag.AlignCenter, self._label
+        )
         painter.end()
 
 
@@ -1386,6 +1579,9 @@ class _ComposerInput(QPlainTextEdit):
 
     files_pasted = Signal(list)  # 本地路径
     image_pasted = Signal(bytes)  # PNG 字节
+    image_paste_failed = Signal(str)
+    image_paste_busy = Signal(bool)
+    paste_generation: Callable[[], int]
 
     def canInsertFromMimeData(self, source: QMimeData) -> bool:
         if _local_paths(source) or source.hasImage():
@@ -1403,12 +1599,38 @@ class _ComposerInput(QPlainTextEdit):
         if source.hasImage():
             image = QImage(source.imageData())
             if not image.isNull():
-                data = QByteArray()
-                buffer = QBuffer(data)
-                buffer.open(QIODevice.OpenModeFlag.WriteOnly)
-                image.save(buffer, "PNG")
-                buffer.close()
-                self.image_pasted.emit(data.data())
+                from limbowave.ui.background_tasks import BackgroundTasks
+
+                def encode() -> bytes:
+                    from io import BytesIO
+
+                    from PIL import Image
+
+                    # Convert the independent QImage snapshot off-thread, then encode
+                    # raw pixels without involving Qt widgets or its image-writer plugins.
+                    pixels = image.convertToFormat(QImage.Format.Format_RGBA8888)
+                    converted = Image.frombytes(
+                        "RGBA", (pixels.width(), pixels.height()), bytes(pixels.constBits()),
+                        "raw", "RGBA", pixels.bytesPerLine(),
+                    )
+                    output = BytesIO()
+                    converted.save(output, format="PNG")
+                    return output.getvalue()
+
+                generation = getattr(self, "paste_generation", lambda: 0)()
+                self.image_paste_busy.emit(True)
+
+                def ready(raw: bytes) -> None:
+                    if generation == getattr(self, "paste_generation", lambda: 0)():
+                        self.image_pasted.emit(raw)
+                    self.image_paste_busy.emit(False)
+
+                def failed(exc: Exception) -> None:
+                    self.image_paste_busy.emit(False)
+                    self.image_paste_failed.emit(str(exc))
+
+                jobs = BackgroundTasks(self)
+                jobs.submit(encode, ready, failed)
             return
         super().insertFromMimeData(source)
 
@@ -1601,6 +1823,7 @@ class ChatView(QWidget):
     # 分支动作（Task 3.2）：只外发 message_id，业务在应用层；分支切换入口在左栏
     edit_message_requested = Signal(str)  # message_id
     edit_submitted = Signal(str, str)  # message_id, 新文本（附件在附件栏里）
+    fork_requested = Signal(str)  # message_id
     regenerate_requested = Signal(str)  # message_id
     retry_requested = Signal(str)  # message_id：重试发送失败的用户消息
     # 压缩（Phase 5）：长按压缩按钮确认后外发（业务在应用层）
@@ -1608,6 +1831,7 @@ class ChatView(QWidget):
     files_dropped = Signal(list)  # 拖放或 Ctrl+V 粘贴的本地文件
     image_pasted = Signal(bytes)  # Ctrl+V 粘贴的剪贴板图片（PNG 字节）
     logical_model_changed = Signal(str)
+    model_site_selected = Signal(str, str)
     permission_preset_changed = Signal(str)
     permission_custom_requested = Signal()
     # 工具步骤一键隐藏（§三.2）：只切展示，不删数据
@@ -1619,8 +1843,9 @@ class ChatView(QWidget):
     # 高级栏展开进度（0 = 收起，1 = 展开），动画中逐帧发出；上层据此摆放高级栏
     advanced_progress_changed = Signal(float)
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(self, parent: QWidget | None = None, *, read_only: bool = False) -> None:
         super().__init__(parent)
+        self._read_only = read_only
         self._docked = False
         self._advanced_expanded = False
         self._dock_progress = 0.0  # 0 = 居中，1 = 停靠底部
@@ -1639,7 +1864,9 @@ class ChatView(QWidget):
         self._execution_mode = "builtin"
         self._usage_action = "none"
         self._available = True
+        self._pending_pastes = 0
         self._history_loading = False
+        self._history_loading_overlay_requested = False
         self._busy = False
         self._status_text = "就绪"
         self._permission_preset = PermissionPreset.READ_ONLY
@@ -1662,6 +1889,10 @@ class ChatView(QWidget):
         self._history_transition_generation = 0
         self._history_rest_pos: QPoint | None = None
         self._build()
+        if read_only:
+            self.set_available(False)
+            self._composer.setEnabled(False)
+            self._input.setPlaceholderText("另一会话正在生成；可切回查看进度，完成后即可在这里继续")
         self._fit_column()
 
     def set_backdrop_engine(
@@ -1716,8 +1947,7 @@ class ChatView(QWidget):
         self._scroll = QScrollArea()
         self._scroll.setWidgetResizable(True)
         self._scroll.setFrameShape(QScrollArea.Shape.NoFrame)
-        # Page-level horizontal scrolling is never useful. Markdown code blocks
-        # retain their own local QTextBrowser horizontal scrollbar.
+        # 对话页与每段 Markdown 正文都不显示横向滚动条。
         self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._transcript_host = _BackdropHost()
         self._transcript_host.setStyleSheet(f"background: {theme.BG_APP};")
@@ -1757,6 +1987,7 @@ class ChatView(QWidget):
         )
         self._composer = _ComposerFrame()
         self._composer.files_dropped.connect(self.files_dropped.emit)
+        self._composer.compression_overlay.cancel_requested.connect(self.stop_requested.emit)
         composer = QVBoxLayout(self._composer)
         composer.setContentsMargins(14, 10, 12, 10)
         composer.setSpacing(6)
@@ -1803,6 +2034,12 @@ class ChatView(QWidget):
         self._input = _ComposerInput()
         self._input.files_pasted.connect(self.files_dropped.emit)
         self._input.image_pasted.connect(self.image_pasted.emit)
+        self._input.image_paste_failed.connect(self.add_error)
+        self._input.image_paste_busy.connect(self._on_image_paste_busy)
+        attachment_ref = weakref.ref(self._attachment_bar)
+        self._input.paste_generation = lambda: (
+            bar.generation if (bar := attachment_ref()) is not None else -1
+        )
         self._input.setPlaceholderText("提出后续修改要求")
         self._input.setMinimumHeight(54)
         self._input.setMaximumHeight(120)
@@ -1876,11 +2113,11 @@ class ChatView(QWidget):
 
         self._usage_bar = _ContextUsageRing()
         tools.addWidget(self._usage_bar)
-        self._logical_model = _UpwardModelCombo()
+        self._logical_model = ModelSelector()
         self._logical_model.setMinimumContentsLength(12)
         self._logical_model.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
         self._logical_model.addItem("逻辑模型")
-        self._logical_model.setToolTip("逻辑模型；实际调用站点在右侧「高级」栏")
+        self._logical_model.setToolTip("按厂牌选择逻辑模型；右键模型显示名选择站点")
         # 静止时无框；悬停/展开时由 theme_effects 的边框层渐显边框。
         self._logical_model.setProperty("comboFramelessAtRest", True)
         self._logical_model.setStyleSheet(
@@ -1893,6 +2130,7 @@ class ChatView(QWidget):
             f" selection-background-color: {theme.BG_SURFACE_HOVER}; }}"
         )
         self._logical_model.currentIndexChanged.connect(self._on_logical_model_changed)
+        self._logical_model.model_site_selected.connect(self.model_site_selected.emit)
         tools.addWidget(self._logical_model)
 
         self._stop_btn = QPushButton("■")
@@ -1945,9 +2183,13 @@ class ChatView(QWidget):
                 return True  # 已处理，不要再插入换行
         return super().eventFilter(watched, event)
 
+    def _on_image_paste_busy(self, busy: bool) -> None:
+        self._pending_pastes = max(0, self._pending_pastes + (1 if busy else -1))
+        self._sync_send_button()
+
     def _on_send(self) -> None:
         text = self._input.toPlainText().strip()
-        if not text or self._history_loading:
+        if not text or self._history_loading or self._pending_pastes > 0:
             return
         self._input.clear()
         self._set_docked(True)
@@ -1991,7 +2233,7 @@ class ChatView(QWidget):
         has_text = bool(self._input.toPlainText().strip())
         self._send_btn.setEnabled(
             self._available and not self._busy and not self._compressing
-            and not self._history_loading and has_text
+            and not self._history_loading and not self._pending_pastes and has_text
         )
 
     def _on_logical_model_changed(self, index: int) -> None:
@@ -2061,8 +2303,16 @@ class ChatView(QWidget):
         self._logical_model.setCurrentIndex(max(0, index))
         self._logical_model.blockSignals(False)
 
-    def set_logical_models(self, models: list[tuple[str, str]], current: str = "") -> None:
-        """刷新可切换的逻辑模型列表（(id, 显示名) 对），不把实际站点混进来。"""
+    def set_logical_models(
+        self, models: list[tuple[str, str]], current: str = "", *,
+        sites: Mapping[str, Sequence[ModelSite]] | None = None,
+        current_endpoint: str = "", overridden: bool = False,
+    ) -> None:
+        """刷新按厂牌分组的逻辑模型；站点只出现在模型行的右键菜单中。"""
+        self._logical_model.set_sites(
+            sites or {}, current_model=current,
+            current_endpoint=current_endpoint, overridden=overridden,
+        )
         # 按 id 去重；同名条目以先出现的为准，itemData 始终是 id
         seen: dict[str, str] = {}
         for model_id, name in models:
@@ -2084,12 +2334,17 @@ class ChatView(QWidget):
     def set_compress_available(self, available: bool) -> None:
         self._compress_btn.setEnabled(available)
 
-    def note_tool_step(self, name: str, tool_call_id: str, *, is_error: bool, phase: str) -> None:
+    def note_tool_step(
+        self, name: str, tool_call_id: str, *, is_error: bool, phase: str,
+        step: ToolStep | None = None,
+    ) -> None:
         """实时累积工具步骤到本轮最近的消息，并同步就地阶段提示。"""
         if self._run_tail is None or self._compression_owns_stream():
             return
         call_key = tool_call_id or name
-        self._run_tail.note_tool_step(name, tool_call_id, is_error=is_error, phase=phase)
+        self._run_tail.note_tool_step(
+            name, tool_call_id, is_error=is_error, phase=phase, step=step
+        )
         if phase == "start":
             self._active_tool_calls.add(call_key)
             self._run_tail.set_run_state(f"● 正在运行工具：{name}…")
@@ -2103,9 +2358,20 @@ class ChatView(QWidget):
 
     def set_tool_steps_visible(self, visible: bool) -> None:
         """全局隐藏/显示工具步骤（§三.2 的一键隐藏）。**只影响展示**。"""
+        if self._tool_steps_hidden == (not visible):
+            return
         self._tool_steps_hidden = not visible
+        viewport = self._scroll.viewport()
+        bounds = viewport.rect().adjusted(0, -64, 0, 64)
+        # Snapshot before geometry changes; offscreen rows need no compositor/timeline.
+        animated = {
+            row for row in self._rows
+            if row.isVisible() and bounds.intersects(
+                QRect(row.mapTo(viewport, QPoint()), row.size())
+            )
+        }
         for row in self._rows:
-            row.set_tool_steps_visible(visible)
+            row.set_tool_steps_visible(visible, animate=row in animated)
 
     def set_available(self, available: bool, hint: str = "") -> None:
         self._available = available
@@ -2117,7 +2383,10 @@ class ChatView(QWidget):
 
     def _sync_input_enabled(self) -> None:
         """输入框、附件与权限按钮：内核可用且不在压缩中才可操作。"""
-        enabled = self._available and not self._compressing and not self._history_loading
+        enabled = (
+            self._available and not self._compressing and not self._history_loading
+            and not self._read_only
+        )
         self._input.setEnabled(enabled)
         self._attach_btn.setEnabled(enabled)
         self._permission_btn.setEnabled(enabled)
@@ -2127,16 +2396,36 @@ class ChatView(QWidget):
     def history_loading(self) -> bool:
         return self._history_loading
 
-    def set_history_loading(self, loading: bool, text: str = "正在加载会话…") -> None:
+    def set_history_loading(
+        self, loading: bool, text: str = "正在加载会话…", *, show_overlay: bool = True
+    ) -> None:
         """独立于模型 busy/available 的加载态；保留旧历史与草稿，不创建助手卡片。"""
+        was_requested = self._history_loading_overlay_requested
         self._history_loading = loading
-        self._history_loading_overlay.set_text(text)
-        self._history_loading_overlay.setVisible(loading)
+        self._history_loading_overlay_requested = loading and show_overlay
         if loading:
-            self._history_loading_overlay.raise_()
+            self._history_loading_overlay.set_text(text)
+        if self._history_loading_overlay_requested:
+            self._set_docked(True, reveal_advanced=False)
+        elif was_requested and not (self._rows or self._full_history):
+            self._set_docked(False, reveal_advanced=False)
+        self._sync_history_loading_overlay()
         self._transcript_host.setEnabled(not loading)
-        self._composer.setEnabled(not loading)
+        self._composer.setEnabled(not loading and not self._read_only)
         self._sync_input_enabled()
+
+    def _sync_history_loading_overlay(self) -> None:
+        show = (
+            self._history_loading_overlay_requested
+            and self._docked
+            and self._dock_anim is None
+            and self._dock_progress == 1.0
+        )
+        if show:
+            layout = self.layout()
+            if layout is not None:
+                layout.activate()
+        self._history_loading_overlay.set_loading(show)
 
     @property
     def status_text(self) -> str:
@@ -2168,6 +2457,8 @@ class ChatView(QWidget):
         self._compressing = True
         self._compression_start = max(0.0, min(100.0, percent or 0.0))
         overlay = self._composer.compression_overlay
+        overlay.set_label("正在压缩")
+        overlay._stop.setEnabled(True)
         overlay.set_progress(self._compression_start)
         overlay.show()
         overlay.raise_()
@@ -2179,15 +2470,27 @@ class ChatView(QWidget):
         step = COMPRESSION_DRAIN_PER_SEC * _COMPRESSION_TICK_MS / 1000
         overlay.set_progress(overlay.progress - step)
 
-    def finish_compression(self, percent: float | None) -> None:
+    def note_compression_stopping(self) -> None:
+        """用户已要求中止：先改文案并禁用停止键，等这一轮真正收尾再撤遮罩。"""
+        overlay = self._composer.compression_overlay
+        overlay.set_label("正在停止")
+        overlay._stop.setEnabled(False)
+        if self._thinking_panel is not None:
+            self._thinking_panel.note_stopping()
+
+    def finish_compression(self, percent: float | None, *, stopped: bool = False) -> None:
         """压缩结束：进度多退少补到压缩后占比，停一下再撤遮罩、恢复输入。
 
         ``percent`` 为 None（失败或占比不可知）时回到起点——原上下文没动。
+        ``stopped`` 为真表示用户中止了这一轮，思考悬浮窗改记「压缩已停止」。
         """
         if not self._compressing:
             return
         if self._thinking_panel is not None:
-            self._thinking_panel.note_finished()
+            if stopped:
+                self._thinking_panel.note_stopped()
+            else:
+                self._thinking_panel.note_finished()
         self._compression_timer.stop()
         overlay = self._composer.compression_overlay
         target = self._compression_start if percent is None else max(0.0, min(100.0, percent))
@@ -2237,6 +2540,7 @@ class ChatView(QWidget):
     def _open_thinking_panel(self) -> CompressionThinkingPanel:
         panel = CompressionThinkingPanel(self.window())
         panel.closed.connect(lambda: self._on_thinking_panel_closed(panel))
+        panel.cancel_requested.connect(self.stop_requested.emit)
         panel.popup()
         return panel
 
@@ -2281,6 +2585,12 @@ class ChatView(QWidget):
         """注入「用户消息 id → 已发送附件」的查询，用于在气泡上方画缩略图。"""
         self._attachment_resolver = resolver
 
+    def refresh_sent_attachments(self, message_id: str, items: list[SentAttachment]) -> None:
+        """Apply a late attachment DTO only to rows still displaying that message."""
+        for row in self._rows:
+            if row._role == "user" and row._message_id == message_id:
+                row.set_attachments(items)
+
     def add_user_message(self, text: str, message_id: str | None = None) -> None:
         self._clear_retry()  # 新的一轮开始，之前的失败不再提供重试
         self._set_docked(True)
@@ -2291,16 +2601,16 @@ class ChatView(QWidget):
     def retry_user_message(self, text: str, message_id: str, retry_of_message_id: str) -> None:
         """已接受的手动重试：复用一问一答的位置，不追加重发气泡。"""
         user = next((row for row in reversed(self._rows) if row._role == "user"), None)
+        if user is not None and user._message_id == message_id:
+            return  # 已应用的重试事件：不要追加气泡，也不要清掉已到达的新 token。
         if user is None or user._message_id != retry_of_message_id:
-            # 来源不在当前展示窗口，不把别的对话误当成这次重试。
-            self.add_user_message(text, message_id)
-            self.set_busy(True)
+            # 过期事件或来源不在展示窗口：不能降级成新发送，也不能覆盖新一轮。
             return
         self._clear_retry()
         user._message_id = message_id
         tail = self._rows[self._rows.index(user) + 1 :]
         assistant = next((row for row in tail if row._role == "assistant"), None)
-        # 同时撤掉本次失败的错误行和自动重试提示（提示不在 _rows 里）。
+        # 同时撤掉本次失败的错误行及可能残留的独立提示。
         start = self._transcript.indexOf(user) + 1
         for index in reversed(range(start, self._transcript.count() - 1)):
             item = self._transcript.itemAt(index)
@@ -2402,7 +2712,7 @@ class ChatView(QWidget):
         """
         for row in list(self._run_rows):
             row.mark_final()
-            if not row.has_content():
+            if not row.has_content() and row._run_error is None:
                 self._drop_row(row)
         self._run_rows.clear()
         self._run_tail = None
@@ -2426,26 +2736,37 @@ class ChatView(QWidget):
     def add_retry_notice(
         self, reason: str, *, attempt: int, delay_ms: int, max_attempts: int
     ) -> None:
-        """在消息流里显示一次重试（§八.3 明确要求：不得偷偷重发）。
-
-        它是**提示**不是错误：用次要色，且不影响气泡内容。
-        """
+        """自动重试在当前回复卡内更新，不追加提示行或保留旧尝试分段。"""
         self._clear_retry()  # 自动重试中，手动重试按钮先收起
+        if self._run_tail is None:
+            self.begin_assistant()
+        row = self._run_tail
+        if row is None:
+            return  # 压缩占用流时不建立聊天气泡。
+        # 只清当前回复之后的失败提示，不影响之前的会话历史。
+        for failed_row in self._rows[self._rows.index(row) + 1 :]:
+            if failed_row._role == "error":
+                self._drop_row(failed_row)
+        row.reset_for_retry()
+        self._active_tool_calls.clear()
+        self._stream_row = row
+        row.begin_segment()
         delay = f"，{delay_ms / 1000:.1f}s 后重试" if delay_ms else ""
-        text = f"↻ {reason}——正在第 {attempt}/{max_attempts} 次尝试{delay}"
-        notice = QLabel(text)
-        notice.setWordWrap(True)
-        notice.setContentsMargins(12, 6, 12, 6)
-        notice.setStyleSheet(
-            f"background: {theme.card_surface()}; color: {theme.TEXT_SECONDARY};"
-            f" border: 1px dashed {theme.BORDER}; border-radius: {theme.RADIUS_MD}px;"
-            f" font-size: {theme.FS_SMALL}px;"
-        )
-        self._transcript.insertWidget(self._transcript.count() - 1, notice)
+        row.set_run_state(f"↻ {reason}——正在第 {attempt}/{max_attempts} 次尝试{delay}")
         self._scroll_to_bottom()
 
     def add_error(self, message: str, *, retry_message_id: str | None = None) -> None:
-        """显示错误；``retry_message_id`` 是发送失败的用户消息，其气泡左侧露出重试按钮。"""
+        """运行失败原位显示；无关联请求的应用错误才使用独立提示。"""
+        if retry_message_id is not None:
+            user = next((row for row in reversed(self._rows) if row._role == "user"), None)
+            if user is not None and user._message_id == retry_message_id:
+                tail = self._rows[self._rows.index(user) + 1 :]
+                assistant = next((row for row in tail if row._role == "assistant"), None)
+                if assistant is not None:
+                    assistant.set_run_error(message)
+                    self.set_retry_available(retry_message_id)
+                    self._scroll_to_bottom()
+                    return
         self._add_bubble(f"⚠ {message}", role="error")
         if retry_message_id is not None:
             self.set_retry_available(retry_message_id)
@@ -2507,6 +2828,75 @@ class ChatView(QWidget):
                 widget.setParent(None)
                 widget.deleteLater()
 
+    def set_branch_actions_enabled(self, enabled: bool) -> None:
+        enabled = enabled and not self._read_only
+        for row in self._rows:
+            for button in (row._fork_btn, row._regenerate_btn):
+                if button is not None:
+                    button.setEnabled(enabled)
+
+    def apply_branch_history(self, messages: Sequence[HistoryEntry], anchor_id: str) -> bool:
+        """Reuse the visible prefix on regeneration; never reread SQLite or rerender it."""
+        anchor = next((row for row in self._rows if row._message_id == anchor_id), None)
+        payload = list(messages)
+        if anchor is None:
+            return False
+        ids = {item.message_id for item in payload}
+        include_anchor = anchor_id in ids
+        retained = self._rows[:self._rows.index(anchor) + int(include_anchor)]
+        if any(row._message_id not in ids for row in retained) or (
+            payload and (not retained or retained[-1]._message_id != payload[-1].message_id)
+        ):
+            # Caller must incrementally render a different paging/retry window.
+            return False
+        self._cancel_history_transition()
+        self.cancel_edit()
+        start = self._transcript.indexOf(anchor) + int(include_anchor)
+        for index in reversed(range(start, self._transcript.count() - 1)):
+            item = self._transcript.itemAt(index)
+            widget = item.widget() if item is not None else None
+            if isinstance(widget, _BubbleRow):
+                self._drop_row(widget)
+            elif widget is not None:
+                self._transcript.removeWidget(widget)
+                widget.setParent(None)
+                widget.deleteLater()
+        self._full_history = payload
+        self._history_offset = min(self._history_offset, len(payload))
+        self._run_rows.clear()
+        self._run_tail = None
+        self._stream_row = None
+        self._active_tool_calls.clear()
+        self._clear_retry()
+        self.sync_compression_markers(payload)
+        self._set_docked(bool(payload), reveal_advanced=False)
+        self._scroll_to_bottom(force=True)
+        return True
+
+    def sync_compression_markers(self, messages: Sequence[HistoryEntry]) -> None:
+        """Refresh persisted boundaries without replacing bubbles or interrupting a stream."""
+        for index in reversed(range(self._transcript.count() - 1)):
+            item = self._transcript.itemAt(index)
+            widget = item.widget() if item is not None else None
+            if isinstance(widget, CompressionDivider):
+                self._transcript.removeWidget(widget)
+                widget.setParent(None)
+                widget.deleteLater()
+        self._full_history = list(messages)
+        self._history_offset = min(self._history_offset, len(self._full_history))
+        entries = {entry.message_id: entry for entry in messages if entry.compressions}
+        for row in self._rows:
+            entry = entries.get(row._message_id)
+            if entry is not None:
+                self._insert_compression_markers(entry, self._transcript.indexOf(row) + 1)
+
+    def _insert_compression_markers(self, entry: HistoryEntry, index: int) -> None:
+        for context in entry.compressions:
+            divider = CompressionDivider(context)
+            self._transcript.insertWidget(index, divider)
+            divider.show()
+            index += 1
+
     def load_history(
         self, messages: Sequence[HistoryEntry | tuple[str, str, str, str | None]]
     ) -> None:
@@ -2543,7 +2933,9 @@ class ChatView(QWidget):
         self, messages: Sequence[HistoryEntry | tuple[str, str, str, str | None]]
     ) -> None:
         self.cancel_edit()  # 换了会话或分支，正在编辑的消息已不在眼前
-        self._set_docked(bool(messages), reveal_advanced=False)
+        self._set_docked(
+            bool(messages) or self._history_loading_overlay_requested, reveal_advanced=False
+        )
         self._full_history = self._history_entries(messages)
         self._history_offset = self._align_window_start(
             max(0, len(self._full_history) - HISTORY_PAGE)
@@ -2719,6 +3111,7 @@ class ChatView(QWidget):
                 row.set_retry_available(entry.retry_available)
                 if entry.thinking:
                     row.set_thinking(entry.thinking)
+                self._insert_compression_markers(entry, self._transcript.count() - 1)
                 index += 1
                 yield
                 continue
@@ -2729,23 +3122,39 @@ class ChatView(QWidget):
                 run_id is not None
                 and index + count < len(window)
                 and window[index + count].run_id == run_id
+                and not window[index + count - 1].compressions
             ):
                 count += 1
             row = self._add_bubble("", role="assistant")
             for offset in range(count):
                 item = window[index + offset]
-                row.begin_segment()
-                row.finalize_segment(
-                    item.content, item.message_id,
-                    html=rendered.get(item.content) if rendered is not None else None,
-                )
+                parts = item.segments or (AssistantMessageSegment(
+                    content=item.content, thinking=item.thinking,
+                    tool_call_ids=tuple(step.tool_call_id for step in item.tool_steps),
+                ),)
+                steps_by_id = {step.tool_call_id: step for step in item.tool_steps}
+                for part in parts:
+                    row.begin_segment()
+                    row.finalize_segment(
+                        part.content, item.message_id,
+                        html=rendered.get(part.content) if rendered is not None else None,
+                    )
+                    if part.thinking:
+                        row.set_thinking(part.thinking)
+                    row.set_tool_steps(tuple(steps_by_id[key] for key in part.tool_call_ids
+                                             if key in steps_by_id))
+                    if not item.segments and item.tool_steps:
+                        # 旧版只存了最终正文。无法恢复丢失的中间文本，但工具应在总结之前。
+                        segment = row._segments[-1]
+                        if segment.tool_steps_view is not None and segment.content is not None:
+                            segment.column.insertWidget(
+                                segment.column.indexOf(segment.content), segment.tool_steps_view
+                            )
+                    yield
                 row.set_fork_available(item.can_fork)
-                if item.thinking:
-                    row.set_thinking(item.thinking)
-                if item.tool_steps:
-                    row.set_segment_tool_steps(item.message_id, item.tool_steps)
-                yield
             row.mark_final()
+            self._insert_compression_markers(window[index + count - 1],
+                                             self._transcript.count() - 1)
             index += count
 
     def _add_load_earlier(self, hidden: int) -> None:
@@ -2853,6 +3262,7 @@ class ChatView(QWidget):
         else:
             self._on_dock_progress(target)
         self.docked_changed.emit(docked, reveal_advanced)
+        self._sync_history_loading_overlay()
 
     def _on_dock_progress(self, value: object) -> None:
         self._dock_progress = float(cast(float, value))
@@ -2860,6 +3270,7 @@ class ChatView(QWidget):
 
     def _on_dock_finished(self) -> None:
         self._dock_anim = None
+        self._sync_history_loading_overlay()
         if self._docked:
             self._scroll_to_bottom()
 
@@ -2875,8 +3286,13 @@ class ChatView(QWidget):
     def _add_bubble(self, text: str, *, role: str, message_id: str | None = None) -> _BubbleRow:
         row = _BubbleRow(text, role=role, message_id=message_id)
         row.edit_clicked.connect(self.edit_message_requested)
+        row.fork_clicked.connect(self.fork_requested)
         row.regenerate_clicked.connect(self.regenerate_requested)
         row.retry_clicked.connect(self.retry_requested)
+        if self._read_only:
+            for button in (row._edit_btn, row._retry_btn, row._fork_btn, row._regenerate_btn):
+                if button is not None:
+                    button.setEnabled(False)
         row.set_column_width(self._column_width)
         row.set_tool_steps_visible(not self._tool_steps_hidden)
         if role == "user" and message_id is not None and self._attachment_resolver is not None:
@@ -2932,6 +3348,7 @@ class ChatView(QWidget):
             layout = self.layout()
             if layout is not None:
                 layout.activate()
+            self._sync_history_loading_overlay()
             bar = self._scroll.verticalScrollBar()
         self._stick_to_bottom = value >= bar.maximum() - _STICK_THRESHOLD
         self._sync_jump_button()

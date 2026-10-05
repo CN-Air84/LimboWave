@@ -164,6 +164,8 @@ def fingerprint_from_entry(entry: dict[str, Any], branch_position: int) -> Entry
         if not content and "payload" in entry:
             content = str(entry.get("payload", ""))
 
+    if entry_type == "compaction":
+        content = str(entry.get("summary", ""))
     normalized = content.strip()
     content_hash = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
 

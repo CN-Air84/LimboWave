@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import Any
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
@@ -56,6 +57,11 @@ class PermissionsDialog(QDialog):
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
+        from limbowave.ui.background_tasks import BackgroundTasks
+
+        self._jobs = BackgroundTasks(self)
+        self._grant_cache: list[PermissionGrant] = []
+        self._reload_generation = 0
         self._service = service
         self._conversation_id = conversation_id
         self.setWindowTitle("会话权限")
@@ -110,22 +116,49 @@ class PermissionsDialog(QDialog):
     # ---------- 数据 ----------
 
     def reload(self) -> None:
-        self._grants.clear()
-        for grant in self._service.list_grants(self._conversation_id):
-            item = QListWidgetItem(self._describe(grant))
-            item.setData(Qt.ItemDataRole.UserRole, grant.id)
-            self._grants.addItem(item)
+        self._reload_generation += 1
+        generation = self._reload_generation
+        service, conversation_id = self._service, self._conversation_id
 
-        self._audit.clear()
-        for record in self._service.list_audit(self._conversation_id)[-50:]:
-            mark = "· 已确认" if record.user_confirmed else ""
-            when = record.created_at.astimezone().strftime("%m-%d %H:%M:%S")
-            self._audit.addItem(
-                QListWidgetItem(
-                    f"{when}  {record.tool_name}  "
-                    f"{_DECISION_TEXT.get(record.decision.value, record.decision.value)}{mark}"
+        def read() -> tuple[list[PermissionGrant], list[Any]]:
+            return service.list_grants(conversation_id), service.list_audit(conversation_id)[-50:]
+
+        def apply(data: tuple[list[PermissionGrant], list[Any]]) -> None:
+            if generation != self._reload_generation:
+                return
+            grants, records = data
+            self._grant_cache = grants
+            self._grants.clear()
+            for grant in grants:
+                item = QListWidgetItem(self._describe(grant))
+                item.setData(Qt.ItemDataRole.UserRole, grant.id)
+                self._grants.addItem(item)
+
+            self._audit.clear()
+            for record in records:
+                mark = "· 已确认" if record.user_confirmed else ""
+                when = record.created_at.astimezone().strftime("%m-%d %H:%M:%S")
+                self._audit.addItem(
+                    QListWidgetItem(
+                        f"{when}  {record.tool_name}  "
+                        f"{_DECISION_TEXT.get(record.decision.value, record.decision.value)}{mark}"
+                    )
                 )
-            )
+
+        self._jobs.submit(read, apply, lambda exc: self._detail.setText(str(exc)))
+
+    def _change(self, work: Callable[[], object]) -> None:
+        self.setEnabled(False)
+
+        def ready(_value: object) -> None:
+            self.setEnabled(True)
+            self.reload()
+
+        def failed(exc: Exception) -> None:
+            self.setEnabled(True)
+            self._detail.setText(str(exc))
+
+        self._jobs.submit(work, ready, failed)
 
     def _selected_id(self) -> str | None:
         item = self._grants.currentItem()
@@ -141,7 +174,7 @@ class PermissionsDialog(QDialog):
             return
         grant_id = current.data(Qt.ItemDataRole.UserRole)
         grant = next(
-            (g for g in self._service.list_grants(self._conversation_id) if g.id == grant_id),
+            (g for g in self._grant_cache if g.id == grant_id),
             None,
         )
         if grant is None:
@@ -162,9 +195,7 @@ class PermissionsDialog(QDialog):
         grant_id = self._selected_id()
         if grant_id is None:
             return
-        if self._service.revoke(grant_id):
-            self.reload()
-            self._detail.setText("授权已撤销：同类请求将重新询问。")
+        self._change(lambda: self._service.revoke(grant_id))
 
     def _on_narrow(self) -> None:
         """缩小范围：撤销原授权，建立边界更小的新授权（不改写历史记录）。"""
@@ -172,7 +203,7 @@ class PermissionsDialog(QDialog):
         if grant_id is None:
             return
         grant = next(
-            (g for g in self._service.list_grants(self._conversation_id) if g.id == grant_id),
+            (g for g in self._grant_cache if g.id == grant_id),
             None,
         )
         if grant is None:
@@ -190,23 +221,24 @@ class PermissionsDialog(QDialog):
             values = tuple(v.strip() for v in text.split(",") if v.strip())
             if not values:
                 return
-            # 撤销旧的 + 建立范围更小的新的
-            self._service.revoke(grant_id)
-            if grant.capability in (Capability.FILE_READ, Capability.FILE_WRITE):
-                self._service.grant(
-                    self._conversation_id,
-                    grant.capability,
-                    allowed_paths=values,
-                    note=f"由 {grant.id} 缩小范围",
-                )
-            else:
-                self._service.grant(
-                    self._conversation_id,
-                    grant.capability,
-                    allowed_domains=values,
-                    note=f"由 {grant.id} 缩小范围",
-                )
-            self.reload()
+            def work() -> None:
+                # 撤销旧的 + 建立范围更小的新的
+                self._service.revoke(grant_id)
+                if grant.capability in (Capability.FILE_READ, Capability.FILE_WRITE):
+                    self._service.grant(
+                        self._conversation_id,
+                        grant.capability,
+                        allowed_paths=values,
+                        note=f"由 {grant.id} 缩小范围",
+                    )
+                else:
+                    self._service.grant(
+                        self._conversation_id,
+                        grant.capability,
+                        allowed_domains=values,
+                        note=f"由 {grant.id} 缩小范围",
+                    )
+            self._change(work)
 
         ask_prompt(self, "缩小授权范围", label, _narrow, default_text=current)
         self._detail.setText("授权范围已缩小。")

@@ -88,9 +88,10 @@ def plan_for_logical(config: AppConfiguration, logical_id: str) -> MatchPlan:
             bind.append(top[0])
         else:
             ambiguous.append((endpoint_id, tuple(actual.model_id for actual in top)))
-    # 绑定顺序即备用顺序：站点优先级高的在前，其次按站点列表顺序
-    order = {e.id: (-e.priority, index) for index, e in enumerate(config.endpoints)}
-    bind.sort(key=lambda actual: order.get(actual.endpoint_id, (0, len(order))))
+    # 新绑定按站点目录顺序追加；已有绑定的优先级由各逻辑模型独立维护。
+    # 旧配置的 endpoint.priority 已废弃，不再影响匹配与排序。
+    order = {e.id: index for index, e in enumerate(config.endpoints)}
+    bind.sort(key=lambda actual: order.get(actual.endpoint_id, len(order)))
     return MatchPlan(logical_id, tuple(bind), tuple(taken), tuple(ambiguous))
 
 

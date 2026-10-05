@@ -24,10 +24,11 @@ from PySide6.QtCore import (
     QAbstractAnimation,
     QEasingCurve,
     QEvent,
+    QModelIndex,
     QObject,
     QParallelAnimationGroup,
+    QPersistentModelIndex,
     QPoint,
-    QPointF,
     QPropertyAnimation,
     QRect,
     QRectF,
@@ -35,7 +36,6 @@ from PySide6.QtCore import (
     QSize,
     Qt,
     QTimer,
-    QVariantAnimation,
     Signal,
 )
 from PySide6.QtGui import (
@@ -44,7 +44,6 @@ from PySide6.QtGui import (
     QPainter,
     QPainterPath,
     QPaintEvent,
-    QPen,
     QResizeEvent,
     QStandardItem,
     QStandardItemModel,
@@ -56,6 +55,9 @@ from PySide6.QtWidgets import (
     QLabel,
     QPushButton,
     QSizePolicy,
+    QStyle,
+    QStyledItemDelegate,
+    QStyleOptionViewItem,
     QVBoxLayout,
     QWidget,
 )
@@ -64,6 +66,8 @@ from limbowave.ui import soft_shadow, theme
 from limbowave.ui.backdrop import BackdropEngine
 from limbowave.ui.floating import FloatingPanel
 from limbowave.ui.popup_motion import UpwardComboBox
+from limbowave.ui.slide_confirm import SlideConfirm
+from limbowave.ui.thinking_combo import HOLD_PROGRESS_ROLE, ThinkingComboBox
 
 # 思考强度等级（合同 §1.2 确认的取值）
 THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
@@ -88,6 +92,36 @@ class RouteCandidate:
     current: bool = False
     override: bool = False  # 当前是否为会话级覆盖
     restore: bool = False
+
+
+class _ThinkingLevelDelegate(QStyledItemDelegate):
+    """仅为不可用的思考等级叠加浅灰蒙版，不改变其他弹层。"""
+
+    def paint(
+        self,
+        painter: QPainter,
+        option: QStyleOptionViewItem,
+        index: QModelIndex | QPersistentModelIndex,
+    ) -> None:
+        enabled = bool(index.flags() & Qt.ItemFlag.ItemIsEnabled)
+        row_option = QStyleOptionViewItem(option)
+        if not enabled:
+            row_option.state &= ~(
+                QStyle.StateFlag.State_Enabled
+                | QStyle.StateFlag.State_Selected
+                | QStyle.StateFlag.State_MouseOver
+            )
+        super().paint(painter, row_option, index)
+        if not enabled:
+            painter.save()
+            painter.fillRect(option.rect, QColor(210, 210, 210, 90))
+            progress = index.data(HOLD_PROGRESS_ROLE)
+            if isinstance(progress, (int, float)) and progress > 0:
+                strip = QRect(option.rect)
+                strip.setTop(strip.bottom() - 2)
+                strip.setWidth(round(strip.width() * progress))
+                painter.fillRect(strip, QColor(theme.ACCENT))
+            painter.restore()
 
 
 class _RouteComboBox(UpwardComboBox):
@@ -151,7 +185,6 @@ NOTICE_MOVE_MS = 240  # 被点的按钮滑到行首/滑回原位
 NOTICE_FADE_MS = 160  # 其余按钮与提示文字的渐隐渐显
 SLIDER_CONFIRM_MS = 5000  # 滑动确认的超时：5 秒内没滑到最右按取消处理
 SLIDER_HINT = "向右滑动开始压缩"  # 滑块轨道里的提示文字
-SLIDER_SNAP_MS = 160  # 手柄松手未确认 / 退出确认态时弹回起点
 
 
 class ToolbarShadowLayer(QWidget):
@@ -204,6 +237,7 @@ class SessionToolbar(QFrame):
 
     collapse_toggled = Signal(bool)  # True = 收起
     thinking_level_changed = Signal(str)
+    thinking_force_requested = Signal(str)
     endpoint_override_requested = Signal(str)  # endpoint_id；空串 = 清除覆盖回默认
     compress_requested = Signal()
     attach_requested = Signal()
@@ -317,8 +351,10 @@ class SessionToolbar(QFrame):
         thinking_row = QHBoxLayout()
         thinking_row.setSpacing(6)
         thinking_row.addWidget(_section_label("思考"))
-        self._thinking = UpwardComboBox()
+        self._thinking = ThinkingComboBox()
+        self._thinking.force_requested.connect(self.thinking_force_requested.emit)
         self._thinking.setStyleSheet("QComboBox { background: transparent; }")
+        self._thinking.setItemDelegate(_ThinkingLevelDelegate(self._thinking))
         self._thinking.addItems(list(THINKING_LEVELS))
         self._thinking.currentTextChanged.connect(self.thinking_level_changed.emit)
         thinking_row.addWidget(self._thinking, 1)
@@ -361,6 +397,11 @@ class SessionToolbar(QFrame):
         self._action_row.slider_confirmed.connect(self._on_slider_confirmed)
         self._refresh_compress_tooltip()
         body.addWidget(self._action_row)
+
+        self._export_btn = QPushButton("导出会话")
+        self._export_btn.setToolTip("导出当前分支，或选择其他会话与分支")
+        self._export_btn.clicked.connect(self.export_requested.emit)
+        body.addWidget(self._export_btn)
 
         body.addStretch(1)
         root.addWidget(self._body, 1)
@@ -483,8 +524,10 @@ class SessionToolbar(QFrame):
         *,
         locked_level: str | None = None,
         available_levels: tuple[str, ...] = (),
+        runtime_levels: tuple[str, ...] | None = None,
     ) -> None:
         """按已验证等级限制控件；显式锁定等级不可由用户覆盖。"""
+        self._thinking.cancel_hold()
         self._thinking_supported = supported
         self._thinking_locked_level = locked_level
         self._available_thinking_levels = available_levels
@@ -493,24 +536,33 @@ class SessionToolbar(QFrame):
             for index, level in enumerate(THINKING_LEVELS):
                 item = model.item(index)
                 if item is not None:
-                    item.setEnabled(
-                        not available_levels or level == "off" or level in available_levels
-                    )
+                    enabled = not available_levels or level == "off" or level in available_levels
+                    if supported is False:
+                        enabled = level == "off"
+                    if locked_level is not None:
+                        enabled = level == locked_level
+                    if runtime_levels is not None:
+                        enabled = enabled and level in runtime_levels
+                    item.setEnabled(enabled)
+                    item.setToolTip("" if enabled else "当前等级不可用；按住 3 秒可临时强制解锁")
         if locked_level:
             self.set_thinking_level(locked_level)
-            self._thinking.setToolTip(f"该绑定的思考强度固定为 {locked_level}，不可切换")
+            self._thinking.setToolTip(
+                f"该绑定固定为 {locked_level}，常规选择不可切换；可长按置灰项 3 秒临时试用"
+            )
         elif supported is False:
             self._thinking.setToolTip("能力探测确认该实际模型不支持思考")
+        elif supported is None:
+            self._thinking.setToolTip("思考能力尚未确认；可选等级以当前运行时为准")
         else:
             self._thinking.setToolTip("会话级思考强度")
         self._refresh_thinking_enabled()
 
     def _refresh_thinking_enabled(self) -> None:
-        self._thinking.setEnabled(
-            self._session_available
-            and self._thinking_supported is not False
-            and self._thinking_locked_level is None
-        )
+        if not self._session_available:
+            self._thinking.cancel_hold()
+        # 即使 reasoning 未开放也能展开，置灰项仅接受长按试用。
+        self._thinking.setEnabled(self._session_available)
 
     def set_context_usage(self, text: str) -> None:
         # 占用已改为主输入框圆环；高级栏只把详情附在压缩入口的提示里。
@@ -637,198 +689,6 @@ class SessionToolbar(QFrame):
             self.set_collapsed(True)
 
 
-class _ConfirmSlider(QWidget):
-    """从左滑到最右才确认的滑块（压缩二段确认的第二段，防误触）。
-
-    拖动手柄到最右端即发出 ``confirmed``；中途松开弹回起点。
-    自绘轨道、进度、手柄与提示文字——不用字体字符，缺字不会退化成方框。
-    进出场动画（渐显渐隐 + 滑入滑出）由 :class:`_ActionRow` 统一编排，
-    这里只负责手柄自身的推进与弹回。
-    """
-
-    _INSET = 3.0  # 轨道内手柄四周的留白
-
-    confirmed = Signal()
-
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._progress = 0.0  # 0 = 手柄在最左，1 = 滑到最右（确认）
-        self._dragging = False
-        self._confirmed = False
-        self._hint = ""
-        self._snap: QVariantAnimation | None = None
-
-    # ---------- 状态 ----------
-
-    @property
-    def progress(self) -> float:
-        return self._progress
-
-    def set_hint(self, text: str) -> None:
-        self._hint = text
-        self.update()
-
-    def reset(self) -> None:
-        """回到初始态：手柄归零、丢弃进行中的手势与弹回动画（进出场前后调用）。"""
-        self._stop_snap()
-        self._dragging = False
-        self._confirmed = False
-        self._set_progress(0.0)
-
-    def snap_back(self) -> None:
-        """手柄弹回起点：松手未滑到最右、或整条退场动画开始时。"""
-        if self._progress <= 0.0:
-            return
-        self._stop_snap()
-        anim = QVariantAnimation(self)
-        anim.setStartValue(self._progress)
-        anim.setEndValue(0.0)
-        anim.setDuration(SLIDER_SNAP_MS)
-        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-        anim.valueChanged.connect(lambda value: self._set_progress(float(value)))
-        anim.finished.connect(lambda: self._on_snap_done(anim))
-        self._snap = anim
-        anim.start()
-
-    def _set_progress(self, value: float) -> None:
-        self._progress = value
-        self.update()
-
-    def _stop_snap(self) -> None:
-        if self._snap is not None:
-            anim, self._snap = self._snap, None
-            anim.stop()  # finished 回调里 _snap 已不指向它，只做 deleteLater
-            anim.deleteLater()
-
-    def _on_snap_done(self, anim: QVariantAnimation) -> None:
-        if self._snap is anim:
-            self._snap = None
-        anim.deleteLater()
-
-    # ---------- 几何 ----------
-
-    def _diameter(self) -> float:
-        return self.height() - 2 * self._INSET
-
-    def _span(self) -> float:
-        """手柄可移动的距离（最左到最右）。"""
-        return max(1.0, self.width() - 2 * self._INSET - self._diameter())
-
-    def _handle_rect(self) -> QRectF:
-        x = self._INSET + self._span() * self._progress
-        return QRectF(x, self._INSET, self._diameter(), self._diameter())
-
-    # ---------- 手势 ----------
-
-    def mousePressEvent(self, event: QMouseEvent) -> None:
-        if self._confirmed or event.button() != Qt.MouseButton.LeftButton:
-            super().mousePressEvent(event)
-            return
-        self._stop_snap()
-        self._dragging = True
-        self._track(event.position().x())
-        event.accept()
-
-    def mouseMoveEvent(self, event: QMouseEvent) -> None:
-        if not self._dragging or self._confirmed:
-            super().mouseMoveEvent(event)
-            return
-        self._track(event.position().x())
-        event.accept()
-
-    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
-        if self._dragging and not self._confirmed and event.button() == Qt.MouseButton.LeftButton:
-            self._dragging = False
-            self.snap_back()
-            event.accept()
-            return
-        super().mouseReleaseEvent(event)
-
-    def _track(self, x: float) -> None:
-        """按指针位置推进手柄；滑到最右即确认（一次性的，确认后忽略后续手势）。"""
-        progress = (x - self._INSET - self._diameter() / 2) / self._span()
-        self._set_progress(max(0.0, min(1.0, progress)))
-        if self._progress >= 1.0:
-            self._dragging = False
-            self._confirmed = True
-            self.confirmed.emit()
-
-    # ---------- 绘制 ----------
-
-    def paintEvent(self, event: QPaintEvent) -> None:
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        track = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
-        radius = track.height() / 2
-        painter.setPen(QPen(QColor(theme.BORDER), 1.0))
-        painter.setBrush(QColor(theme.BG_SURFACE_HOVER))
-        painter.drawRoundedRect(track, radius, radius)
-
-        handle = self._handle_rect()
-        # 已滑过的进度：accent 淡色铺在手柄扫过的轨道里
-        if self._progress > 0:
-            painter.save()
-            clip = QPainterPath()
-            clip.addRoundedRect(track, radius, radius)
-            painter.setClipPath(clip)
-            fill = QColor(theme.ACCENT)
-            fill.setAlpha(42)
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(fill)
-            painter.drawRect(
-                QRectF(
-                    track.left(),
-                    track.top(),
-                    handle.center().x() - track.left(),
-                    track.height(),
-                )
-            )
-            painter.restore()
-
-        # 提示文字随手柄推进渐隐，把位置让给「正在确认」的动势
-        if self._hint and self._progress < 0.9:
-            text_rect = QRectF(
-                handle.right() + 8,
-                track.top(),
-                track.right() - handle.right() - 8,
-                track.height(),
-            )
-            if text_rect.width() > 24:
-                font = painter.font()
-                font.setPixelSize(theme.FS_SMALL)
-                painter.setFont(font)
-                painter.setOpacity(1.0 - self._progress / 0.9)
-                painter.setPen(QColor(theme.TEXT_SECONDARY))
-                painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, self._hint)
-                painter.setOpacity(1.0)
-
-        # 手柄：accent 描边的圆钮 + 双箭头，示意「向右」
-        painter.setPen(QPen(QColor(theme.ACCENT), 1.2))
-        painter.setBrush(QColor(theme.BG_ELEVATED))
-        painter.drawEllipse(handle)
-        painter.setPen(
-            QPen(
-                QColor(theme.ACCENT),
-                1.6,
-                Qt.PenStyle.SolidLine,
-                Qt.PenCapStyle.RoundCap,
-                Qt.PenJoinStyle.RoundJoin,
-            )
-        )
-        center = handle.center()
-        for offset in (-2.8, 1.2):
-            painter.drawLine(
-                QPointF(center.x() + offset - 1.6, center.y() - 3.0),
-                QPointF(center.x() + offset + 1.2, center.y()),
-            )
-            painter.drawLine(
-                QPointF(center.x() + offset + 1.2, center.y()),
-                QPointF(center.x() + offset - 1.6, center.y() + 3.0),
-            )
-        painter.end()
-
-
 class _ActionRow(QWidget):
     """高级栏的动作按钮行。
 
@@ -866,7 +726,7 @@ class _ActionRow(QWidget):
         self._source: QPushButton | None = None  # 提示态下被点的按钮；常态为 None
         self._anim: QAbstractAnimation | None = None
         # 压缩二段确认的滑块：与提示文字占用同一块区域，互斥出现
-        self.slider = _ConfirmSlider(self)
+        self.slider = SlideConfirm(self)
         slider_effect = QGraphicsOpacityEffect(self.slider)
         slider_effect.setOpacity(1.0)
         self.slider.setGraphicsEffect(slider_effect)

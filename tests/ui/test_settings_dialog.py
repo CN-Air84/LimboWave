@@ -430,6 +430,9 @@ def test_reference_candidates_exclude_bound_actual_model_ids(
         ("chat-5.3-mini", "Chat 5.3 Mini"),
         ("  MY-chat-model  ", "My Chat Model"),
         ("model", "Model"),
+        ("glm-5.3", "GLM 5.3"),
+        ("gpt-5-mini", "GPT 5 Mini"),
+        ("z-ai/glm-5.3", "Z Ai/GLM 5.3"),
     ],
 )
 def test_new_model_name_follows_typed_id(
@@ -657,8 +660,10 @@ def test_multi_select_delete_asks_then_removes(
     dialog = SettingsDialog(settings, credentials)
     qtbot.addWidget(dialog)
     tab = dialog._models_tab
-    tab._list.item(1).setSelected(True)
-    tab._list.item(2).setSelected(True)
+    # 显示名已自动排序，按稳定 ID 选择目标，不再依赖配置插入行号。
+    for row in range(tab._list.count()):
+        item = tab._list.item(row)
+        item.setSelected(item.data(Qt.ItemDataRole.UserRole) in {"a", "b"})
     tab._on_delete()
     assert [m.id for m in settings.load().models] == ["keep"]
 
@@ -966,3 +971,29 @@ def test_settings_dialog_has_shared_about_tab(qtbot: QtBot, services) -> None:
     tabs.setCurrentIndex(tabs.count() - 1)
     assert isinstance(tabs.currentWidget(), AboutPage)
     assert tabs.currentWidget() is dialog.about_tab
+
+
+def test_endpoint_rpm_save_reload_and_new_default(qtbot: QtBot, services) -> None:
+    settings, credentials = services
+    original = _endpoint_config("a", "A").model_copy(update={
+        "rpm": 17, "timeout_seconds": 29, "headers": {"X-Test": "preserved"},
+    })
+    settings.upsert_endpoint(original)
+    dialog = SettingsDialog(settings, credentials)
+    qtbot.addWidget(dialog)
+    tab = dialog._endpoints_tab
+    tab._select_endpoint("a")
+    assert tab._rpm.value() == 17
+    assert tab._rpm.minimum() == 1
+    tab._rpm.setValue(9)
+    tab._on_save()
+    saved = settings.load().endpoints[0]
+    assert saved.rpm == 9
+    assert saved.timeout_seconds == 29
+    assert saved.headers == original.headers
+    reopened = SettingsDialog(settings, credentials)
+    qtbot.addWidget(reopened)
+    reopened._endpoints_tab._select_endpoint("a")
+    assert reopened._endpoints_tab._rpm.value() == 9
+    tab._on_new()
+    assert tab._rpm.value() == 5

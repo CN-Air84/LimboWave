@@ -252,8 +252,13 @@ class AttachmentBar(QWidget):
         if not self._chips:
             self.setVisible(False)
 
+    @property
+    def generation(self) -> int:
+        return getattr(self, "_generation", 0)
+
     def clear(self) -> None:
-        """发送后清空。"""
+        """发送后清空，并使尚未完成的旧草稿导入失效。"""
+        self._generation = self.generation + 1
         for attachment_id in list(self._chips):
             self.remove_attachment(attachment_id)
 

@@ -17,10 +17,10 @@ from pathlib import Path
 
 import pytest
 from PySide6.QtWidgets import (
+    QCheckBox,
     QLineEdit,
     QPlainTextEdit,
     QPushButton,
-    QRadioButton,
     QWidget,
 )
 from pytestqt.qtbot import QtBot
@@ -348,7 +348,7 @@ def test_export_panel_selection_and_format_reach_callback(qtbot: QtBot) -> None:
     panel._rows[2].checkbox.setChecked(True)
     for _bid, check in panel._rows[2]._branch_checks:
         check.setChecked(True)
-    jsons = [b for b in panel.findChildren(QRadioButton) if b.text() == "JSON"]
+    jsons = [b for b in panel.findChildren(QCheckBox) if b.text() == "JSON"]
     assert jsons
     jsons[0].setChecked(True)
     go = next(b for b in panel.findChildren(QPushButton) if b.text() == "导出")
@@ -368,3 +368,39 @@ def _host(qtbot: QtBot) -> object:
     qtbot.addWidget(host)
     host.show()
     return host
+
+
+def test_export_defaults_to_current_branch_and_html(qtbot: QtBot) -> None:
+    host = _host(qtbot)
+    panel = ExportPanel(
+        host, _panel_rows(), current_branch_id="b3",
+        on_export=lambda *_: None,
+    )
+    assert panel._fmt["html"].isChecked()
+    assert [bid for row in panel._rows for bid in row.selected_branches()] == ["b3"]
+
+
+def test_export_rejects_path_in_filename(qtbot: QtBot) -> None:
+    captured = []
+    host = _host(qtbot)
+    panel = ExportPanel(
+        host, _panel_rows(), current_branch_id="b1",
+        on_export=lambda *args: captured.append(args),
+    )
+    panel._name.setText("../escape")
+    panel._do_export()
+    assert not captured
+    assert panel._error.text()
+
+
+def test_export_formats_reuse_checkboxes_and_remain_exclusive(qtbot: QtBot) -> None:
+    host = _host(qtbot)
+    panel = ExportPanel(host, _panel_rows(), current_branch_id="b1", on_export=lambda *_: None)
+    assert all(isinstance(box, QCheckBox) for box in panel._fmt.values())
+    assert panel._fmt["html"].isChecked()
+    for fmt in ("txt", "md", "json", "html"):
+        panel._fmt[fmt].click()
+        assert [key for key, box in panel._fmt.items() if box.isChecked()] == [fmt]
+        # 再次点击已选格式不能取消唯一选择。
+        panel._fmt[fmt].click()
+        assert panel._fmt[fmt].isChecked()

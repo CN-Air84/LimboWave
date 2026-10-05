@@ -25,7 +25,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from limbowave.application.services.model_probe import DiscoveryResult, ModelProbeResult
+from limbowave.application.services.model_probe import (
+    DiscoveryResult,
+    ModelProbeProgress,
+    ModelProbeResult,
+)
 from limbowave.domain.models import ActualModel
 from limbowave.domain.providers import EndpointConfig
 from limbowave.ui import theme
@@ -322,6 +326,7 @@ class SettingsPage(QWidget):
         self._discovery_cache: dict[str, tuple[EndpointConfig, DiscoveryResult]] = {}
         self._settings = settings
         self._probe_tasks: dict[tuple[str, str], ModelProbeTask] = {}
+        self._probe_progress: dict[tuple[str, str], ModelProbeProgress] = {}
         self._request_logs = request_logs
         self._conversation_id = conversation_id
         root = QVBoxLayout(self)
@@ -502,9 +507,24 @@ class SettingsPage(QWidget):
         for task in self._probe_tasks.values():
             if self.actual_models.endpoint_id == task.endpoint.id:
                 self.actual_models.mark_probe_started(task.model_id)
+                progress = self._probe_progress.get((task.endpoint.id, task.model_id))
+                if progress is not None:
+                    self.actual_models.apply_probe_progress(
+                        task.endpoint.id, task.model_id, progress,
+                    )
+
+    def apply_model_probe_progress(
+        self, endpoint_id: str, model_id: str, progress: ModelProbeProgress,
+    ) -> None:
+        key = (endpoint_id, model_id)
+        if key not in self._probe_tasks:
+            return
+        self._probe_progress[key] = progress
+        self.actual_models.apply_probe_progress(endpoint_id, model_id, progress)
 
     def apply_model_probe(self, endpoint_id: str, result: ModelProbeResult) -> None:
         self._probe_tasks.pop((endpoint_id, result.model_id), None)
+        self._probe_progress.pop((endpoint_id, result.model_id), None)
         self.models_tab.apply_probe_result(endpoint_id, result)
         actual = self._settings.load().actual_model(endpoint_id, result.model_id)
         self.actual_models.apply_probe_result(endpoint_id, result, actual)
@@ -522,6 +542,7 @@ class SettingsPage(QWidget):
 
     def show_model_probe_error(self, endpoint_id: str, model_id: str, detail: str) -> None:
         self._probe_tasks.pop((endpoint_id, model_id), None)
+        self._probe_progress.pop((endpoint_id, model_id), None)
         self.models_tab.show_probe_error(endpoint_id, model_id, detail)
         self.actual_models.show_probe_error(endpoint_id, model_id, detail)
 

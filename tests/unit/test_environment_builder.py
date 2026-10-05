@@ -278,3 +278,61 @@ def test_refresh_catalog_clears_param_rules(tmp_path: Path) -> None:
     routing = RoutingService(_config())
     sync = EnvironmentBuilder(tmp_path).refresh_catalog([(routing.route(), SECRET)])
     assert sync.env["LIMBOWAVE_PARAM_RULES"] == ""
+
+
+@pytest.mark.parametrize("protocol", list(ProviderProtocol))
+def test_verified_efforts_are_exported_only_for_effort_protocols(protocol) -> None:
+    from dataclasses import replace
+
+    decision = RoutingService(_config()).route()
+    decision = replace(
+        decision,
+        endpoint=decision.endpoint.model_copy(update={"api": protocol}),
+        binding=decision.binding.model_copy(update={
+            "supports_thinking": True, "available_thinking_levels": ("low", "high", "max")
+        }),
+    )
+    entry = EnvironmentBuilder._model_entry(decision)
+    if protocol in (ProviderProtocol.OPENAI_COMPLETIONS, ProviderProtocol.OPENAI_RESPONSES):
+        assert entry["thinkingLevelMap"] == {
+            "minimal": None, "low": "low", "medium": None,
+            "high": "high", "xhigh": None, "max": "max",
+        }
+    else:
+        assert "thinkingLevelMap" not in entry
+
+
+def test_unknown_capability_does_not_invent_effort_support() -> None:
+    entry = EnvironmentBuilder._model_entry(RoutingService(_config()).route())
+    assert "reasoning" not in entry
+    assert "thinkingLevelMap" not in entry
+
+
+def test_temporary_thinking_map_is_scoped_and_not_stored_in_configuration(tmp_path):
+    decision = RoutingService(_config()).route()
+    builder = EnvironmentBuilder(tmp_path)
+    builder.refresh_catalog([(decision, SECRET)], temporary_thinking_levels={
+        (decision.provider_key, decision.model_id): ("max",)
+    })
+    entry = _models_json(tmp_path)["providers"]["relay-a"]["models"][0]
+    assert entry["reasoning"] is True
+    assert entry["thinkingLevelMap"]["max"] == "max"
+    assert decision.binding.user_thinking_levels == ()
+    assert decision.binding.supports_thinking is None
+    builder.refresh_catalog([(decision, SECRET)])
+    entry = _models_json(tmp_path)["providers"]["relay-a"]["models"][0]
+    assert "thinkingLevelMap" not in entry
+    assert "reasoning" not in entry
+
+
+@pytest.mark.parametrize("protocol", list(ProviderProtocol))
+def test_user_confirmed_level_is_exported_for_each_protocol(protocol):
+    from dataclasses import replace
+
+    decision = RoutingService(_config()).route()
+    decision = replace(decision,
+        endpoint=decision.endpoint.model_copy(update={"api": protocol}),
+        binding=decision.binding.model_copy(update={"user_thinking_levels": ("high",)}))
+    entry = EnvironmentBuilder._model_entry(decision)
+    assert entry["reasoning"] is True
+    assert entry["thinkingLevelMap"]["high"] == "high"

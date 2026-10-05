@@ -38,6 +38,7 @@ def test_incomplete_reply_offers_retry_instead_of_fork(
     assistants = [row for row in view._rows if row._role == "assistant"]
     assert bool(assistants) == bool(text)
     assert all(row._fork_btn.isHidden() for row in assistants)
+    assert all(row._regenerate_btn.isHidden() for row in assistants)
     with qtbot.waitSignal(view.retry_requested) as signal:
         qtbot.mouseClick(user_row._retry_btn, Qt.MouseButton.LeftButton)
     assert signal.args == ["user-1"]
@@ -221,7 +222,7 @@ def test_retry_reuses_rows_and_fades_without_losing_fast_tokens(
     qtbot.waitUntil(lambda: assistant._retry_animation is None, timeout=1500)
     assert assistant._assistant_panel.graphicsEffect() is None
     assert assistant.content_text() == "新回复"
-    assert assistant._thinking._content.text() == "新思考"
+    assert assistant._thinking.text() == "新思考"
     assert assistant._message_id == "assistant-new"
     assert not assistant._fork_btn.isHidden()
     assert len(assistant._segments) == 1
@@ -299,3 +300,218 @@ async def test_retry_history_collapses_chain_but_not_normal_duplicate_sends(qtbo
     assert [row._role for row in view._rows] == ["user", "assistant", "user", "assistant"]
     assert all(row._retry_btn.isHidden() for row in view._rows if row._role == "user")
     assert view._rows[-1].content_text() == "普通发送成功"
+
+
+@pytest.mark.parametrize("old_text", ["", "旧尝试的部分回复"])
+def test_automatic_retry_reuses_card_and_replaces_attempt_state(
+    qtbot: QtBot, old_text: str
+) -> None:
+    view = ChatView()
+    qtbot.addWidget(view)
+    view.add_user_message("之前的问题", "user-old")
+    view.end_assistant("之前的回复", "assistant-old")
+    earlier_rows = list(view._rows)
+    view.add_user_message("当前问题", "user-1")
+    view.set_busy(True)
+    user, assistant = view._rows[-2:]
+    state = assistant._run_state
+
+    for attempt in (2, 3):
+        view.begin_assistant()
+        view.append_thinking_delta("旧尝试的思考")
+        view.end_assistant(
+            old_text, "assistant-1", stop_reason="error", user_message_id="user-1"
+        )
+        view.add_error("连接失败", retry_message_id="user-1")
+        old_segment = assistant._segments[-1]
+        view.add_retry_notice("连接失败", attempt=attempt, delay_ms=100, max_attempts=3)
+
+        assert view._rows == [*earlier_rows, user, assistant]
+        assert view._transcript.count() == len(view._rows) + 1
+        assert view._stream_row is assistant
+        assert view._run_tail is assistant
+        assert view._run_rows == [assistant]
+        assert assistant._run_state is state
+        assert f"第 {attempt}/3 次尝试" in state.text()
+        assert not state.isHidden()
+        assert user._retry_btn.isHidden()
+        assert assistant.content_text() == ""
+        assert assistant._thinking is None
+        assert assistant._message_id is None
+        assert len(assistant._segments) == 1
+        assert assistant._segments[0] is not old_segment
+        assert assistant._segments[0].hint._timer.isActive()
+        assert not old_segment.hint._timer.isActive()
+
+    view.begin_assistant()
+    view.append_thinking_delta("新思考")
+    view.append_assistant_delta("成功回复")
+    view.end_assistant("成功回复", "assistant-new")
+    view.set_busy(False)
+    assert view._rows == [*earlier_rows, user, assistant]
+    assert assistant.content_text() == "成功回复"
+    assert assistant._thinking.text() == "新思考"
+    assert len(assistant._segments) == 1
+    assert state.isHidden()
+    assert not assistant._fork_btn.isHidden()
+
+
+def test_replayed_manual_retry_does_not_add_or_reset_bubbles(qtbot: QtBot) -> None:
+    view = ChatView()
+    qtbot.addWidget(view)
+    view.add_user_message("问题", "user-1")
+    view.set_busy(True)
+    view.end_assistant(
+        "部分输出", "assistant-1", stop_reason="error", user_message_id="user-1"
+    )
+    view.set_busy(False)
+    view.retry_user_message("问题", "user-2", "user-1")
+    user, assistant = view._rows
+    view.begin_assistant()
+    view.append_assistant_delta("新的输出")
+
+    view.retry_user_message("问题", "user-2", "user-1")
+
+    assert view._rows == [user, assistant]
+    assert view._stream_row is assistant
+    assert assistant.content_text() == "新的输出"
+    view.set_busy(False)
+
+
+@pytest.mark.parametrize("final_text", ["", "最终回复"])
+@pytest.mark.parametrize("final_stop", ["stop", "error"])
+async def test_app_automatic_retry_keeps_one_reply_and_only_final_error(
+    qtbot: QtBot, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    final_stop: str, final_text: str,
+) -> None:
+    from tests.unit.test_run_coordinator import _retry_context
+
+    kernel = BranchingKernel()
+    monkeypatch.setattr(
+        app, "_build_kernel", lambda *_a, **_kw: KernelSetup(kernel, "fake", "fake", "test")
+    )
+    monkeypatch.setattr(shell, "probe_shell", lambda *_a: None)
+    window = MainWindow()
+    qtbot.addWidget(window)
+    controller, _ipc, _warm, _startup, shutdown = app._wire(
+        window, AppPaths(tmp_path, tmp_path / "logs"), None
+    )
+    controller.coordinator()._context = lambda: _retry_context(base_delay_ms=0)
+    try:
+        await controller.send("问题")
+        user, assistant = window.chat._rows
+        for _ in range(2):
+            kernel.emit("message.start", {"message": {"role": "assistant"}})
+            kernel.emit("message.update", {"assistantMessageEvent": {
+                "type": "thinking_delta", "delta": "旧思考",
+            }})
+            kernel.emit("message.end", {"message": {
+                "role": "assistant", "stopReason": "error", "errorMessage": "ECONNRESET",
+            }})
+            assert window.chat._rows == [user, assistant]  # Error event itself adds nothing.
+            kernel.emit("run.settled", {})
+            await controller.wait_idle()
+            assert window.chat._rows == [user, assistant], [
+                (row._role, row.content_text()) for row in window.chat._rows
+            ]
+            assert window.chat._transcript.count() == 3
+            assert window.chat._busy
+            assert len(assistant._segments) == 1
+            assert assistant._thinking is None
+            assert user._retry_btn.isHidden()
+
+        assert kernel.sent == ["问题"] * 3
+        kernel.say(final_text, stop=final_stop)
+        kernel.emit("run.settled", {})
+        await controller.wait_idle()
+        if final_text or final_stop == "error":
+            assert window.chat._rows == [user, assistant]
+            assert assistant.content_text() == final_text
+            assert len(assistant._segments) == 1
+        else:
+            assert all(row._role != "assistant" for row in window.chat._rows)
+        assert not window.chat._busy
+        assert all(row._role != "error" for row in window.chat._rows)
+        if final_stop == "error":
+            assert assistant._run_error
+            assert not assistant._run_state.isHidden()
+            assert "⚠" in assistant._run_state.text()
+        assert user._retry_btn.isHidden() == (final_stop == "stop")
+        assert window.chat._transcript.count() == len(window.chat._rows) + 1
+    finally:
+        await shutdown()
+
+
+@pytest.mark.parametrize("old_text", ["", "部分输出"])
+def test_run_error_never_inserts_a_transient_bubble(qtbot: QtBot, old_text: str) -> None:
+    view = ChatView()
+    qtbot.addWidget(view)
+    view.add_user_message("问题", "user-1")
+    view.set_busy(True)
+    user, assistant = view._rows
+    state = assistant._run_state
+    for attempt in (2, 3):
+        view.end_assistant(
+            old_text, "assistant-old", stop_reason="error", user_message_id="user-1"
+        )
+        view.add_error("连接失败", retry_message_id="user-1")
+        # Check before retrying/settled: adding then deleting an error bubble is not reuse.
+        assert view._rows == [user, assistant]
+        assert view._transcript.count() == 3
+        assert "连接失败" in state.text()
+        assert not state.isHidden()
+        view.add_retry_notice("连接失败", attempt=attempt, delay_ms=0, max_attempts=3)
+        assert view._rows == [user, assistant]
+        assert assistant._run_state is state
+        assert f"第 {attempt}/3 次尝试" in state.text()
+    view.end_assistant("成功", "assistant-new")
+    view.set_busy(False)
+    assert view._rows == [user, assistant]
+    assert state.isHidden()
+
+
+def test_empty_failed_reply_survives_settlement_and_manual_retry(qtbot: QtBot) -> None:
+    view = ChatView()
+    qtbot.addWidget(view)
+    view.add_user_message("问题", "user-1")
+    view.set_busy(True)
+    user, assistant = view._rows
+    for attempt in range(1, 4):
+        view.add_error("发送失败", retry_message_id=f"user-{attempt}")
+        view.set_busy(False)
+        assert view._rows == [user, assistant]
+        assert "发送失败" in assistant._run_state.text()
+        assert not assistant._run_state.isHidden()
+        assert not assistant._segments[-1].hint._timer.isActive()
+        assert not user._retry_btn.isHidden()
+        view.retry_user_message("问题", f"user-{attempt + 1}", f"user-{attempt}")
+        assert view._rows == [user, assistant]
+        assert "发送失败" not in assistant._run_state.text()
+    view.end_assistant("成功", "assistant-final")
+    view.set_busy(False)
+    assert view._rows == [user, assistant]
+    assert assistant._run_state.isHidden()
+
+
+@pytest.mark.parametrize("replay", ["stale", "missing", "empty"])
+def test_unmatched_retry_never_becomes_a_new_send(qtbot: QtBot, replay: str) -> None:
+    view = ChatView()
+    qtbot.addWidget(view)
+    if replay != "empty":
+        view.add_user_message("问题", "user-1")
+        view.set_busy(True)
+        view.end_assistant("失败", "assistant-1", stop_reason="error")
+        view.set_busy(False)
+        view.retry_user_message("问题", "user-2", "user-1")
+        view.end_assistant("失败", "assistant-2", stop_reason="error")
+        view.set_busy(False)
+        view.retry_user_message("问题", "user-3", "user-2")
+        view.append_assistant_delta("最新输出")
+    rows = list(view._rows)
+    tail = view._stream_row
+    view.retry_user_message("问题", "user-2", "user-1" if replay == "stale" else "missing")
+    assert view._rows == rows
+    assert view._stream_row is tail
+    if tail is not None:
+        assert tail.content_text() == "最新输出"
+    view.set_busy(False)

@@ -166,6 +166,10 @@ class SessionController:
         """重试失败或停止的用户请求：在当前分支重发原文，不创建分支。"""
         return await self._coordinator.retry_user_message(message_id)
 
+    async def fork_message(self, assistant_message_id: str) -> str | None:
+        """从完整回复之后分叉，保留这条回复，不触发生成。"""
+        return await self._coordinator.fork_message(assistant_message_id)
+
     async def regenerate(self, assistant_message_id: str) -> str | None:
         """完整回复分叉重生成；失败或停止的回复在当前分支重试。"""
         return await self._coordinator.regenerate(assistant_message_id)

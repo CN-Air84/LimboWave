@@ -17,6 +17,7 @@ from tests.unit.test_memory_service import memory_stack as memory_stack
 def _show_editor_page(qtbot, service, scope=(None, None)):
     panel = MemoryPanel(service, conversation_id=scope[0], branch_id=scope[1])
     qtbot.addWidget(panel)
+    qtbot.waitUntil(panel.isEnabled)
     panel.resize(900, 640)
     panel._subtabs.setCurrentIndex(1)
     panel.show()
@@ -45,6 +46,7 @@ def test_memory_subtabs_separate_settings_and_list_with_appearance_animation(qtb
     service, _ = memory_stack
     panel = MemoryPanel(service)
     qtbot.addWidget(panel)
+    qtbot.waitUntil(panel.isEnabled)
     panel.resize(900, 640)
     panel.show()
     qtbot.waitExposed(panel)
@@ -83,12 +85,14 @@ def test_global_injection_settings_and_intervals(qtbot, memory_stack):
     service, _ = memory_stack
     panel = MemoryPanel(service)
     qtbot.addWidget(panel)
+    qtbot.waitUntil(panel.isEnabled)
     assert panel.global_interval.minimum() == 1
     assert panel.session_interval.maximum() == 30
     panel.global_interval.setValue(1)
     panel.session_interval.setValue(30)
     panel.policy.setCurrentIndex(panel.policy.findData("allow"))
     qtbot.mouseClick(panel.save_settings_button, Qt.MouseButton.LeftButton)
+    qtbot.waitUntil(panel.isEnabled)
     assert service.settings().global_interval == 1
     assert service.settings().session_interval == 30
     assert service.settings().default_policy == "allow"
@@ -107,6 +111,8 @@ def test_add_and_double_click_edit_memory_in_floating_panel(qtbot, memory_stack,
     assert editor.hasFocus()
     editor.setPlainText("中文偏好\n保留换行")
     qtbot.mouseClick(save, Qt.MouseButton.LeftButton)
+    qtbot.waitUntil(lambda: not panel.is_editing or save.isEnabled())
+    qtbot.waitUntil(panel.isEnabled)
     assert not panel.is_editing
     original = service.list(*scope)[0]
     assert original.content == "中文偏好\n保留换行"
@@ -120,6 +126,8 @@ def test_add_and_double_click_edit_memory_in_floating_panel(qtbot, memory_stack,
     editor.setPlainText("<b>完整正文，不解析标签</b>\n" + "记忆" * 1500)
     expected = editor.toPlainText()
     qtbot.mouseClick(save, Qt.MouseButton.LeftButton)
+    qtbot.waitUntil(lambda: not panel.is_editing or save.isEnabled())
+    qtbot.waitUntil(panel.isEnabled)
     updated = service.list(*scope)
     assert len(updated) == 1 and updated[0].id == original.id
     assert updated[0].content == expected
@@ -135,6 +143,8 @@ def test_add_and_double_click_edit_memory_in_floating_panel(qtbot, memory_stack,
     assert editor.toPlainText() == ""
     editor.setPlainText("独立的新条目")
     qtbot.mouseClick(save, Qt.MouseButton.LeftButton)
+    qtbot.waitUntil(lambda: not panel.is_editing or save.isEnabled())
+    qtbot.waitUntil(panel.isEnabled)
     assert len(service.list(*scope)) == 2
 
 
@@ -171,6 +181,8 @@ def test_invalid_memory_stays_in_editor_and_can_be_corrected(qtbot, memory_stack
     popup, editor, save = _editor_parts(qtbot, panel)
     editor.setPlainText(text)
     qtbot.mouseClick(save, Qt.MouseButton.LeftButton)
+    qtbot.waitUntil(lambda: not panel.is_editing or save.isEnabled())
+    qtbot.waitUntil(panel.isEnabled)
     assert panel.is_editing and popup.isVisible()
     assert editor.toPlainText() == text
     assert not service.list()
@@ -179,6 +191,8 @@ def test_invalid_memory_stays_in_editor_and_can_be_corrected(qtbot, memory_stack
     assert error.textFormat() == Qt.TextFormat.PlainText
     editor.setPlainText("可保存的正文")
     qtbot.mouseClick(save, Qt.MouseButton.LeftButton)
+    qtbot.waitUntil(lambda: not panel.is_editing or save.isEnabled())
+    qtbot.waitUntil(panel.isEnabled)
     assert not panel.is_editing
     assert service.list()[0].content == "可保存的正文"
 
@@ -192,11 +206,14 @@ def test_reload_preserves_draft_and_original_edit_target(qtbot, memory_stack):
     popup, editor, save = _editor_parts(qtbot, panel)
     editor.setPlainText("仍然编辑原始条目")
     panel.reload()
+    qtbot.waitUntil(panel.isEnabled)
     panel.items.setCurrentRow(1)
     assert panel.is_editing
     assert panel._editor_panel is popup
     assert editor.toPlainText() == "仍然编辑原始条目"
     qtbot.mouseClick(save, Qt.MouseButton.LeftButton)
+    qtbot.waitUntil(lambda: not panel.is_editing or save.isEnabled())
+    qtbot.waitUntil(panel.isEnabled)
     assert service.list()[0].id == original.id
     assert service.list()[0].content == "仍然编辑原始条目"
     assert service.list()[1] == other
@@ -234,6 +251,8 @@ def test_session_editor_is_nested_and_closes_with_parent(qtbot, memory_stack):
     assert not outer._closing and panel.is_editing
     editor.setPlainText("此分支的记忆")
     qtbot.mouseClick(save, Qt.MouseButton.LeftButton)
+    qtbot.waitUntil(lambda: not panel.is_editing or save.isEnabled())
+    qtbot.waitUntil(panel.isEnabled)
     assert not outer._closing and not panel.is_editing
     assert service.list("c", "b")[0].content == "此分支的记忆"
     assert not service.list()
@@ -250,6 +269,7 @@ def test_session_override_and_promotion(qtbot, memory_stack, monkeypatch):
     service.save("分支独有", "c", "b")
     panel = MemoryPanel(service, conversation_id="c", branch_id="b")
     qtbot.addWidget(panel)
+    qtbot.waitUntil(panel.isEnabled)
     panel.items.setCurrentRow(0)
     confirmations = []
 
@@ -259,14 +279,17 @@ def test_session_override_and_promotion(qtbot, memory_stack, monkeypatch):
 
     monkeypatch.setattr("limbowave.ui.session_memory_panel.ask_confirm", confirm)
     panel._promote()
+    qtbot.waitUntil(panel.isEnabled)
     assert "所有会话" in confirmations[0]
     assert service.list()[0].content == "分支独有"
     assert service.list("c", "other") == []
     panel.policy.setCurrentIndex(panel.policy.findData("allow"))
     qtbot.mouseClick(panel.save_settings_button, Qt.MouseButton.LeftButton)
+    qtbot.waitUntil(panel.isEnabled)
     assert service.policy("c") is MemoryPolicy.ALLOW
     panel.items.setCurrentRow(0)
     panel._delete()
+    qtbot.waitUntil(panel.isEnabled)
     assert not service.list("c", "b")
     assert len(service.list()) == 1
     assert not panel.delete_button.isEnabled()
@@ -366,6 +389,7 @@ def test_memory_cards_empty_state_and_themed_layout(qtbot, memory_stack, palette
         for i in range(5):
             service.save(f"卡片 {i}\n" + "🙂正文 \U00020000" * 70)
         panel.reload()
+        qtbot.waitUntil(panel.isEnabled)
         assert not panel.items.empty_state.isVisible()
         view = panel.items
         qtbot.waitUntil(lambda: view.visualItemRect(view.item(1)).left() > 0)
@@ -378,6 +402,7 @@ def test_memory_cards_empty_state_and_themed_layout(qtbot, memory_stack, palette
         for item in service.list():
             service.delete(item.id)
         panel.reload()
+        qtbot.waitUntil(panel.isEnabled)
         assert view.empty_state.isVisible()
         assert not panel.delete_button.isEnabled()
     finally:

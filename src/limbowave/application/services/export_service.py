@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import base64
 import html
+import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -36,9 +38,10 @@ from limbowave.domain.run import RunRecord
 from limbowave.infrastructure.crypto.blob_store import BlobStore
 
 PRIVACY_NOTICE = (
-    "导出的 HTML 是**明文文件**，不加密。\n"
+    "导出的文件是**明文文件**，不加密。\n"
     "它包含：会话消息正文、模型的思考内容（如有）、以及每条回复使用的模型与站点。\n"
     "它**不含**：API 密钥、完整请求头、原始请求/响应载荷、权限审计记录。\n"
+    "HTML 还会内嵌图片与工具步骤。消息正文中自行粘贴的敏感信息不会自动脱敏。\n"
     "请把导出文件放在你认为安全的位置；发给他人前请自行确认内容。"
 )
 
@@ -79,9 +82,27 @@ _MD.enable("strikethrough")
 class ExportService:
     """把一条分支导出成单文件 HTML。只读，不改任何数据。"""
 
-    def __init__(self, uow_factory: UnitOfWorkFactory, blob_store: BlobStore | None) -> None:
+    def __init__(
+        self, uow_factory: UnitOfWorkFactory, blob_store: BlobStore | None,
+        *, model_names: Mapping[str, str] | None = None,
+        endpoint_names: Mapping[str, str] | None = None,
+    ) -> None:
         self._uow_factory = uow_factory
         self._blobs = blob_store
+        self._model_names = dict(model_names or {})
+        self._endpoint_names = dict(endpoint_names or {})
+
+    def _display_reason(self, reason: str) -> str:
+        """只转换溯源说明，不替换消息正文；一次替换避免显示名被二次替换。"""
+        names = {**self._model_names, **self._endpoint_names}
+        names = {key: value for key, value in names.items() if key and value}
+        if not names:
+            return reason
+        alternatives = "|".join(re.escape(key) for key in sorted(names, key=len, reverse=True))
+        return re.sub(
+            rf"(?<![\w./:-])(?:{alternatives})(?![\w./:-])",
+            lambda match: names[match.group()], reason,
+        )
 
     def render_plain(self, branch_id: str, fmt: str) -> str:
         """把分支渲染成 md / txt / json 三种纯文本格式（导出悬浮窗用）。
@@ -164,6 +185,44 @@ class ExportService:
             image_count=stats["images"],
             bytes_written=len(page.encode("utf-8")),
         )
+
+    def export_selection(self, branch_ids: list[str], fmt: str, target: Path) -> list[Path]:
+        """每个分支独立导出；排他创建文件，绝不静默覆盖已有内容。"""
+        if fmt not in {"html", "md", "txt", "json"}:
+            raise ValueError(f"不支持的导出格式：{fmt}")
+        ids = list(dict.fromkeys(branch_ids))
+        if not ids:
+            raise ValueError("请至少选择一个分支")
+        suffix = f".{fmt}"
+        stem = target.name[:-len(suffix)] if target.name.lower().endswith(suffix) else target.name
+        outputs = [
+            target.with_name(f"{stem}{f'-{index:03d}' if len(ids) > 1 else ''}{suffix}")
+            for index in range(1, len(ids) + 1)
+        ]
+        # 先校验并渲染全部选择，避免无效分支导致只导出前半部分。
+        for path in outputs:
+            if path.exists():
+                raise FileExistsError(f"文件已存在，请更换文件名：{path}")
+        pages: list[str] = []
+        for branch_id in ids:
+            if fmt == "html":
+                with self._uow_factory() as uow:
+                    page, _stats = self._render(uow, branch_id)
+            else:
+                page = self.render_plain(branch_id, fmt)
+            pages.append(page)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        created: list[Path] = []
+        try:
+            for path, page in zip(outputs, pages, strict=True):
+                with path.open("x", encoding="utf-8") as stream:
+                    created.append(path)
+                    stream.write(page)
+        except Exception:
+            for path in created:
+                path.unlink(missing_ok=True)
+            raise
+        return outputs
 
     # ---------- 渲染 ----------
 
@@ -270,11 +329,14 @@ class ExportService:
         transports = uow.snapshots.list_transport(run_id)
         out: list[str] = []
         if intent is not None:
+            model_name = self._model_names.get(intent.logical_model_id) or intent.logical_model_id
+            endpoint_name = self._endpoint_names.get(intent.endpoint_id) or intent.endpoint_id
+            reason = self._display_reason(intent.routing_reason)
             out.append(
                 '<div class="provenance">模型 '
-                f"<code>{html.escape(intent.logical_model_id)}</code> → 站点 "
-                f"<code>{html.escape(intent.endpoint_id)}</code>"
-                f'<span class="reason">（{html.escape(intent.routing_reason)}）</span></div>'
+                f"<code>{html.escape(model_name)}</code> → 站点 "
+                f"<code>{html.escape(endpoint_name)}</code>"
+                f'<span class="reason">（{html.escape(reason)}）</span></div>'
             )
         if transports:
             # 工具步骤 / 传输摘要：只给状态与序号，不给请求体与请求头

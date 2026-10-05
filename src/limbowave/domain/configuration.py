@@ -133,8 +133,6 @@ class AppConfiguration(BaseModel):
                     )
             if len({b.key for b in model.bindings}) != len(model.bindings):
                 raise ValueError(f"模型 {model.id} 重复绑定了同一个实际模型")
-            if not (0 <= model.default_binding < max(1, len(model.bindings))):
-                raise ValueError(f"模型 {model.id} 的 default_binding 越界")
 
         seen: set[tuple[str, str]] = set()
         for actual in self.actual_models:

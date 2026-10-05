@@ -174,6 +174,10 @@ class ImageService:
             size_text=_human_size(attachment.size_bytes),
         )
 
+    def get(self, attachment_id: str) -> ImageAttachment | None:
+        with self._uow_factory() as uow:
+            return uow.image_attachments.get(attachment_id)
+
     def list_all(self) -> list[ImageAttachment]:
         with self._uow_factory() as uow:
             return uow.image_attachments.list_all()

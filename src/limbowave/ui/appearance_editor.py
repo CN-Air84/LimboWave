@@ -111,7 +111,7 @@ class AppearanceEditor(QWidget):
 
     appearance_changed = Signal(object)
 
-    # 应用一次预览要重设全局样式表、重渲染会话，会卡住事件循环一小段。先让控件自己的
+    # 应用一次预览要重设全局样式表，会卡住事件循环一小段。先让控件自己的
     # 点击反馈（复选框勾选过渡约 150–190ms）播完再应用；连续调数值时也顺带合并成一次。
     PREVIEW_DELAY_MS = 200
 
@@ -122,6 +122,9 @@ class AppearanceEditor(QWidget):
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
+        from limbowave.ui.background_tasks import BackgroundTasks
+
+        self._jobs = BackgroundTasks(self)
         self._preferences = preferences
         current = preferences.load()
         self.theme_service = theme_service or AppearanceThemeService(
@@ -699,32 +702,54 @@ class AppearanceEditor(QWidget):
         )
         if not file:
             return
-        try:
-            asset = self.theme_service.import_background(Path(file))
-        except (OSError, ValueError) as exc:
+        service = self.theme_service
+        self.setEnabled(False)
+
+        def loaded(asset: str) -> None:
+            self.setEnabled(True)
+            self.background_resource_label.setText(asset)
+            self._preview(replace(
+                self._draft, background=replace(self._draft.background, asset=asset)
+            ))
+
+        def failed(exc: Exception) -> None:
+            self.setEnabled(True)
             QMessageBox.warning(self, "背景不可用", str(exc))
-            return
-        self.background_resource_label.setText(asset)
-        self._preview(replace(self._draft, background=replace(self._draft.background, asset=asset)))
+
+        self._jobs.submit(lambda: service.import_background(Path(file)), loaded, failed)
 
     def _remove_background(self) -> None:
         self.background_resource_label.setText("未设置")
         self._preview(replace(self._draft, background=replace(self._draft.background, asset="")))
 
     def _cleanup_backgrounds(self) -> None:
-        orphans = self.theme_service.orphan_assets()
-        if not orphans:
-            QMessageBox.information(self, "主题资源", "没有未引用的背景图片。")
-            return
-        total = sum(path.stat().st_size for path in orphans)
-        answer = QMessageBox.question(
-            self,
-            "清理主题资源",
-            f"删除 {len(orphans)} 个未引用背景（{total / 1024 / 1024:.1f} MiB）？",
-        )
-        if answer == QMessageBox.StandardButton.Yes:
-            deleted = self.theme_service.cleanup_orphan_assets()
-            QMessageBox.information(self, "主题资源", f"已删除 {len(deleted)} 个文件。")
+        service = self.theme_service
+
+        def inspect() -> tuple[int, int]:
+            orphans = service.orphan_assets()
+            return len(orphans), sum(path.stat().st_size for path in orphans)
+
+        def failed(exc: Exception) -> None:
+            QMessageBox.warning(self, "主题资源", str(exc))
+
+        def ready(data: tuple[int, int]) -> None:
+            count, total = data
+            if not count:
+                QMessageBox.information(self, "主题资源", "没有未引用的背景图片。")
+                return
+            answer = QMessageBox.question(
+                self, "清理主题资源",
+                f"删除 {count} 个未引用背景（{total / 1024 / 1024:.1f} MiB）？",
+            )
+            if answer == QMessageBox.StandardButton.Yes:
+                self._jobs.submit(
+                    service.cleanup_orphan_assets,
+                    lambda deleted: QMessageBox.information(
+                        self, "主题资源", f"已删除 {len(deleted)} 个文件。"
+                    ), failed,
+                )
+
+        self._jobs.submit(inspect, ready, failed)
 
     def _system_font_changed(self, _index: int = -1) -> None:
         if self._loading:
@@ -754,28 +779,44 @@ class AppearanceEditor(QWidget):
         if not file:
             return
         source = Path(file)
-        try:
+        directory = self._preferences.path.parent / "fonts"
+        self.setEnabled(False)
+
+        def copy_font() -> Path:
+            if source.stat().st_size > 16 * 1024 * 1024:
+                raise ValueError("字体超过 16 MiB")
             data = source.read_bytes()
-            if len(data) > 16 * 1024 * 1024 or not (families := family_for_file(file)):
-                raise ValueError("字体无效或超过 16 MiB")
-            directory = self._preferences.path.parent / "fonts"
+            if len(data) > 16 * 1024 * 1024:
+                raise ValueError("字体超过 16 MiB")
             directory.mkdir(parents=True, exist_ok=True)
             destination = directory / (sha256(data).hexdigest() + source.suffix.lower())
             if not destination.exists():
                 pending = destination.with_suffix(destination.suffix + ".tmp")
                 pending.write_bytes(data)
                 pending.replace(destination)
-        except (OSError, ValueError) as exc:
+            return destination
+
+        def failed(exc: Exception) -> None:
+            self.setEnabled(True)
             QMessageBox.warning(self, "字体不可用", str(exc))
-            return
-        self._font_file = str(destination)
-        family = families[0]
-        if self._family.findData(family) < 0:
-            self._family.addItem(family, family)
-        self._loading = True
-        self._family.setCurrentIndex(self._family.findData(family))
-        self._loading = False
-        self._font_preferences_changed()
+
+        def ready(destination: Path) -> None:
+            self.setEnabled(True)
+            # Font registration belongs to Qt; file reading/hashing/copying does not.
+            families = family_for_file(str(destination))
+            if not families:
+                failed(ValueError("字体无效"))
+                return
+            self._font_file = str(destination)
+            family = families[0]
+            if self._family.findData(family) < 0:
+                self._family.addItem(family, family)
+            self._loading = True
+            self._family.setCurrentIndex(self._family.findData(family))
+            self._loading = False
+            self._font_preferences_changed()
+
+        self._jobs.submit(copy_font, ready, failed)
 
     def resolve_pending_changes(self) -> bool:
         return not self.dirty or self._resolve_dirty()

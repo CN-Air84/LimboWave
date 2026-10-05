@@ -15,6 +15,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from limbowave.application.repositories import UnitOfWorkFactory
+from limbowave.application.services.compression_context import without_application_compactions
 from limbowave.domain.conversation import Conversation
 from limbowave.domain.runtime_mirror import RuntimeEntryMirror
 from limbowave.domain.runtime_state import RuntimeStateSnapshot, fingerprint_from_entry
@@ -46,7 +47,9 @@ class RuntimeStateService:
                     entry.setdefault("parentId", mirror.parent_entry_id)
                 entries.append(entry)
 
-            entries = isolate_conversation_entries(entries, uow.conversations.get(conversation_id))
+            entries = without_application_compactions(
+                isolate_conversation_entries(entries, uow.conversations.get(conversation_id))
+            )
             if not entries:
                 return None
             fingerprints = [
@@ -114,7 +117,9 @@ class RuntimeStateService:
                 entry.setdefault("parentId", mirror.parent_entry_id)
             entries.append(entry)
 
-        entries = isolate_conversation_entries(entries, conversation)
+        entries = without_application_compactions(
+            isolate_conversation_entries(entries, conversation)
+        )
         if not entries:
             return None
         fingerprints = [fingerprint_from_entry(e, branch_position=i) for i, e in enumerate(entries)]

@@ -24,6 +24,7 @@ CAPABILITY_FIELDS = (
     "default_thinking_level",
     "thinking_level_locked",
     "available_thinking_levels",
+    "user_thinking_levels",
     "supports_thinking",
     "supports_tools",
 )
@@ -50,6 +51,8 @@ class ActualModel(BaseModel):
     thinking_level_locked: bool = False
     # 逐级探测实际验证的等级；空值表示尚无逐级探测结果。
     available_thinking_levels: tuple[str, ...] = ()
+    # 用户在真实请求成功后明确确认的等级；与自动探测来源分开保存。
+    user_thinking_levels: tuple[str, ...] = ()
     # None = 尚未确认；True/False = 检测结果或用户声明
     supports_thinking: bool | None = None
     # 工具能力声明（§二.4 模型级覆盖）：由检测或用户设置，供工具模式判断使用
@@ -86,6 +89,7 @@ class ModelBinding(BaseModel):
     default_thinking_level: str | None = Field(default=None, exclude=True)
     thinking_level_locked: bool = Field(default=False, exclude=True)
     available_thinking_levels: tuple[str, ...] = Field(default=(), exclude=True)
+    user_thinking_levels: tuple[str, ...] = Field(default=(), exclude=True)
     supports_thinking: bool | None = Field(default=None, exclude=True)
     supports_tools: bool = Field(default=False, exclude=True)
 
@@ -100,6 +104,7 @@ class LogicalModel(BaseModel):
 
     可以先建后绑：``bindings`` 为空表示还没有绑定实际模型（路由会如实报错）。
     同一站点至多一条绑定（会话级站点覆盖与备用站点都按站点区分）。
+    bindings 按优先级从高到低排列，第一条就是默认站点。旧 default_binding 字段忽略。
     """
 
     model_config = ConfigDict(frozen=True)
@@ -107,8 +112,6 @@ class LogicalModel(BaseModel):
     id: str = Field(min_length=1)
     name: str = Field(min_length=1)
     bindings: list[ModelBinding] = Field(default_factory=list)
-    # 默认绑定的索引（bindings 中的位置）；没有绑定时为 0
-    default_binding: int = 0
     # 模型能力元数据（可选；缺省时派生 models.json 用 Pi 默认值）
     context_window: int | None = None
     max_tokens: int | None = None
