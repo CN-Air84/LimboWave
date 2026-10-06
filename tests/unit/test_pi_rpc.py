@@ -109,3 +109,65 @@ def test_cli_discovery_resolves_npm_symlink(tmp_path, monkeypatch) -> None:
     shim.symlink_to(cli)
     monkeypatch.setattr(pi_rpc.shutil, "which", lambda name: str(shim) if name == "pi" else None)
     assert pi_rpc._locate_cli() == cli
+
+
+@pytest.mark.asyncio
+async def test_stdout_burst_yields_without_reordering_events() -> None:
+    from types import SimpleNamespace
+
+    reader = asyncio.StreamReader()
+    count = 1_000
+    reader.feed_data(b"".join(
+        f'{{"type":"event","index":{index}}}\n'.encode() for index in range(count)
+    ))
+    reader.feed_eof()
+    rpc = PiRpcProcess(SpawnSpec(argv=[]))
+    rpc._proc = SimpleNamespace(stdout=reader, pid=0, returncode=0)
+    rpc._expected_exit = True
+    received = []
+    opportunities = []
+    rpc.on_event(lambda event: received.append(event["index"]) if "index" in event else None)
+
+    async def input_task() -> None:
+        while len(received) < count:
+            await asyncio.sleep(0)
+            if 0 < len(received) < count:
+                opportunities.append(len(received))
+
+    task = asyncio.create_task(input_task())
+    await rpc._read_stdout()
+    await task
+    assert received == list(range(count))
+    assert opportunities, "A buffered read/inline async decoder must not monopolize the UI loop"
+    assert max(b - a for a, b in zip(
+        [0, *opportunities], [*opportunities, count], strict=True
+    )) <= 128
+
+
+@pytest.mark.asyncio
+async def test_fragmented_stdout_preserves_byte_framing_and_trailing_frame() -> None:
+    import json
+    from types import SimpleNamespace
+
+    messages = [{"type": "event", "text": "🙂\u2028\u2029" + "x" * 150_000},
+                {"type": "event", "text": "tail"}]
+    data = b"\r\n" + b"\r\n".join(
+        json.dumps(message, ensure_ascii=False).encode("utf-8") for message in messages
+    )
+
+    class Reader:
+        offset = 0
+
+        async def read(self, _size: int) -> bytes:
+            chunk = data[self.offset:self.offset + 997]
+            self.offset += len(chunk)
+            return chunk
+
+    rpc = PiRpcProcess(SpawnSpec(argv=[]))
+    rpc._proc = SimpleNamespace(stdout=Reader(), pid=0, returncode=0)
+    rpc._expected_exit = True
+    received = []
+    rpc.on_event(received.append)
+    await rpc._read_stdout()
+    assert received[:-1] == messages
+    assert received[-1]["type"] == "process_exit"

@@ -262,13 +262,13 @@ async def test_app_loading_reads_and_markdown_are_off_thread_and_duplicates_igno
     snapshot_reads: list[int] = []
     with controller.coordinator()._uow_factory() as uow:
         snapshot_type = type(uow.snapshots)
-    snapshots = snapshot_type.list_all_intents
+    snapshots = snapshot_type.attachment_ids_for_messages
 
-    def read_snapshots(self):
+    def read_snapshots(self, *args):
         snapshot_reads.append(threading.get_ident())
-        return snapshots(self)
+        return snapshots(self, *args)
 
-    monkeypatch.setattr(snapshot_type, "list_all_intents", read_snapshots)
+    monkeypatch.setattr(snapshot_type, "attachment_ids_for_messages", read_snapshots)
 
     def slow_read(self, target):
         worker_ids.append(threading.get_ident())

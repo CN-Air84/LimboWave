@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
@@ -210,6 +210,26 @@ class _Conversations:
         ).fetchall()
         return [self._to_domain(r) for r in rows]
 
+    def page_summaries(
+        self, *, limit: int, before: tuple[datetime, str] | None = None,
+    ) -> list[tuple[Conversation, str]]:
+        where = " AND (c.created_at, c.id) < (?, ?)" if before else ""
+        args: list[Any] = [_iso(before[0]), before[1]] if before else []
+        args.append(limit)
+        rows = self._conn.execute(
+            "SELECT c.id, c.title_enc, c.created_at, c.default_logical_model_id, "
+            "c.permission_preset, (SELECT b.id FROM branches b "
+            "WHERE b.conversation_id = c.id ORDER BY "
+            "max(b.created_at, coalesce((SELECT max(m.created_at) FROM messages m "
+            "WHERE m.branch_id = b.id AND m.conversation_id = b.conversation_id), "
+            "b.created_at)) DESC, "
+            "b.created_at DESC, b.id DESC LIMIT 1) "
+            "FROM conversations c WHERE EXISTS "
+            "(SELECT 1 FROM branches b WHERE b.conversation_id = c.id)" + where +
+            " ORDER BY c.created_at DESC, c.id DESC LIMIT ?", args,
+        ).fetchall()
+        return [(self._to_domain(row[:5]), row[5]) for row in rows]
+
     def delete(self, conversation_id: str) -> None:
         """删除会话。schema 的 ON DELETE CASCADE 负责清掉分支/消息/运行/快照/镜像。"""
         self._conn.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
@@ -351,6 +371,41 @@ class _Messages:
             (branch_id,),
         ).fetchall()
         return [self._to_domain(r) for r in rows]
+
+    def history_position(self, message_id: str) -> tuple[str, str, datetime] | None:
+        row = self._conn.execute(
+            "SELECT conversation_id, branch_id, created_at FROM messages WHERE id = ?",
+            (message_id,),
+        ).fetchone()
+        return (row[0], row[1], _parse_iso(row[2])) if row else None
+
+    def page_history(
+        self, conversation_id: str, branch_id: str, *, limit: int,
+        before: tuple[datetime, str] | None = None,
+        upper: tuple[datetime, str, bool] | None = None,
+    ) -> list[Message]:
+        clauses = ["conversation_id = ?", "branch_id = ?"]
+        args: list[Any] = [conversation_id, branch_id]
+        if before is not None:
+            clauses.append("(created_at, id) < (?, ?)")
+            args.extend((_iso(before[0]), before[1]))
+        if upper is not None:
+            operator = "<=" if upper[2] else "<"
+            clauses.append(f"(created_at, id) {operator} (?, ?)")
+            args.extend((_iso(upper[0]), upper[1]))
+        args.append(limit)
+        rows = self._conn.execute(
+            "SELECT id, role, content_enc, thinking_enc, created_at, status, run_id, "
+            "tool_steps_enc FROM messages WHERE "
+            + " AND ".join(clauses) + " ORDER BY created_at DESC, id DESC LIMIT ?", args,
+        ).fetchall()
+        return [Message(
+            id=r[0], conversation_id=conversation_id, branch_id=branch_id,
+            role=MessageRole(r[1]), content=self._key.decrypt(r[2]),
+            thinking=self._key.decrypt(r[3]) if r[3] else "", created_at=_parse_iso(r[4]),
+            status=MessageStatus(r[5]), run_id=r[6],
+            tool_steps=_load_tool_steps(self._key.decrypt(r[7])),
+        ) for r in rows]
 
     def count_for_branch(self, branch_id: str) -> int:
         row = self._conn.execute(
@@ -537,6 +592,28 @@ class _Snapshots:
             (run_id,),
         ).fetchone()
         return self._to_intent(row) if row else None
+
+    def attachment_ids_for_messages(
+        self, conversation_id: str, message_ids: Sequence[str],
+    ) -> dict[str, tuple[str, ...]]:
+        # Reuse the conversation/run indexes; do not read or decrypt app_params.
+        # Bound parameters for older bundled SQLite builds and very long histories.
+        wanted = list(dict.fromkeys(message_ids))
+        result: dict[str, tuple[str, ...]] = {}
+        for offset in range(0, len(wanted), 500):
+            batch = wanted[offset:offset + 500]
+            placeholders = ",".join("?" for _ in batch)
+            rows = self._conn.execute(
+                "SELECT json_extract(i.message_ids, '$[#-1]'), i.attachment_ids "
+                "FROM runs r JOIN request_intents i ON i.run_id = r.id "
+                "WHERE r.conversation_id = ? AND i.conversation_id = ? "
+                f"AND json_extract(i.message_ids, '$[#-1]') IN ({placeholders}) "
+                "ORDER BY i.created_at, i.id",
+                (conversation_id, conversation_id, *batch),
+            )
+            for message_id, attachment_ids in rows:
+                result[message_id] = tuple(json.loads(attachment_ids))
+        return result
 
     def list_all_intents(self) -> list[RequestIntentSnapshot]:
         rows = self._conn.execute(

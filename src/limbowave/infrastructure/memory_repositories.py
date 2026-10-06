@@ -12,7 +12,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import replace
+from datetime import datetime
+from heapq import nlargest
 from types import TracebackType
 from typing import Any
 
@@ -67,6 +70,9 @@ class _Staged[T]:
 
 
 class _Conversations:
+    _history_branches: _Branches
+    _history_messages: _Messages
+
     def __init__(self, store: InMemoryStore, staged: _Staged[Conversation]) -> None:
         self._store = store
         self._staged = staged
@@ -87,6 +93,36 @@ class _Conversations:
         merged = dict(self._store.conversations)
         merged.update({c.id: c for c in self._staged.values()})
         return [c for cid, c in merged.items() if cid not in self.pending_deletes]
+
+    def page_summaries(
+        self, *, limit: int, before: tuple[datetime, str] | None = None,
+    ) -> list[tuple[Conversation, str]]:
+        conversations = dict(self._store.conversations)
+        conversations.update({c.id: c for c in self._staged.values()})
+        branches = dict(self._store.branches)
+        branches.update({b.id: b for b in self._history_branches._staged.values()})
+        messages = dict(self._store.messages)
+        messages.update({m.id: m for m in self._history_messages._staged.values()})
+        activity = {b.id: b.created_at for b in branches.values()}
+        for m in messages.values():
+            if (m.branch_id in branches
+                    and branches[m.branch_id].conversation_id == m.conversation_id):
+                activity[m.branch_id] = max(activity[m.branch_id], m.created_at)
+        current: dict[str, Branch] = {}
+        for b in branches.values():
+            if b.id in self._history_branches.pending_deletes:
+                continue
+            old = current.get(b.conversation_id)
+            if old is None or (activity[b.id], b.created_at, b.id) > (
+                activity[old.id], old.created_at, old.id
+            ):
+                current[b.conversation_id] = b
+        rows = nlargest(limit, (
+            c for c in conversations.values()
+            if c.id not in self.pending_deletes and c.id in current
+            and (before is None or (c.created_at, c.id) < before)
+        ), key=lambda c: (c.created_at, c.id))
+        return [(c, current[c.id].id) for c in rows]
 
     def delete(self, conversation_id: str) -> None:
         """标记删除。级联在 commit 时执行（与 SQLite 的 ON DELETE CASCADE 对齐）。"""
@@ -142,6 +178,25 @@ class _Messages:
         merged.update({m.id: m for m in self._staged.values()})
         rows = [m for m in merged.values() if m.branch_id == branch_id]
         return sorted(rows, key=lambda m: (m.created_at, m.id))
+
+    def history_position(self, message_id: str) -> tuple[str, str, datetime] | None:
+        message = self.get(message_id)
+        return (message.conversation_id, message.branch_id, message.created_at) if message else None
+
+    def page_history(
+        self, conversation_id: str, branch_id: str, *, limit: int,
+        before: tuple[datetime, str] | None = None,
+        upper: tuple[datetime, str, bool] | None = None,
+    ) -> list[Message]:
+        merged = dict(self._store.messages)
+        merged.update({m.id: m for m in self._staged.values()})
+        return nlargest(limit, (
+            m for m in merged.values()
+            if m.conversation_id == conversation_id and m.branch_id == branch_id
+            and (before is None or (m.created_at, m.id) < before)
+            and (upper is None or (m.created_at, m.id) < upper[:2]
+                 or (upper[2] and (m.created_at, m.id) == upper[:2]))
+        ), key=lambda m: (m.created_at, m.id))
 
     def count_for_branch(self, branch_id: str) -> int:
         return len(self.list_for_branch(branch_id))
@@ -214,6 +269,22 @@ class _Snapshots:
             if snapshot.run_id == run_id:
                 return snapshot
         return None
+
+    def attachment_ids_for_messages(
+        self, conversation_id: str, message_ids: Sequence[str],
+    ) -> dict[str, tuple[str, ...]]:
+        wanted = set(message_ids)
+        if not wanted:
+            return {}
+        merged = dict(self._store.intents)
+        merged.update({snapshot.id: snapshot for snapshot in self._intents.values()})
+        selected = sorted(
+            (snapshot for snapshot in merged.values()
+             if snapshot.conversation_id == conversation_id and snapshot.message_ids
+             and snapshot.message_ids[-1] in wanted),
+            key=lambda snapshot: (snapshot.created_at, snapshot.id),
+        )
+        return {snapshot.message_ids[-1]: snapshot.attachment_ids for snapshot in selected}
 
     def list_all_intents(self) -> list[RequestIntentSnapshot]:
         merged = dict(self._store.intents)
@@ -443,6 +514,8 @@ class InMemoryUnitOfWork:
         self.conversations = _Conversations(store, self._staged_conversations)
         self.branches = _Branches(store, self._staged_branches)
         self.messages = _Messages(store, self._staged_messages)
+        self.conversations._history_branches = self.branches
+        self.conversations._history_messages = self.messages
         self.runs = _Runs(store, self._staged_runs, self._staged_transports)
         self.snapshots = _Snapshots(store, self._staged_intents, self._staged_transports)
         self.runtime = _RuntimeMirror(store, self._staged_mirrors)

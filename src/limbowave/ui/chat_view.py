@@ -18,7 +18,8 @@
 先出现「正在构思……N秒」计秒，思考流也算构思，首个正文 delta（或工具开始、
 本段定稿）落字即收；没等到任何内容的空卡在整轮收敛时撤掉。
 
-流式渲染策略：流式期间气泡显示**纯文本**（每 delta 重排 HTML 会抖动且浪费），
+流式渲染策略：首字即时显示，后续增量按约 32ms 合并追加**纯文本**；
+隐藏的回复暂存增量，重新显示时补齐，避免每 delta 都触发文档与滚动布局。
 ``end_assistant`` 时一次性渲染 Markdown。这是有意的取舍：流式的实时性优先，
 排版在定稿时一步到位。
 
@@ -75,6 +76,7 @@ from PySide6.QtGui import (
     QPaintEvent,
     QPen,
     QResizeEvent,
+    QShowEvent,
     QTextCursor,
 )
 from PySide6.QtWidgets import (
@@ -115,6 +117,7 @@ from limbowave.ui.popup_material import install_popup_material
 from limbowave.ui.popup_motion import PopupMotion
 from limbowave.ui.run_state_label import RunStateLabel
 from limbowave.ui.sent_attachments import SentAttachment, SentAttachmentStrip
+from limbowave.ui.streaming_text import StreamingTextBuffer
 from limbowave.ui.thinking_block import ThinkingBlock as _ThinkingBlock
 from limbowave.ui.tool_steps import ToolStepsView, make_tool_steps
 
@@ -453,6 +456,7 @@ class _BubbleRow(QWidget):
     按钮只外发 message_id，业务逻辑（分叉）在应用层。
     """
 
+    stream_updated = Signal()  # one display/layout update, not one provider delta
     edit_clicked = Signal(str)  # message_id
     fork_clicked = Signal(str)  # message_id：保留起点回复，不触发生成
     regenerate_clicked = Signal(str)  # message_id
@@ -468,6 +472,9 @@ class _BubbleRow(QWidget):
     ) -> None:
         super().__init__(parent)
         self._role = role
+        self._stream_buffer = (
+            StreamingTextBuffer(self, self._append_stream_text) if role == "assistant" else None
+        )
         self._message_id = message_id
         self._raw_text = text  # 流式期间的纯文本累积（助手卡当前段的镜像），定稿时渲染
         self._column_width = 0
@@ -661,6 +668,7 @@ class _BubbleRow(QWidget):
     def reset_for_retry(self) -> None:
         """保留回复栏，只清掉旧尝试的分段与动作状态。"""
         assert self._column_layout is not None
+        self.cancel_pending_stream()
         self.cancel_retry_animation()
         self._settle_tool_steps_visibility()
         for segment in self._segments:
@@ -715,7 +723,14 @@ class _BubbleRow(QWidget):
     def hideEvent(self, event: QHideEvent) -> None:
         self.cancel_send_animation()
         self._settle_tool_steps_visibility()
+        if self._stream_buffer is not None:
+            self._stream_buffer.pause()
         super().hideEvent(event)
+
+    def showEvent(self, event: QShowEvent) -> None:
+        super().showEvent(event)
+        if self._stream_buffer is not None:
+            self._stream_buffer.resume()
 
     def animate_retry(self) -> None:
         """一次渐隐渐显，只作用于回复栏，不阻塞流式输出。"""
@@ -751,6 +766,8 @@ class _BubbleRow(QWidget):
 
     def _copy_text(self) -> None:
         """把整卡的 Markdown 原文放进剪贴板；按钮短暂换成对勾表示已复制。"""
+        if self._stream_buffer is not None:
+            self._stream_buffer.flush()
         if self._role == "assistant":
             # 各段原文按空行连接：一段 = 一条模型消息
             text = "\n\n".join(
@@ -842,6 +859,8 @@ class _BubbleRow(QWidget):
         if self._role != "assistant":
             return
         assert self._column_layout is not None
+        if self._stream_buffer is not None:
+            self._stream_buffer.flush()
         if self._segments and self._segments[-1].is_empty():
             self._content = self._segments[-1].content
             return
@@ -865,15 +884,28 @@ class _BubbleRow(QWidget):
         self._sync_segment_presentation()
 
     def append_delta(self, delta: str) -> None:
-        """流式期间：纯文本追加，不做 Markdown 重排。"""
+        """首个增量立即显示，后续增量按帧合并，避免逐 token 触发文档布局。"""
+        if not delta:
+            return
         if self._role != "assistant":
             self._raw_text += delta
             assert self._content is not None
             self._content.setText(self._raw_text)
             self._fit_bubble()
             return
-        segment = self._latest_segment()
-        assert segment is not None and segment.content is not None
+        self._latest_segment()
+        assert self._stream_buffer is not None
+        self._stream_buffer.append(delta)
+
+    def cancel_pending_stream(self) -> None:
+        if self._stream_buffer is not None:
+            self._stream_buffer.discard()
+
+    def _append_stream_text(self, delta: str) -> None:
+        # Boundaries flush/discard before changing the current segment, so
+        # delayed text can never land in another segment or retry attempt.
+        segment = self._segments[-1]
+        assert segment.content is not None
         had_text = bool(segment.raw_text.strip())
         segment.raw_text += delta
         self._raw_text = segment.raw_text
@@ -883,6 +915,7 @@ class _BubbleRow(QWidget):
         segment.stop_composing()  # 落字即构思结束
         if not had_text:
             self._sync_segment_presentation()
+        self.stream_updated.emit()
 
     def finalize_segment(
         self, text: str, message_id: str | None = None, *, html: str | None = None
@@ -896,6 +929,7 @@ class _BubbleRow(QWidget):
         segment = self._latest_segment()
         if segment is None:
             return
+        self.cancel_pending_stream()  # the final snapshot supersedes pending draft fragments
         segment.raw_text = text
         self._raw_text = text
         assert segment.content is not None
@@ -940,6 +974,8 @@ class _BubbleRow(QWidget):
 
     def mark_final(self) -> None:
         """整轮 run 收敛后，这张卡才成为可操作的最终回复。"""
+        if self._stream_buffer is not None:
+            self._stream_buffer.flush()  # stop/error may arrive without message.end
         if self._run_state is not None:
             self._run_state.setVisible(self._run_error is not None)
         if self._actions is not None:
@@ -1000,6 +1036,8 @@ class _BubbleRow(QWidget):
         step: ToolStep | None = None,
     ) -> None:
         """按调用 ID 更新所属分段，直接使用协调器的完整审计记录。"""
+        if self._stream_buffer is not None:
+            self._stream_buffer.flush()  # a tool boundary must not overtake queued body text
         call_key = step.tool_call_id if step is not None else tool_call_id or name
         segment = next(
             (part for part in self._segments
@@ -1882,6 +1920,13 @@ class ChatView(QWidget):
         # 长会话滞性化（Task 0.2）：完整历史 + 当前已物化的起点
         self._full_history: list[HistoryEntry] = []
         self._history_offset = 0
+        self._load_earlier_button: QPushButton | None = None
+        self._history_scroll_anchor: tuple[_BubbleRow, int] | None = None
+        self._restoring_history_anchor = False
+        self._history_anchor_timer = QTimer(self)
+        self._history_anchor_timer.setSingleShot(True)
+        self._history_anchor_timer.setInterval(16)
+        self._history_anchor_timer.timeout.connect(self._finish_history_prepend)
         # 用户消息 id → 已发送附件（由上层注入）；没有注入时不显示缩略图
         self._attachment_resolver: Callable[[str], list[SentAttachment]] | None = None
         self._history_transition: QParallelAnimationGroup | None = None
@@ -1965,6 +2010,8 @@ class ChatView(QWidget):
         # 滚回底部后恢复跟随。内容增高靠 rangeChanged 跟进（布局是延迟的，
         # 追加内容当下读到的 maximum() 还是旧值）。
         self._stick_to_bottom = True
+        self._user_scrolled_up = False
+        self._adjusting_scroll = False
         # 上翻阅读时浮在消息区底部中央；挂在视口上，不随内容滚动。
         self._jump_btn = _JumpToBottomButton(self._scroll.viewport())
         self._jump_btn.clicked.connect(lambda: self._scroll_to_bottom(force=True))
@@ -1976,6 +2023,7 @@ class ChatView(QWidget):
         # layout grows the document. Keep the previous range so that "at the
         # old bottom" is not mistaken for a user scroll away from the bottom.
         self._scroll_maximum = scroll_bar.maximum()
+        self._scroll_value = scroll_bar.value()
         scroll_bar.valueChanged.connect(self._on_scroll_value_changed)
         scroll_bar.rangeChanged.connect(self._on_scroll_range_changed)
 
@@ -2040,7 +2088,7 @@ class ChatView(QWidget):
         self._input.paste_generation = lambda: (
             bar.generation if (bar := attachment_ref()) is not None else -1
         )
-        self._input.setPlaceholderText("提出后续修改要求")
+        self._input.setPlaceholderText(" ")
         self._input.setMinimumHeight(54)
         self._input.setMaximumHeight(120)
         self._input.setTabChangesFocus(True)
@@ -2200,6 +2248,12 @@ class ChatView(QWidget):
             self.edit_submitted.emit(editing_id, text)
             return
         self.message_submitted.emit(text)
+
+    def restore_draft(self, text: str) -> None:
+        """Return a rejected submission without overwriting text typed meanwhile."""
+        current = self._input.toPlainText()
+        self._input.setPlainText(text if not current else f"{current}\n{text}")
+        self._sync_send_button()
 
     # ---------- 编辑已发送的消息 ----------
 
@@ -2648,6 +2702,8 @@ class ChatView(QWidget):
         self._scroll_to_bottom()
 
     def append_assistant_delta(self, text: str) -> None:
+        if not text:
+            return
         if self._compression_owns_stream():
             # 摘要正文留给压缩预览；思考悬浮窗只切到「正在生成摘要」
             if self._thinking_panel is not None:
@@ -2659,10 +2715,12 @@ class ChatView(QWidget):
         self._stream_row.append_delta(text)
         if self._busy:
             self._stream_row.set_run_state("● 正在生成内容…")
-        self._scroll_to_bottom()
+        # Actual document updates signal scroll work; queued tokens do not.
 
     def append_thinking_delta(self, text: str) -> None:
         """思考流：追加到当前助手气泡的折叠思考块；压缩期间改进单独的悬浮窗。"""
+        if not text:
+            return
         if self._compression_owns_stream():
             self._show_compression_thinking(text)
             return
@@ -2672,7 +2730,7 @@ class ChatView(QWidget):
         self._stream_row.append_thinking(text)
         if self._busy:
             self._stream_row.set_run_state("● Agent 正在继续思考…")
-        self._scroll_to_bottom()
+        # Expanded reasoning follows rangeChanged; collapsed reasoning has no layout work.
 
     def end_assistant(
         self,
@@ -2707,8 +2765,8 @@ class ChatView(QWidget):
     def _settle_assistant_run(self) -> None:
         """整轮收敛：本轮的卡片露出动作栏、收起状态行。
 
-        没等到任何内容的预立卡片（如发起即失败、尚无首 token 就中断）直接
-        撤掉，不留空面板。
+        无内容且无失败状态的预立卡片直接撤掉；可重试的失败/停止/中断
+        卡片保留状态行，让下一次尝试仍复用同一个组件。
         """
         for row in list(self._run_rows):
             row.mark_final()
@@ -2728,6 +2786,7 @@ class ChatView(QWidget):
             self._stream_row = None
         if row in self._rows:
             self._rows.remove(row)
+        row.cancel_pending_stream()
         self._transcript.removeWidget(row)
         # 先脱离子树再延迟删除，免得旧组件在删除前还画在原处
         row.setParent(None)
@@ -2787,6 +2846,10 @@ class ChatView(QWidget):
                 break
             if row._role == "assistant":
                 row.set_fork_available(False)
+                # 首 token 前停止/中断也保留原卡，不能在 settled 删除后
+                # 又在手动重试时创建一张看起来相同的新气泡。
+                if not row.has_content() and row._run_error is None:
+                    row.set_run_error("本次回复未完成，可重试")
 
     def _clear_retry(self) -> None:
         for row in self._rows:
@@ -2807,11 +2870,14 @@ class ChatView(QWidget):
 
     def _reset_rows(self) -> None:
         """只清组件，不动历史缓存。"""
+        self._cancel_history_anchor()
+        self._load_earlier_button = None
         self._stream_row = None
         self._run_rows.clear()
         self._run_tail = None
         self._active_tool_calls.clear()
         for row in self._rows:
+            row.cancel_pending_stream()
             row.cancel_send_animation()
             row.cancel_retry_animation()
             for segment in row._segments:
@@ -3101,17 +3167,25 @@ class ChatView(QWidget):
         hidden = self._history_offset
         if hidden > 0:
             self._add_load_earlier(hidden)
-        window = self._full_history[hidden:]
+        yield from self._render_history_steps(self._full_history[hidden:], rendered)
+
+    def _render_history_steps(
+        self, window: Sequence[HistoryEntry], rendered: Mapping[str, str] | None = None,
+        *, before: _BubbleRow | None = None,
+    ) -> Iterator[None]:
+        """Materialize only these entries; existing rows and live run state stay intact."""
         index = 0
         while index < len(window):
             entry = window[index]
             if entry.role == "user":
-                row = self._add_bubble("", role="user", message_id=entry.message_id)
+                row = self._add_bubble(
+                    "", role="user", message_id=entry.message_id, before=before
+                )
                 row.finalize(entry.content)
                 row.set_retry_available(entry.retry_available)
                 if entry.thinking:
                     row.set_thinking(entry.thinking)
-                self._insert_compression_markers(entry, self._transcript.count() - 1)
+                self._insert_compression_markers(entry, self._transcript.indexOf(row) + 1)
                 index += 1
                 yield
                 continue
@@ -3125,7 +3199,7 @@ class ChatView(QWidget):
                 and not window[index + count - 1].compressions
             ):
                 count += 1
-            row = self._add_bubble("", role="assistant")
+            row = self._add_bubble("", role="assistant", before=before)
             for offset in range(count):
                 item = window[index + offset]
                 parts = item.segments or (AssistantMessageSegment(
@@ -3154,22 +3228,83 @@ class ChatView(QWidget):
                 row.set_fork_available(item.can_fork)
             row.mark_final()
             self._insert_compression_markers(window[index + count - 1],
-                                             self._transcript.count() - 1)
+                                             self._transcript.indexOf(row) + 1)
             index += count
 
     def _add_load_earlier(self, hidden: int) -> None:
         """顶部「加载更早的消息」入口。只影响展示——数据早就在内存里。"""
+        if self._load_earlier_button is not None:
+            button = self._load_earlier_button
+            self._transcript.removeWidget(button)
+            button.setParent(None)
+            button.deleteLater()
+            self._load_earlier_button = None
+        if hidden <= 0:
+            return
         button = QPushButton(f"加载更早的 {min(hidden, HISTORY_PAGE)} 条消息（还有 {hidden} 条）")
         button.setProperty("flat", True)
         button.setCursor(Qt.CursorShape.PointingHandCursor)
         button.clicked.connect(self._load_earlier)
-        self._transcript.insertWidget(self._transcript.count() - 1, button)
+        self._transcript.insertWidget(0, button)
+        self._load_earlier_button = button
 
     def _load_earlier(self) -> None:
-        self._history_offset = self._align_window_start(
-            max(0, self._history_offset - HISTORY_PAGE)
-        )
-        self._render_window()
+        old_offset = self._history_offset
+        if old_offset <= 0:
+            return
+        viewport = self._scroll.viewport()
+        before = self._rows[0] if self._rows else None
+        anchor = next((row for row in self._rows
+                       if row.mapTo(viewport, QPoint()).y() + row.height() > 0), before)
+        if anchor is not None:
+            self._history_scroll_anchor = (anchor, anchor.mapTo(viewport, QPoint()).y())
+            self._stick_to_bottom = False
+            self._user_scrolled_up = True
+        self._history_offset = self._align_window_start(max(0, old_offset - HISTORY_PAGE))
+        # Never rebuild the existing page: preserve selection, expanded reasoning/tools,
+        # and especially _stream_row/_run_tail when paging during a live reply.
+        layout_enabled = self._transcript.isEnabled()
+        self._transcript.setEnabled(False)
+        try:
+            for _step in self._render_history_steps(
+                self._full_history[self._history_offset:old_offset], before=before
+            ):
+                pass
+            self._add_load_earlier(self._history_offset)
+        finally:
+            self._transcript.setEnabled(layout_enabled)
+        self._transcript.activate()
+        self._restore_history_anchor()
+        self._history_anchor_timer.start()
+
+    def _restore_history_anchor(self) -> None:
+        if self._history_scroll_anchor is None:
+            return
+        row, y = self._history_scroll_anchor
+        if row not in self._rows:
+            self._cancel_history_anchor()
+            return
+        bar = self._scroll.verticalScrollBar()
+        self._restoring_history_anchor = True
+        try:
+            delta = row.mapTo(self._scroll.viewport(), QPoint()).y() - y
+            bar.setValue(bar.value() + delta)
+        finally:
+            self._restoring_history_anchor = False
+
+    def _finish_history_prepend(self) -> None:
+        # Rich-text height/viewport changes settle after insertion. rangeChanged
+        # restores the anchor until a quiet layout turn, not an arbitrary old maximum.
+        self._restore_history_anchor()
+        self._cancel_history_anchor()
+        bar = self._scroll.verticalScrollBar()
+        self._stick_to_bottom = bar.value() >= bar.maximum() - _STICK_THRESHOLD
+        self._user_scrolled_up = not self._stick_to_bottom
+        self._sync_jump_button()
+
+    def _cancel_history_anchor(self) -> None:
+        self._history_anchor_timer.stop()
+        self._history_scroll_anchor = None
 
     # ---------- 高级栏开关 ----------
 
@@ -3283,8 +3418,12 @@ class ChatView(QWidget):
 
     # ---------- 内部 ----------
 
-    def _add_bubble(self, text: str, *, role: str, message_id: str | None = None) -> _BubbleRow:
+    def _add_bubble(
+        self, text: str, *, role: str, message_id: str | None = None,
+        before: _BubbleRow | None = None,
+    ) -> _BubbleRow:
         row = _BubbleRow(text, role=role, message_id=message_id)
+        row.stream_updated.connect(self._scroll_to_bottom)
         row.edit_clicked.connect(self.edit_message_requested)
         row.fork_clicked.connect(self.fork_requested)
         row.regenerate_clicked.connect(self.regenerate_requested)
@@ -3297,9 +3436,12 @@ class ChatView(QWidget):
         row.set_tool_steps_visible(not self._tool_steps_hidden)
         if role == "user" and message_id is not None and self._attachment_resolver is not None:
             row.set_attachments(self._attachment_resolver(message_id))
-        self._rows.append(row)
-        # 在 stretch 之前插入
-        self._transcript.insertWidget(self._transcript.count() - 1, row)
+        if before is None:
+            self._rows.append(row)
+            self._transcript.insertWidget(self._transcript.count() - 1, row)
+        else:
+            self._rows.insert(self._rows.index(before), row)
+            self._transcript.insertWidget(self._transcript.indexOf(before), row)
         # 运行中的可见布局动态插入组件时，Qt 可能要到下一轮事件循环才自动 show；
         # 显式显示可让定稿后动作栏与背景板立即进入正确的可见状态。
         row.show()
@@ -3323,14 +3465,34 @@ class ChatView(QWidget):
     def _scroll_to_bottom(self, *, force: bool = False) -> None:
         """滚到底部。非 ``force`` 时只在贴底跟随状态下生效，用户上翻阅读时不打扰。"""
         if force:
+            self._cancel_history_anchor()
+            self._user_scrolled_up = False
             self._stick_to_bottom = True
         if self._stick_to_bottom:
-            bar = self._scroll.verticalScrollBar()
-            bar.setValue(bar.maximum())
+            self._follow_bottom()
         self._sync_jump_button()
 
-    def _on_scroll_value_changed(self, value: int) -> None:
+    def _follow_bottom(self) -> None:
         bar = self._scroll.verticalScrollBar()
+        self._adjusting_scroll = True
+        try:
+            bar.setValue(bar.maximum())
+        finally:
+            self._adjusting_scroll = False
+
+    def _on_scroll_value_changed(self, value: int) -> None:
+        previous_value = self._scroll_value
+        self._scroll_value = value
+        if self._restoring_history_anchor:
+            return
+        if self._history_scroll_anchor is not None:
+            self._cancel_history_anchor()  # explicit scrolling wins over a pending layout restore
+        bar = self._scroll.verticalScrollBar()
+        if not self._adjusting_scroll and bar.maximum() == self._scroll_maximum:
+            if value < previous_value:
+                self._user_scrolled_up = True
+            elif value > previous_value and value >= bar.maximum() - _STICK_THRESHOLD:
+                self._user_scrolled_up = False
         if (
             self._docked
             and self._dock_anim is not None
@@ -3350,13 +3512,20 @@ class ChatView(QWidget):
                 layout.activate()
             self._sync_history_loading_overlay()
             bar = self._scroll.verticalScrollBar()
-        self._stick_to_bottom = value >= bar.maximum() - _STICK_THRESHOLD
+        self._stick_to_bottom = (
+            not self._user_scrolled_up and value >= bar.maximum() - _STICK_THRESHOLD
+        )
         self._sync_jump_button()
 
     def _on_scroll_range_changed(self, _minimum: int, maximum: int) -> None:
         bar = self._scroll.verticalScrollBar()
         previous_maximum = self._scroll_maximum
         self._scroll_maximum = maximum
+        if self._history_scroll_anchor is not None:
+            self._restore_history_anchor()
+            self._history_anchor_timer.start()
+            self._sync_jump_button()
+            return
         # Rich text and tool rows settle one event-loop turn after history is
         # inserted. If the viewport was at the previous bottom, follow the new
         # bottom even when valueChanged arrived first and temporarily cleared
@@ -3366,9 +3535,14 @@ class ChatView(QWidget):
             maximum < previous_maximum
             and bar.value() >= maximum - _STICK_THRESHOLD
         )
-        if self._stick_to_bottom or was_at_previous_bottom or range_shrank_to_bottom:
+        # A dock animation can temporarily shrink the range to zero while text
+        # is buffered. That must not erase an explicit upward scroll before the
+        # next batch grows the reply and erroneously pull the user to the bottom.
+        if not self._user_scrolled_up and (
+            self._stick_to_bottom or was_at_previous_bottom or range_shrank_to_bottom
+        ):
             self._stick_to_bottom = True
-            bar.setValue(maximum)
+            self._follow_bottom()
         self._sync_jump_button()
 
     def _sync_jump_button(self) -> None:

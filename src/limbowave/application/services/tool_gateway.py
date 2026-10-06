@@ -2,7 +2,7 @@
 
 统一网关流水线（§9.2，顺序固定）：
 
-    参数模式校验 → 权限与资源范围检查 → 高影响操作检查
+    运行来源硬边界 → 参数模式校验 → 权限与资源范围检查 → 高影响操作检查
     → 执行 → 输出限制与敏感信息处理 → 审计记录 → 结构化结果返回
 
 内置工具（§9.1）：
@@ -31,6 +31,7 @@ from limbowave.application.services.file_service import (
 )
 from limbowave.application.services.memory_service import MemoryService
 from limbowave.application.services.permission_service import PermissionService
+from limbowave.application.services.run_origin import remote_tools_denied
 from limbowave.domain.memory import MemoryRunContext
 from limbowave.domain.network_guard import NetworkBlocked, check_host
 from limbowave.domain.path_guard import PathEscape, resolve_within
@@ -59,6 +60,12 @@ class InvalidParams(ToolError):
 
 class ToolDenied(ToolError):
     """权限网关拒绝。"""
+
+
+def _require_local_origin(origin_provider: Callable[[], str] | None = None) -> None:
+    """Remote runs cannot execute tools, even with confirmation or full trust."""
+    if remote_tools_denied(origin_provider):
+        raise ToolDenied("权限网关拒绝：web 来源禁止工具执行（首版不支持远程 Agent）")
 
 
 @dataclass(frozen=True, slots=True)
@@ -358,7 +365,9 @@ class ToolGateway:
         documents: FileService | None = None,
         terminal: TerminalTools | None = None,
         max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
+        origin_provider: Callable[[], str] | None = None,
     ) -> None:
+        self.origin_provider = origin_provider
         self._permissions = permissions
         self._files = FileTools(workspace_root, documents)
         self._documents = documents
@@ -378,11 +387,13 @@ class ToolGateway:
         闸门判定的范围与执行时检查的范围必须是同一个（解析后的绝对路径），
         会话授权才对得上。参数或路径非法时抛 ``ToolError`` / ``PathEscape``。
         """
+        _require_local_origin(self.origin_provider)
         validate_params(tool_name, params)
         return self.build_request(tool_name, normalize_params(tool_name, params))
 
     def build_request(self, tool_name: str, params: dict[str, Any]) -> ToolRequest:
         """把工具调用转成权限判定用的请求（含资源范围）。"""
+        _require_local_origin(self.origin_provider)
         capability = capability_of(tool_name)
         paths: tuple[str, ...] = ()
         domains: tuple[str, ...] = ()
@@ -417,6 +428,11 @@ class ToolGateway:
         user_confirmed: bool = False,
     ) -> ToolResult:
         """执行一次工具调用。任何失败都返回结构化 ``ToolResult``（不抛给调用方）。"""
+        # 来源硬边界先于参数、路径解析、记忆分支及授权，不可由确认或信任绕过。
+        try:
+            _require_local_origin(self.origin_provider)
+        except ToolDenied as exc:
+            return ToolResult(ok=False, error=str(exc))
         # 1. 参数模式校验（含规范化），并解析出资源范围
         try:
             request = self.prepare_request(tool_name, params)
@@ -473,6 +489,7 @@ class ToolGateway:
             return ToolResult(ok=False, error=f"工具执行失败：{exc}")
 
     def _execute(self, tool_name: str, params: dict[str, Any]) -> ToolResult:
+        _require_local_origin(self.origin_provider)
         if tool_name == "read_document":
             return self._read_document(params)
         handler = getattr(self._files, tool_name, None)
@@ -514,6 +531,7 @@ class ToolGateway:
         不在路径守卫的工作区内——这里的边界是登记表成员资格，不是路径。
         资源范围沿用文件读取的默认解析（工作区根），与其他读取工具同档授权。
         """
+        _require_local_origin(self.origin_provider)
         if self._documents is None:
             raise ToolError("文档服务未配置")
         try:

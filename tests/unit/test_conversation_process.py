@@ -285,3 +285,27 @@ async def test_interruption_waits_for_queued_tool_audit(process_stack):
     assert messages[-1].tool_steps[0].args == {"path": "keep.txt"}
     assert messages[-1].tool_steps[0].result_summary == "kept"
     assert not coord._pending_kernel_events
+
+
+async def test_unused_worker_does_not_allocate_a_process_pool(tmp_path, vault_key, monkeypatch):
+    from limbowave.infrastructure import conversation_process
+
+    def unexpected_pool(*args, **kwargs):
+        pytest.fail("no process-pool resources should be allocated before first use")
+
+    monkeypatch.setattr(conversation_process, "ProcessPoolExecutor", unexpected_pool)
+    worker = ConversationProcess(ConversationProcessConfig(
+        tmp_path / "unused.db", tmp_path, vault_key.key_bytes()
+    ))
+    assert worker._executor is None
+    worker.close_unstarted()
+    await worker.close()
+    assert not (tmp_path / "unused.db").exists()
+
+
+async def test_first_call_lazily_starts_and_reuses_worker(process_stack):
+    _, _, _, worker, _ = process_stack
+    assert worker._executor is None
+    child = await worker.call("pid", (None, None))
+    assert child != os.getpid()
+    assert await worker.call("pid", (None, None)) == child

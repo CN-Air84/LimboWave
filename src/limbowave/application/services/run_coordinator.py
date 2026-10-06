@@ -37,7 +37,8 @@ from collections.abc import Awaitable, Callable, Iterator
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from functools import wraps
+from typing import Any, Concatenate, cast
 from uuid import uuid4
 
 from limbowave.application import branch_path
@@ -74,6 +75,8 @@ from limbowave.application.services.compression_context import (
 )
 from limbowave.application.services.compression_inheritance import inherit_compressions
 from limbowave.application.services.memory_service import MemoryService, capture_memory, fork_memory
+from limbowave.application.services.public_tool_steps import public_tool_steps
+from limbowave.application.services.run_origin import RUN_ORIGIN
 from limbowave.application.services.runtime_state_service import (
     RuntimeStateService,
     isolate_conversation_entries,
@@ -168,6 +171,7 @@ class _LiveRun:
     user_text: str
     context: RunContext
     # 实际发给内核的 prompt（含文档注记）；镜像匹配以它为用户条目的基准
+    origin: str = "desktop"
     sent_prompt: str | None = None
     images: list[dict[str, Any]] = field(default_factory=list)
     route_error: bool = False
@@ -279,6 +283,30 @@ class RouteMismatchError(RuntimeError):
     """实际内核未采用本轮路由；不得作为网络故障自动重试。"""
 
 
+def _arbitrated[**CommandArgs, CommandResult: (bool, str | None)](
+    method: Callable[Concatenate[RunCoordinator, CommandArgs], Awaitable[CommandResult]],
+) -> Callable[Concatenate[RunCoordinator, CommandArgs], Awaitable[CommandResult]]:
+    """Reserve state transitions, preserving the controller's typed return contract."""
+    @wraps(method)
+    async def wrapped(
+        self: RunCoordinator, /, *args: CommandArgs.args, **kwargs: CommandArgs.kwargs
+    ) -> CommandResult:
+        try:
+            with self.command_scope():
+                result = await method(self, *args, **kwargs)
+                if result:
+                    self._revision += 1
+                return result
+        except CommandBusy:
+            rejected = False if method.__annotations__.get("return") in (bool, "bool") else None
+            return cast(CommandResult, rejected)
+    return wrapped
+
+
+class CommandBusy(RuntimeError):
+    """Another task owns the runtime transition."""
+
+
 class RunCoordinator:
     """驱动一轮请求，并把应用权威数据按事务写下去。"""
 
@@ -296,6 +324,8 @@ class RunCoordinator:
         self.branch_ready: Callable[[], Awaitable[None]] | None = None
         self.memory_service: MemoryService | None = None
         self.attachment_builder: Callable[[list[str]], AttachmentPayload] | None = None
+        self._command_owner: asyncio.Task[Any] | None = None
+        self._revision = 0
         self._transitioning = False
         self._runtime_valid = True
         self._kernel = kernel
@@ -310,6 +340,8 @@ class RunCoordinator:
         self._busy = False
         self._memory_cancelled = False
         self._last_run_id: str | None = None
+        self._last_run_origin = "desktop"
+        self._last_assistant_message_id: str | None = None
         self._active_conversation_id: str | None = None
         self._active_branch_id: str | None = None
         self._finalize_tasks: set[asyncio.Task[None]] = set()
@@ -364,7 +396,88 @@ class RunCoordinator:
 
     @property
     def busy(self) -> bool:
-        return self._busy or self._transitioning
+        try:
+            task = asyncio.current_task()
+        except RuntimeError:
+            task = None
+        return self._busy or self._transitioning or (
+            self._command_owner is not None and self._command_owner is not task
+        )
+
+    @property
+    def run_origin(self) -> str:
+        """Trusted provenance for IPC/gateway dispatchers, never browser supplied."""
+        if self._live is not None:
+            return self._live.origin
+        return self._last_run_origin if self._last_run_id is not None else "desktop"
+
+    def notify_remote_target_changing(self, conversation_id: str, branch_id: str) -> None:
+        """Synchronous view-boundary hook before a remote restore changes scope."""
+        self._emit(
+            "remote_target_changing",
+            conversation_id=self.conversation_id,
+            branch_id=self.branch_id,
+            target_conversation_id=conversation_id,
+            target_branch_id=branch_id,
+        )
+
+    def event_scope(self) -> dict[str, Any]:
+        """Query synchronously inside ChatEvent handlers; no private-field access."""
+        live = self._live
+        return {
+            "run_origin": self.run_origin,
+            "conversation_id": live.conversation_id if live else self.conversation_id,
+            "branch_id": live.branch_id if live else self.branch_id,
+            "run_id": live.run_id if live else self.run_id,
+            "message_id": (live.assistant_message_id if live else
+                           self._last_assistant_message_id if self.run_id else None),
+        }
+
+    def stream_snapshot(self) -> dict[str, Any] | None:
+        """Authoritative in-memory output, including when a facade attaches mid-run."""
+        live = self._live
+        if live is None:
+            return None
+        return {
+            **self.event_scope(), "text": live.text, "thinking": live.thinking,
+            "status": "running" if self._busy else "settled",
+            "tools": public_tool_steps(live.tool_steps),
+            "segments": [{"content": part.content, "thinking": part.thinking}
+                         for part in live.segments],
+        }
+
+    @property
+    def active_run_id(self) -> str | None:
+        """Only a live generating run may be remotely aborted, not a last-run ID."""
+        return self._live.run_id if self._busy and self._live is not None else None
+
+    def bump_revision(self) -> None:
+        """Record an external model/config transition while command_scope is owned."""
+        self._revision += 1
+
+    @property
+    def revision(self) -> int:
+        """Monotonic execution-target revision, shared by desktop and remote callers."""
+        return self._revision
+
+    @contextlib.contextmanager
+    def command_scope(self) -> Iterator[None]:
+        """Nonwaiting task-reentrant reservation for compound runtime commands.
+
+        The scope is not a generation lock. Busy runs are rejected by commands;
+        abort deliberately bypasses it so cancellation can interrupt startup too.
+        """
+        task = asyncio.current_task()
+        if self._command_owner is not None and self._command_owner is not task:
+            raise CommandBusy("runtime_busy")
+        outer = self._command_owner is None
+        if outer:
+            self._command_owner = task
+        try:
+            yield
+        finally:
+            if outer and self._command_owner is task:
+                self._command_owner = None
 
     @contextlib.contextmanager
     def runtime_transition(self) -> Iterator[None]:
@@ -376,6 +489,7 @@ class RunCoordinator:
             yield
         finally:
             self._transitioning = False
+            self._revision += 1
 
     @property
     def run_id(self) -> str | None:
@@ -447,10 +561,13 @@ class RunCoordinator:
     async def _on_permission(self, title: str, detail: str) -> bool:
         if self._permission_handler is None:
             return False
+        token = RUN_ORIGIN.set(self.run_origin)
         try:
             return bool(await self._permission_handler(title, detail))
         except Exception:
             return False
+        finally:
+            RUN_ORIGIN.reset(token)
 
     # ---------- 生命周期 ----------
 
@@ -518,6 +635,7 @@ class RunCoordinator:
         """续接历史也必须恢复内核，不能只改变数据库写入目标。"""
         return await self.switch_conversation(conversation_id, branch_id)
 
+    @_arbitrated
     async def new_session(self) -> bool:
         """等待旧轮收尾，再新建空内核会话；成功后才清空应用定位。"""
         if self.busy:
@@ -590,6 +708,7 @@ class RunCoordinator:
             snapshot=snapshot,
         )
 
+    @_arbitrated
     async def switch_conversation(
         self,
         conversation_id: str,
@@ -640,12 +759,14 @@ class RunCoordinator:
             self._emit(ERROR, message=f"切换会话失败：{redact_text(str(exc))}")
             return False
 
+    @_arbitrated
     async def apply_compression(
         self, version_id: str, *, edited_summary: str | None = None,
     ) -> bool:
         """Apply the preview to the runtime before atomically marking it accepted."""
         return await self._change_compression(version_id, None, edited_summary)
 
+    @_arbitrated
     async def rollback_compression(self, branch_id: str) -> bool:
         """Restore original context, including messages sent after compression."""
         return await self._change_compression(None, branch_id, None)
@@ -739,6 +860,7 @@ class RunCoordinator:
 
     # ---------- 分支（Task 3.2） ----------
 
+    @_arbitrated
     async def edit_user_message(
         self,
         message_id: str,
@@ -768,6 +890,7 @@ class RunCoordinator:
             document_note=document_note,
         )
 
+    @_arbitrated
     async def retry_user_message(self, message_id: str) -> str | None:
         """重试一条发送失败的用户消息。
 
@@ -808,6 +931,7 @@ class RunCoordinator:
                 raise ValueError("只能重试当前分支中的用户消息")
         return message.content, self._attachments_for_message(message_id)
 
+    @_arbitrated
     async def fork_message(self, assistant_message_id: str) -> str | None:
         """从完整回复之后创建新分支，保留起点和上下文，不发送或重新生成。"""
         if self.busy:
@@ -912,6 +1036,7 @@ class RunCoordinator:
         history = history_payload(messages[:index + 1], uow_factory=self._uow_factory)
         return branch, snapshot, memory_anchor, history
 
+    @_arbitrated
     async def regenerate(self, assistant_message_id: str) -> str | None:
         """完整回复重生成；阻塞的数据准备交给存储进程，失败/停止保持原分支重试。"""
         if self.busy:
@@ -970,7 +1095,11 @@ class RunCoordinator:
                 raise ValueError("该消息没有运行时记录，无法分叉")
             # Commit only repaired orphan links here, before leaving the worker transaction.
             uow.commit()
-        prefix = history_payload(messages[:index], uow_factory=self._uow_factory)
+        # 先带上分叉来源完成重试折叠，再移除它；先截断会让旧尝试复活。
+        prefix = [entry for entry in history_payload(
+            messages[:index + 1], uow_factory=self._uow_factory,
+            branch_id=self._active_branch_id,
+        ) if entry.message_id != source.id]
         return _BranchPreparation(source, entry, prefix)
 
     def _persist_branch(
@@ -1015,6 +1144,7 @@ class RunCoordinator:
             raise RuntimeError("原消息的附件已缺失，未发送不完整请求")
         return payload
 
+    @_arbitrated
     async def switch_branch(self, branch_id: str) -> bool:
         """切换到同会话的另一分支，与会话切换共用收尾和恢复边界。"""
         if self._active_conversation_id is None:
@@ -1165,6 +1295,7 @@ class RunCoordinator:
 
     # ---------- 发送 ----------
 
+    @_arbitrated
     async def send(
         self,
         text: str,
@@ -1243,13 +1374,19 @@ class RunCoordinator:
             assistant_message_id=assistant_message_id,
             user_text=text,
             context=context,
+            origin=RUN_ORIGIN.get(),
             sent_prompt=prompt,
             images=deepcopy(images or []),
             first_turn=first_turn,
             run_started_monotonic=time.monotonic(),
         )
         self._last_run_id = run_id
+        self._last_run_origin = self._live.origin
+        self._last_assistant_message_id = assistant_message_id
         self._busy = True
+        # The live run now excludes conflicting writes. Release the command
+        # reservation BEFORE route/model I/O and generation; abort stays live.
+        self._command_owner = None
         self._memory_cancelled = False
         # message_id 随事件带出：分支操作（编辑/重生成）要以消息为锚点
         retry_data = (
@@ -1481,9 +1618,19 @@ class RunCoordinator:
         self._handle_kernel_event(event)
 
     async def _drain_kernel_events(self) -> None:
+        deadline = time.monotonic() + 0.008
+        processed = 0
         try:
             while self._pending_kernel_events:
+                # Tool IPC may leave thousands of ready deltas behind it. An
+                # ordered queue must not then monopolize the shared Qt loop.
+                if processed >= 64 or time.monotonic() >= deadline:
+                    await asyncio.sleep(0)
+                    deadline = time.monotonic() + 0.008
+                    processed = 0
+                    continue  # recheck queue/liveness after cancellation or a session switch
                 event, live, received_at = self._pending_kernel_events.popleft()
+                processed += 1
                 if self._live is not live:
                     continue  # A late result must never modify another run/session.
                 prepared: ToolStep | None = None
@@ -1787,7 +1934,11 @@ class RunCoordinator:
             finally:
                 self._transitioning = False
 
-        task = loop.create_task(_retry())
+        token = RUN_ORIGIN.set(live.origin)
+        try:
+            task = loop.create_task(_retry())
+        finally:
+            RUN_ORIGIN.reset(token)
         self._finalize_tasks.add(task)
         task.add_done_callback(self._finalize_tasks.discard)
 

@@ -202,8 +202,9 @@ def test_thinking_and_toolsteps_collapsed(seeded, tmp_path: Path) -> None:
     assert "先看图再答" in page  # 内容在，只是折叠
 
 
-def test_model_and_site_info_retained(seeded, tmp_path: Path) -> None:
-    export, _, _ = seeded
+def test_model_and_site_info_retained_when_requested(seeded, tmp_path: Path) -> None:
+    _, factory, _ = seeded
+    export = ExportService(factory, None, include_model_info=True)
     page = export.export_branch("b1", tmp_path / "out.html").path.read_text(encoding="utf-8")
     assert "deepseek-chat" in page
     assert "relay-a" in page
@@ -329,6 +330,7 @@ def test_export_uses_display_names_and_escapes_them(seeded, tmp_path: Path) -> N
     _, factory, _ = seeded
     export = ExportService(
         factory, None,
+        include_model_info=True,
         model_names={"deepseek-chat": "深度求索 <对话>"},
         endpoint_names={"relay-a": "中转站 & A"},
     )
@@ -353,3 +355,64 @@ def test_export_routing_reason_resolves_names_without_partial_or_recursive_repla
         "会话级站点覆盖（配置默认是 relay-b）"
     )
     assert export._display_reason("relay-a-other / relay-b") == "relay-a-other / 备用站"
+
+
+@pytest.mark.parametrize("fmt", ["html", "md", "txt", "json"])
+def test_exports_hide_model_and_site_info_by_default(seeded, tmp_path: Path, fmt: str) -> None:
+    _, factory, _ = seeded
+    export = ExportService(
+        factory, None,
+        model_names={"deepseek-chat": "深度求索"},
+        endpoint_names={"relay-a": "中转站 A"},
+    )
+    paths = export.export_selection(["b1", "b2"], fmt, tmp_path / "private")
+    for path in paths:
+        content = path.read_text(encoding="utf-8")
+        for value in ("deepseek-chat", "relay-a", "深度求索", "中转站 A", "默认绑定"):
+            assert value not in content
+        assert '<div class="provenance">' not in content
+    assert "收到" in paths[0].read_text(encoding="utf-8")
+    assert "先看图再答" in paths[0].read_text(encoding="utf-8")
+
+
+def test_direct_html_export_hides_model_info_by_default(seeded, tmp_path: Path) -> None:
+    export, _, _ = seeded
+    content = export.export_branch("b1", tmp_path / "private.html").path.read_text(encoding="utf-8")
+    for value in ("deepseek-chat", "relay-a", "默认绑定", '<div class="provenance">'):
+        assert value not in content
+    assert "工具步骤" in content
+    assert "data:image/png;base64," in content
+
+
+def test_batch_html_export_retains_model_info_when_requested(seeded, tmp_path: Path) -> None:
+    _, factory, _ = seeded
+    export = ExportService(factory, None, include_model_info=True)
+    paths = export.export_selection(["b1", "b2"], "html", tmp_path / "with-model")
+    content = paths[0].read_text(encoding="utf-8")
+    for value in ("deepseek-chat", "relay-a", "默认绑定"):
+        assert value in content
+    assert SECRET not in content
+    assert "Authorization" not in content
+
+
+def test_privacy_notice_matches_model_info_choice() -> None:
+    assert "不包含每条回复使用的模型、站点与路由原因" in privacy_notice()
+    notice = privacy_notice(include_model_info=True)
+    assert "包含每条回复使用的模型、站点与路由原因" in notice
+    assert "不包含每条回复" not in notice
+
+
+@pytest.mark.parametrize("fmt", ["html", "md", "txt", "json"])
+def test_hiding_model_info_does_not_redact_message_content(
+    seeded, tmp_path: Path, fmt: str,
+) -> None:
+    export, factory, _ = seeded
+    text = "正文中提到 deepseek-chat 和 relay-a 应保持原样"
+    with factory() as uow:
+        uow.messages.add(Message(
+            id="m4", conversation_id="c1", branch_id="b1", role=MessageRole.USER,
+            content=text, created_at=T0 + timedelta(minutes=6),
+        ))
+        uow.commit()
+    [path] = export.export_selection(["b1"], fmt, tmp_path / "body")
+    assert text in path.read_text(encoding="utf-8")

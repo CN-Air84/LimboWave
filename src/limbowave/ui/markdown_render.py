@@ -18,17 +18,16 @@ HTML，不能抛异常。markdown-it 对未闭合围栏会等到收尾行才开�
 
 from __future__ import annotations
 
+from functools import lru_cache
 from html.parser import HTMLParser
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from markdown_it import MarkdownIt
-from pygments import highlight
-from pygments.formatters import HtmlFormatter
-from pygments.lexers import get_lexer_by_name
-from pygments.util import ClassNotFound
 from PySide6.QtCore import QRegularExpression
 
 from limbowave.ui import theme
+
+if TYPE_CHECKING:
+    from markdown_it import MarkdownIt
 
 # 代码高亮：内联样式（Qt 不支持 class CSS），nowrap 只产 <span>，
 # 外层 <pre> 由 markdown-it 统一包裹。
@@ -41,6 +40,8 @@ _formatter_cache: dict[str, Any] = {}
 def _formatter() -> Any:
     style = theme.pygments_style()
     if style not in _formatter_cache:
+        from pygments.formatters import HtmlFormatter
+
         _formatter_cache[style] = HtmlFormatter(noclasses=True, nowrap=True, style=style)
     return _formatter_cache[style]
 
@@ -48,6 +49,9 @@ def _formatter() -> Any:
 def _highlight(code: str, lang: str | None, _attrs: str | None) -> str:
     """markdown-it 的 highlight 回调。未知语言回退纯文本（转义）。"""
     if lang:
+        from pygments.lexers import get_lexer_by_name
+        from pygments.util import ClassNotFound
+
         try:
             lexer = get_lexer_by_name(lang)
         except ClassNotFound:
@@ -56,13 +60,21 @@ def _highlight(code: str, lang: str | None, _attrs: str | None) -> str:
         lexer = None
     if lexer is None:
         return code.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    from pygments import highlight
+
     rendered: str = highlight(code, lexer, _formatter())
     return rendered.rstrip("\n")
 
 
-_MD = MarkdownIt("commonmark", {"highlight": _highlight, "html": False, "breaks": False})
-_MD.enable("table")
-_MD.enable("strikethrough")
+@lru_cache(maxsize=1)
+def _markdown() -> MarkdownIt:
+    # Login/empty conversations need neither the parser nor the lexer registry.
+    from markdown_it import MarkdownIt
+
+    parser = MarkdownIt("commonmark", {"highlight": _highlight, "html": False, "breaks": False})
+    parser.enable("table")
+    parser.enable("strikethrough")
+    return parser
 
 # Qt 的 Unicode 属性识别 emoji，\X 一次匹配完整字素簇（肤色、ZWJ、旗帜等）。
 # 普通数字 / © / ™ 等文本符号不匹配，除非明确使用 emoji 选择符或组成键帽。
@@ -119,7 +131,7 @@ class _EmojiStyler(HTMLParser):
 def render(text: str) -> str:
     """把 Markdown 渲染成 Qt 富文本 HTML。纯函数，绝不抛。"""
     try:
-        body = _MD.render(text)
+        body = _markdown().render(text) if text.strip() else ""
     except Exception:
         # 渲染器本身出问题也不让消息消失——回退转义纯文本
         escaped = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")

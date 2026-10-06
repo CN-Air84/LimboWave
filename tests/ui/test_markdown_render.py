@@ -209,3 +209,23 @@ def test_emoji_in_attributes_is_not_rewritten() -> None:
     assert 'alt="图片"' in html
     assert "<span" not in html
     _assert_balanced(html)
+
+
+def test_markdown_dependencies_load_only_when_needed():
+    import subprocess
+    import sys
+
+    result = subprocess.run(
+        [sys.executable, "-c", (
+            "import sys; "
+            "from limbowave.ui.markdown_render import render; "
+            "assert render('  '); "
+            "assert 'markdown_it' not in sys.modules; "
+            "assert 'pygments' not in sys.modules; "
+            "assert '<strong>' in render('**hello**'); "
+            "assert 'markdown_it' in sys.modules; "
+            "assert 'pygments' not in sys.modules; "
+            "assert '<span style=' in render('```python\\nprint(1)\\n```')"
+        )], capture_output=True, text=True, timeout=20,
+    )
+    assert result.returncode == 0, result.stderr

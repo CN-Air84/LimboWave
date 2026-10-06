@@ -36,7 +36,7 @@ def test_incomplete_reply_offers_retry_instead_of_fork(
     assert user_row._retry_btn.isVisible()
     assert "当前分支" in user_row._retry_btn.toolTip()
     assistants = [row for row in view._rows if row._role == "assistant"]
-    assert bool(assistants) == bool(text)
+    assert len(assistants) == 1
     assert all(row._fork_btn.isHidden() for row in assistants)
     assert all(row._regenerate_btn.isHidden() for row in assistants)
     with qtbot.waitSignal(view.retry_requested) as signal:
@@ -424,7 +424,7 @@ async def test_app_automatic_retry_keeps_one_reply_and_only_final_error(
         kernel.say(final_text, stop=final_stop)
         kernel.emit("run.settled", {})
         await controller.wait_idle()
-        if final_text or final_stop == "error":
+        if final_text or final_stop in {"error", "aborted"}:
             assert window.chat._rows == [user, assistant]
             assert assistant.content_text() == final_text
             assert len(assistant._segments) == 1
@@ -515,3 +515,38 @@ def test_unmatched_retry_never_becomes_a_new_send(qtbot: QtBot, replay: str) -> 
     if tail is not None:
         assert tail.content_text() == "最新输出"
     view.set_busy(False)
+
+
+@pytest.mark.parametrize("stop", ["error", "aborted", "interrupted"])
+def test_empty_incomplete_retry_never_constructs_another_bubble(
+    qtbot: QtBot, monkeypatch: pytest.MonkeyPatch, stop: str
+) -> None:
+    view = ChatView()
+    qtbot.addWidget(view)
+    view.add_user_message("问题", "user-0")
+    view.set_busy(True)
+    user, assistant = view._rows
+
+    def forbid_new_bubble(*_args, **_kwargs):
+        pytest.fail("重试必须复用原气泡，不允许创建新气泡")
+
+    monkeypatch.setattr(view, "_add_bubble", forbid_new_bubble)
+    for attempt in range(3):
+        if stop == "interrupted":
+            view.set_retry_available(f"user-{attempt}")
+        else:
+            view.end_assistant(
+                "", f"assistant-{attempt}", stop_reason=stop,
+                user_message_id=f"user-{attempt}",
+            )
+        view.set_busy(False)
+        assert view._rows == [user, assistant]
+        assert not assistant._run_state.isHidden()
+        view.retry_user_message("问题", f"user-{attempt + 1}", f"user-{attempt}")
+        assert view._rows == [user, assistant]
+        assert view._stream_row is assistant
+        view.begin_assistant()
+    view.end_assistant("成功", "assistant-final")
+    view.set_busy(False)
+    assert view._rows == [user, assistant]
+    assert assistant.content_text() == "成功"

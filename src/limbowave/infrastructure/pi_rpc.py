@@ -35,6 +35,8 @@ _STDERR_CACHE_CHARS = 256 * 1024
 _STDERR_CACHE_LINES = 1024
 _CREATE_NO_WINDOW = 0x08000000
 _BACKGROUND_JSON_THRESHOLD = 64 * 1024
+_STDOUT_FRAMES_PER_SLICE = 64
+_STDOUT_SLICE_SECONDS = 0.008
 
 
 def _decode_frame(raw: bytes) -> dict[str, Any]:
@@ -161,19 +163,39 @@ class PiRpcProcess:
 
     async def _read_stdout(self) -> None:
         assert self._proc is not None and self._proc.stdout is not None
-        buf = b""
+        buf = bytearray()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _STDOUT_SLICE_SECONDS
+        frames = 0
         try:
             while True:
                 chunk = await self._proc.stdout.read(65536)
                 if not chunk:
                     break
-                buf += chunk
-                # 只在 b"\n" 上分帧；\r\n 靠 strip 尾部 \r 兼容（合同 §三.1）
-                while b"\n" in buf:
-                    line, buf = buf.split(b"\n", 1)
-                    await self._dispatch_async(line.rstrip(b"\r"))
+                # Previous bytes contain no newline. Search only the new suffix;
+                # a large fragmented JSON frame must not be copied/rescanned per read.
+                search_from = len(buf)
+                buf.extend(chunk)
+                start = 0
+                while (newline := buf.find(b"\n", search_from)) >= 0:
+                    line = bytes(memoryview(buf)[start:newline]).rstrip(b"\r")
+                    start = search_from = newline + 1
+                    await self._dispatch_async(line)
+                    frames += 1
+                    # Buffered StreamReader.read and a small _dispatch_async both
+                    # complete inline. Explicitly yield so Qt input/stop/paint can run.
+                    if frames >= _STDOUT_FRAMES_PER_SLICE or loop.time() >= deadline:
+                        await asyncio.sleep(0)
+                        frames = 0
+                        deadline = loop.time() + _STDOUT_SLICE_SECONDS
+                if start:
+                    del buf[:start]
+                if loop.time() >= deadline:
+                    await asyncio.sleep(0)
+                    frames = 0
+                    deadline = loop.time() + _STDOUT_SLICE_SECONDS
             if buf.strip():
-                await self._dispatch_async(buf.rstrip(b"\r"))
+                await self._dispatch_async(bytes(buf).rstrip(b"\r"))
         finally:
             # 进程退出：让所有挂起的请求以异常结束，避免永远等待
             for pending in self._pending.values():

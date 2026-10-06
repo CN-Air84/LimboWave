@@ -6,9 +6,9 @@
 - **单文件 HTML**：样式内联在 ``<style>`` 里，无外部依赖，双击即开；
 - **图片内嵌**：从加密 blob 仓读出原图，base64 成 ``data:`` URI；
 - **工具步骤可折叠**：``<details>`` 元素，默认收起；
-- **保留模型和站点信息**：每条助手消息标出逻辑模型 → 端点与路由原因；
+- **默认隐藏模型和站点信息**：仅显式开启时标出逻辑模型 → 端点与路由原因；
 - **默认不含完整请求头、密钥、原始请求日志**：只导出**摘要**
-  （模型/端点/参数键/状态码），请求体与请求头一律不导出；
+  （传输序号/状态码/停止原因），请求体与请求头一律不导出；
 - **导出前显示隐私提示**：:func:`privacy_notice` 返回提示文本，UI 必须先展示；
 - **导出文件不是加密文件**：明文 HTML——这是刻意的，也是必须在提示里说明的。
 
@@ -39,16 +39,21 @@ from limbowave.infrastructure.crypto.blob_store import BlobStore
 
 PRIVACY_NOTICE = (
     "导出的文件是**明文文件**，不加密。\n"
-    "它包含：会话消息正文、模型的思考内容（如有）、以及每条回复使用的模型与站点。\n"
+    "它包含：会话消息正文、模型的思考内容（如有）。\n"
     "它**不含**：API 密钥、完整请求头、原始请求/响应载荷、权限审计记录。\n"
     "HTML 还会内嵌图片与工具步骤。消息正文中自行粘贴的敏感信息不会自动脱敏。\n"
     "请把导出文件放在你认为安全的位置；发给他人前请自行确认内容。"
 )
 
 
-def privacy_notice() -> str:
-    """导出前的隐私提示文本（§十四.2：导出前显示隐私提示）。"""
-    return PRIVACY_NOTICE
+def privacy_notice(*, include_model_info: bool = False) -> str:
+    """导出前的隐私提示文本，与本次导出的模型/站点选项保持一致。"""
+    model_info_notice = (
+        "本次导出包含每条回复使用的模型、站点与路由原因。"
+        if include_model_info
+        else "本次导出不包含每条回复使用的模型、站点与路由原因（消息正文不做脱敏）。"
+    )
+    return f"{PRIVACY_NOTICE}\n{model_info_notice}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,11 +91,13 @@ class ExportService:
         self, uow_factory: UnitOfWorkFactory, blob_store: BlobStore | None,
         *, model_names: Mapping[str, str] | None = None,
         endpoint_names: Mapping[str, str] | None = None,
+        include_model_info: bool = False,
     ) -> None:
         self._uow_factory = uow_factory
         self._blobs = blob_store
         self._model_names = dict(model_names or {})
         self._endpoint_names = dict(endpoint_names or {})
+        self._include_model_info = include_model_info
 
     def _display_reason(self, reason: str) -> str:
         """只转换溯源说明，不替换消息正文；一次替换避免显示名被二次替换。"""
@@ -174,7 +181,7 @@ class ExportService:
         return chr(10).join(parts)
 
     def export_branch(self, branch_id: str, target: Path) -> ExportResult:
-        """导出指定分支。图片内嵌、工具步骤折叠、模型信息保留。"""
+        """导出指定分支。图片内嵌、工具步骤折叠、模型/站点信息默认隐藏。"""
         with self._uow_factory() as uow:
             page, stats = self._render(uow, branch_id)
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -323,12 +330,12 @@ class ExportService:
         return f'<div class="attachments">{"".join(chunks)}</div>' if chunks else ""
 
     def _render_provenance(self, uow: UnitOfWork, run: RunRecord) -> list[str]:
-        """模型/站点信息 + 工具步骤（折叠）。**不含请求头、密钥、原始载荷**。"""
+        """可选模型/站点信息 + 工具步骤（折叠）。不含请求头、密钥、原始载荷。"""
         run_id = run.id
         intent = uow.snapshots.get_intent(run_id)
         transports = uow.snapshots.list_transport(run_id)
         out: list[str] = []
-        if intent is not None:
+        if self._include_model_info and intent is not None:
             model_name = self._model_names.get(intent.logical_model_id) or intent.logical_model_id
             endpoint_name = self._endpoint_names.get(intent.endpoint_id) or intent.endpoint_id
             reason = self._display_reason(intent.routing_reason)

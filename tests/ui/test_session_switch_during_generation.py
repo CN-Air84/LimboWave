@@ -63,7 +63,7 @@ async def browse_history(window, history_id):
                    and not window.chat.history_loading)
 
 
-async def test_browse_does_not_interrupt_or_redirect_live_reply(wired):
+async def test_browse_does_not_interrupt_or_redirect_live_reply(wired, qtbot):
     window, controller, kernel, history_id, _, _ = wired
     live_id, live_branch = controller.conversation_id, controller.branch_id
     live_rows = list(window.chat._rows)
@@ -91,7 +91,11 @@ async def test_browse_does_not_interrupt_or_redirect_live_reply(wired):
     window.sidebar.conversation_selected.emit(live_id)
     await wait_for(lambda: window.history_preview is None)
     assert window.chat._rows == live_rows
-    assert window.chat._rows[-1].content_text() == "before switch after switch"
+    # This fixture uses plain asyncio, not qasync: explicitly pump the Qt
+    # presentation timer rather than assuming every provider delta paints inline.
+    qtbot.waitUntil(
+        lambda: window.chat._rows[-1].content_text() == "before switch after switch"
+    )
     assert window.chat._input.toPlainText() == "keep my draft"
     assert window.chat._busy and window.chat._stop_btn.isEnabled()
     assert window.sidebar._active_conversation_id == live_id

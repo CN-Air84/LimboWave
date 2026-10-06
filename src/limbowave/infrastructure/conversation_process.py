@@ -109,10 +109,8 @@ def _execute(
 
 class ConversationProcess:
     def __init__(self, config: ConversationProcessConfig) -> None:
-        self._executor = ProcessPoolExecutor(
-            max_workers=1, mp_context=multiprocessing.get_context("spawn"),
-            initializer=_initialize, initargs=(config,),
-        )
+        self._config = config
+        self._executor: ProcessPoolExecutor | None = None
         self._closed = False
 
     async def warm(self) -> int:
@@ -124,6 +122,11 @@ class ConversationProcess:
     ) -> Any:
         if self._closed:
             raise RuntimeError("Conversation storage process is closed")
+        if self._executor is None:
+            self._executor = ProcessPoolExecutor(
+                max_workers=1, mp_context=multiprocessing.get_context("spawn"),
+                initializer=_initialize, initargs=(self._config,),
+            )
         pending = asyncio.get_running_loop().run_in_executor(
             self._executor, partial(_execute, operation, location, args, kwargs)
         )
@@ -136,9 +139,11 @@ class ConversationProcess:
 
     async def close(self) -> None:
         self._closed = True
-        await asyncio.to_thread(self._executor.shutdown, wait=True, cancel_futures=True)
+        if self._executor is not None:
+            await asyncio.to_thread(self._executor.shutdown, wait=True, cancel_futures=True)
 
     def close_unstarted(self) -> None:
-        """Startup rollback only: no jobs have been submitted before warm()."""
+        """Startup rollback only: no jobs have been submitted before first use."""
         self._closed = True
-        self._executor.shutdown(wait=False, cancel_futures=True)
+        if self._executor is not None:
+            self._executor.shutdown(wait=False, cancel_futures=True)

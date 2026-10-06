@@ -73,16 +73,38 @@ def history_payload(
     }
     retryable_users: set[str] = set()
     retry_sources: dict[str, str] = {}
+    replaced_runs: set[str] = set()
     if messages and uow_factory is not None:
         with uow_factory() as uow:
-            for run in uow.runs.list_for_conversation(messages[0].conversation_id):
+            runs = uow.runs.list_for_conversation(messages[0].conversation_id)
+            runs_by_user = {run.user_message_id: run for run in runs}
+            for run in runs:
                 if run.status in {RunStatus.FAILED, RunStatus.ABORTED, RunStatus.INTERRUPTED}:
                     retryable_runs.add(run.id)
                     retryable_users.add(run.user_message_id)
                 if run.retry_of_message_id is not None:
                     retry_sources[run.user_message_id] = run.retry_of_message_id
+            # 重生成/编辑在重试用户消息之前截断，来源消息虽不在新路径里，
+            # 它替换过的旧尝试仍不可复活。沿分支祖先恢复这个展示边界，
+            # 不改原始消息、运行审计或旧分支，也不按相同文本去重。
+            seen_branches: set[str] = set()
+            cursor = branch_id
+            while cursor is not None and cursor not in seen_branches:
+                seen_branches.add(cursor)
+                branch = uow.branches.get(cursor)
+                if branch is None:
+                    break
+                if not branch.include_fork_message:
+                    source = branch.forked_from_message_id
+                    seen_sources: set[str] = set()
+                    while source in retry_sources and source not in seen_sources:
+                        seen_sources.add(source)
+                        source = retry_sources[source]
+                        prior = runs_by_user.get(source)
+                        if prior is not None:
+                            replaced_runs.add(prior.id)
+                cursor = branch.parent_branch_id
     # 只替换当前分支路径中紧邻的来源轮；不按文本去重，不吞掉分叉后的独立消息。
-    replaced_runs: set[str] = set()
     previous_user: Message | None = None
     for message in messages:
         if message.role is not MessageRole.USER:

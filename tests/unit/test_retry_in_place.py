@@ -205,7 +205,7 @@ async def test_regenerate_uses_failed_run_status_even_if_message_is_complete() -
     await coord.wait_idle()
 
 
-async def test_retry_waits_for_finalize_and_rechecks_location() -> None:
+async def test_retry_reserves_location_while_waiting_for_finalize() -> None:
     class SlowEntriesKernel(BranchingKernel):
         def __init__(self) -> None:
             super().__init__()
@@ -230,10 +230,77 @@ async def test_retry_waits_for_finalize_and_rechecks_location() -> None:
     assert kernel.sent == ["第一轮"]
     switching = asyncio.create_task(coord.new_session())
     await asyncio.sleep(0)
-    assert not switching.done()
+    assert switching.done()
+    assert await switching is False
     kernel.release.set()
-    assert await switching
-    assert await retry is None
-    assert kernel.sent == ["第一轮"]
+    assert await retry is not None
+    assert kernel.sent == ["第一轮", "第一轮"]
     assert kernel.forked == []
     assert store.runs[first_run].status is RunStatus.ABORTED
+
+
+@pytest.mark.parametrize("action", ["regenerate", "edit"])
+@pytest.mark.parametrize("attempts", [1, 3])
+async def test_regenerating_successful_retry_does_not_revive_aborted_turn(
+    action: str, attempts: int,
+) -> None:
+    from limbowave.application import branch_path
+    from limbowave.application.history_payload import history_payload
+    from tests.unit.test_branch_path import TreeKernel
+
+    store = InMemoryStore()
+    factory = in_memory_uow_factory(store)
+    kernel = TreeKernel()
+    coord = _coordinator(kernel, store)
+    events = []
+    coord.subscribe(events.append)
+    # An independent identical send must not be deduplicated by text.
+    await coord.send("n")
+    kernel.say("earlier")
+    kernel.emit("run.settled", {})
+    await coord.wait_idle()
+    first = await coord.send("n")
+    second = first
+    for _ in range(attempts):
+        kernel.say("x", stop="aborted")
+        kernel.emit("run.settled", {})
+        await coord.wait_idle()
+        second = await coord.retry_user_message(store.runs[second].user_message_id)
+        assert second is not None
+    kernel.say("y")
+    kernel.emit("run.settled", {})
+    await coord.wait_idle()
+    old_branch = coord.branch_id
+
+    def contents(branch):
+        with factory() as uow:
+            messages = branch_path.branch_messages(uow, branch)
+        return [entry.content for entry in history_payload(
+            messages, uow_factory=factory, branch_id=branch,
+        )]
+
+    assert contents(old_branch) == ["n", "earlier", "n", "y"]
+    prepared = coord._prepare_regeneration(store.runs[second].assistant_message_id)
+    assert [entry.content for entry in prepared.history] == ["n", "earlier"]
+    if action == "regenerate":
+        third = await coord.regenerate(store.runs[second].assistant_message_id)
+    else:
+        third = await coord.edit_user_message(store.runs[second].user_message_id, "edited")
+    assert third is not None
+    assert [entry.content for entry in next(
+        event for event in reversed(events) if event.kind == "branched"
+    ).data["history"]] == ["n", "earlier"]
+    kernel.say("z")
+    kernel.emit("run.settled", {})
+    await coord.wait_idle()
+    expected_user = "n" if action == "regenerate" else "edited"
+    assert contents(coord.branch_id) == ["n", "earlier", expected_user, "z"]
+    assert contents(old_branch) == ["n", "earlier", "n", "y"]
+    # Reopen through a fresh projection and regenerate on a descendant branch.
+    fourth = await coord.regenerate(store.runs[third].assistant_message_id)
+    assert fourth is not None
+    kernel.say("final")
+    kernel.emit("run.settled", {})
+    await coord.wait_idle()
+    assert contents(coord.branch_id) == ["n", "earlier", expected_user, "final"]
+    assert any(message.content == "x" for message in store.messages.values())

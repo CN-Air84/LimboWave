@@ -10,15 +10,19 @@ from __future__ import annotations
 import re
 from collections.abc import Collection
 
-from pypinyin import lazy_pinyin
-
 _FALLBACK = "endpoint"
 
 
 def slugify(name: str) -> str:
     """``"中转站 A"`` → ``"zhong-zhuan-zhan-a"``；派生为空时回退 ``endpoint``。"""
     # lazy_pinyin 把每个汉字拆成一个音节，非汉字片段原样保留为一段
-    joined = "-".join(lazy_pinyin(name.strip()))
+    stripped = name.strip()
+    if stripped.isascii():
+        joined = stripped
+    else:
+        from pypinyin import lazy_pinyin
+
+        joined = "-".join(lazy_pinyin(stripped))
     slug = re.sub(r"[^a-z0-9]+", "-", joined.lower()).strip("-")
     return slug or _FALLBACK
 

@@ -17,6 +17,9 @@ dependencies = [
     "pygments>=2.17",
     "Pillow>=10.0",
     "pypinyin>=0.55.0",
+    "fastapi>=0.115",
+    "uvicorn>=0.34",
+    "qrcode>=8",
 ]
 
 [dependency-groups]
@@ -28,6 +31,7 @@ dev = [
     "mypy>=1.10",
     "types-Pygments>=2.21",
     "pyinstaller>=6.10",
+    "types-qrcode>=8.2.0.20260518",
 ]
 
 [build-system]
@@ -39,6 +43,7 @@ packages = ["src/limbowave"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
 qt_api = "pyside6"
 asyncio_mode = "auto"
 addopts = "-ra"
@@ -62,3 +67,6 @@ files = ["src"]
 [[tool.mypy.overrides]]
 module = ["qasync", "qasync.*"]
 ignore_missing_imports = true
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/limbowave/web/static" = "limbowave/web/static"

@@ -320,6 +320,7 @@ class SettingsPage(QWidget):
         conversation_id: str | None = None,
         memories: Any = None,
         diagnostics_available: bool = False,
+        lan_panel: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.setObjectName("settingsPage")
@@ -406,6 +407,12 @@ class SettingsPage(QWidget):
         data_tab.restore_requested.connect(self.restore_requested.emit)
         data_tab.reset_requested.connect(self.reset_requested.emit)
         self._add_page("数据与安全", data_tab)
+        if lan_panel is not None:
+            lan_scroll = QScrollArea()
+            lan_scroll.setWidgetResizable(True)
+            lan_scroll.setFrameShape(QFrame.Shape.NoFrame)
+            lan_scroll.setWidget(lan_panel)
+            self._add_page("局域网访问", lan_scroll)
         # The log viewer can query and lay out many rows. Build it only when selected.
         self._request_log_index = self._add_page(
             "请求日志", _RequestLogTab(None, None, self)

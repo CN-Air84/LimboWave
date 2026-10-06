@@ -79,6 +79,7 @@ if TYPE_CHECKING:
     from limbowave.domain.permissions import GrantScope, ToolRequest
     from limbowave.ui.data_reset_panel import DataResetPanel
     from limbowave.ui.settings_panel import SettingsPage
+    from limbowave.web.server import WebServer
 
 SMOKE_EXIT_MS = 400
 _LOG = logging.getLogger(__name__)
@@ -540,6 +541,10 @@ def _make_permission_handler(
     """普通工具使用预选权限；记忆工具独立遵守逐次询问或自动允许策略。"""
 
     async def confirm(title: str, detail: str) -> bool:
+        from limbowave.application.services.run_origin import remote_tools_denied
+
+        if remote_tools_denied(gateway.origin_provider if gateway is not None else None):
+            return False
         gate = _parse_gate_request(title, detail)
         conversation_id = conversation_provider() if conversation_provider else None
         if gate is not None and gate.get("tool") == "add_session_memory":
@@ -765,9 +770,10 @@ def _wire_impl(
     sidebar = window.sidebar
     # Display navigation must not move the single kernel away from an active run.
     preview_scope: tuple[str, str] | None = None
+    detached_scope: tuple[str | None, str | None] | None = None
 
     def _display_scope() -> tuple[str | None, str | None]:
-        return preview_scope or (controller.conversation_id, controller.branch_id)
+        return preview_scope or detached_scope or (controller.conversation_id, controller.branch_id)
 
     # MainWindow 构造时 ChatView 默认可用；内核尚未 start 前必须先封住输入，
     # 否则用户可以在 Pi 进程创建前提交 prompt。
@@ -891,6 +897,7 @@ def _wire_impl(
         context=_run_context(setup_state, session_endpoint_override, thinking_state),
     )
     holder["controller"] = controller
+    tool_gateway.origin_provider = lambda: controller.coordinator().run_origin
     conversation_process = None
     if key is not None:
         from limbowave.infrastructure.conversation_process import (
@@ -1175,6 +1182,8 @@ def _wire_impl(
                 ids = chat.attachments.attachment_ids()
             if (_display_scope() != scope or controller.busy
                     or chat.attachments.generation != draft_generation):
+                chat.restore_draft(text)
+                chat.set_status("运行目标已变化或正在忙，输入已保留。")
                 return
             with controller.coordinator().runtime_transition():
                 payload = await run_blocking(attachments.build, ids) if attachments else None
@@ -1188,7 +1197,8 @@ def _wire_impl(
                 "document_note": payload.document_note,
             } if payload else {}
             if message_id is None:
-                await _send_with_catalog_sync(text, **kwargs)
+                if not await _send_with_catalog_sync(text, **kwargs):
+                    chat.restore_draft(text)
             else:
                 await controller.edit_user_message(message_id, text, **kwargs)
         finally:
@@ -1928,15 +1938,16 @@ def _wire_impl(
     async def _open_history(
         conversation_id: str, branch_id: str | None = None, *, from_preview: bool = False
     ) -> None:
-        nonlocal preview_scope
+        nonlocal preview_scope, detached_scope
         if chat.history_loading or chat.compressing or shutting_down:
             sidebar.set_active(*_display_scope())
             return
-        if conversation_id == controller.conversation_id and (
+        if detached_scope is None and conversation_id == controller.conversation_id and (
             branch_id is None or branch_id == controller.branch_id
         ):
             # Return to the actual live widgets, including draft, tools and partial text.
             preview_scope = None
+            detached_scope = None
             window.clear_history_preview()
             sidebar.set_active(*_display_scope())
             toolbar.setEnabled(True)
@@ -1997,6 +2008,7 @@ def _wire_impl(
             sidebar.set_branches(conversation_id, loaded.branches)
             await chat.load_history_incrementally(loaded.payload, rendered=loaded.rendered)
             preview_scope = None
+            detached_scope = None
             window.clear_history_preview()
             chat.set_status(f"已切换到历史{label}（{len(loaded.messages)} 条消息）")
             _refresh_agent_state()
@@ -2096,8 +2108,8 @@ def _wire_impl(
                 return
             settings_page = None
 
-        # Cold imports (including the pinyin dictionary) are not needed for login.
-        # _warm_settings calls this after the transition; widgets stay on the GUI thread.
+        # Optional settings are created once, on demand, on the GUI thread.
+        # Building hundreds of hidden controls must not delay chat readiness.
         from limbowave.ui.settings_panel import SettingsPage
 
         page = SettingsPage(
@@ -2111,6 +2123,7 @@ def _wire_impl(
             conversation_id=controller.conversation_id,
             memories=memories,
             diagnostics_available=diagnostics_available,
+            lan_panel=lan_access.panel(),
         )
         page.diagnostics_requested.connect(window.diagnostics_requested.emit)
         settings_page = page
@@ -2275,11 +2288,12 @@ def _wire_impl(
         window.show_full_page(page)
 
     async def _on_new_conversation() -> None:
-        nonlocal preview_scope
+        nonlocal preview_scope, detached_scope
         if chat.history_loading:
             return
         if await controller.new_session():
             preview_scope = None
+            detached_scope = None
             window.clear_history_preview()
             toolbar.setEnabled(True)
             chat.clear_transcript()
@@ -2475,7 +2489,10 @@ def _wire_impl(
         )
         from limbowave.infrastructure.crypto.blob_store import BlobStore
 
-        def _run_export(branch_ids: list[str], _labels: list[str], fmt: str, target: Path) -> None:
+        def _run_export(
+            branch_ids: list[str], _labels: list[str], fmt: str, target: Path,
+            include_model_info: bool,
+        ) -> None:
             def _proceed(ok: bool) -> None:
                 _spawn(_export(ok))
 
@@ -2488,6 +2505,7 @@ def _wire_impl(
                     config = settings.load()
                     exporter = ExportService(
                         uow_factory, blob_store,
+                        include_model_info=include_model_info,
                         model_names={model.id: model.name for model in config.models},
                         endpoint_names={
                             endpoint.id: endpoint.name for endpoint in config.endpoints
@@ -2501,7 +2519,10 @@ def _wire_impl(
                 destination = str(outputs[0]) if len(outputs) == 1 else str(target.parent)
                 chat.set_status(f"已导出 {len(outputs)} 个分支到 {destination}")
 
-            ask_confirm(window, "导出前请确认", privacy_notice(), _proceed, confirm_text="导出")
+            ask_confirm(
+                window, "导出前请确认", privacy_notice(include_model_info=include_model_info),
+                _proceed, confirm_text="导出",
+            )
 
         ExportPanel(
             window, rows, default_dir=str(Path.home()),
@@ -2661,6 +2682,7 @@ def _wire_impl(
         def _confirmed(service: DataResetService) -> None:
             nonlocal resetting
             resetting = True
+            lan_access.invalidate()
             if on_reset is not None:
                 on_reset(service)
 
@@ -2719,6 +2741,9 @@ def _wire_impl(
         _spawn(show())
 
     async def _prepare_edit(message_id: str) -> None:
+        if detached_scope is not None:
+            chat.set_status("请先在侧栏重新打开当前会话，再进行消息操作。")
+            return
         scope, generation = _display_scope(), chat.attachments.generation
 
         def read_edit() -> tuple[Any, dict[str, Any]]:
@@ -2744,6 +2769,9 @@ def _wire_impl(
             _spawn(_prepare_edit(message_id))
 
     def _on_edit_submitted(message_id: str, new_text: str) -> None:
+        if detached_scope is not None:
+            chat.set_status("请先在侧栏重新打开当前会话，再进行消息操作。")
+            return
         nonlocal send_preparing
         if chat.history_loading or send_preparing:
             return
@@ -2754,6 +2782,9 @@ def _wire_impl(
         ))
 
     def _on_fork(message_id: str) -> None:
+        if detached_scope is not None:
+            chat.set_status("请先在侧栏重新打开当前会话，再进行消息操作。")
+            return
         if chat.history_loading:
             return
         _spawn(controller.fork_message(message_id))
@@ -2761,6 +2792,9 @@ def _wire_impl(
     regenerate_pending = False
 
     def _on_regenerate(message_id: str) -> None:
+        if detached_scope is not None:
+            chat.set_status("请先在侧栏重新打开当前会话，再进行消息操作。")
+            return
         nonlocal regenerate_pending
         if chat.history_loading or controller.busy or regenerate_pending:
             return
@@ -2780,6 +2814,9 @@ def _wire_impl(
         _spawn(regenerate())
 
     def _on_retry(message_id: str) -> None:
+        if detached_scope is not None:
+            chat.set_status("请先在侧栏重新打开当前会话，再进行消息操作。")
+            return
         if chat.history_loading:
             return
         _spawn(controller.retry_user_message(message_id))
@@ -2970,24 +3007,36 @@ def _wire_impl(
         catalog_state["fingerprint"] = sync.fingerprint
         return True
 
-    async def _send_with_catalog_sync(text: str, **send_kwargs: Any) -> None:
-        """发送前先把最新配置的模型目录同步进运行中的 Pi，再发起这一轮。
+    async def _send_with_catalog_sync(text: str, **send_kwargs: Any) -> bool:
+        """Reserve target restoration, model sync and acceptance as one transition."""
+        nonlocal detached_scope
+        from limbowave.application.services.run_coordinator import CommandBusy
 
-        会话启动后改过的能力声明（典型：事后勾选的视觉支持）原本要等设置页
-        关闭或手动换模型才传导到 Pi——这里堵上发送这个缺口。指纹没变时
-        ``_sync_model_catalog`` 在后台比较目录，不阻塞 GUI，也不重复重载 Pi；
-        同步失败就停止发送，不能继续使用未核实的旧目录。
-        """
         if chat.history_loading:
-            return
-        if controller.busy:
-            await controller.send(text, **send_kwargs)
-            return
-        if setup is not None:
-            with controller.coordinator().runtime_transition():
-                if not await _sync_model_catalog():
-                    return
-        await controller.send(text, **send_kwargs)
+            return False
+        try:
+            with controller.coordinator().command_scope():
+                if controller.busy:
+                    chat.set_status("已有设备正在生成，输入已保留。")
+                    return False
+                if detached_scope is not None:
+                    conversation_id, branch_id = detached_scope
+                    if conversation_id is None or branch_id is None:
+                        restored = await controller.new_session()
+                    else:
+                        restored = await controller.switch_conversation(conversation_id, branch_id)
+                    if not restored:
+                        return False
+                    detached_scope = None
+                    toolbar.setEnabled(True)
+                if setup is not None:
+                    with controller.coordinator().runtime_transition():
+                        if not await _sync_model_catalog():
+                            return False
+                return await controller.send(text, **send_kwargs) is not None
+        except CommandBusy:
+            chat.set_status("另一个设备正在提交，输入已保留。")
+            return False
 
     async def _on_config_changed() -> None:
         """设置页关闭后：热更新模型目录，并让当前运行上下文跟上新配置。"""
@@ -3491,9 +3540,28 @@ def _wire_impl(
     controller.coordinator().branch_ready = _await_branch_view
 
     def _on_event(event: ChatEvent) -> None:
-        nonlocal branch_render_task
+        nonlocal branch_render_task, detached_scope
         kind = event.kind
         data = event.data
+        if kind == "remote_target_changing":
+            if detached_scope is None:
+                detached_scope = (data.get("conversation_id"), data.get("branch_id"))
+            toolbar.setEnabled(False)
+            return
+        scope = controller.coordinator().event_scope()
+        if (scope["run_origin"] == "web" and detached_scope is not None
+                and detached_scope != (scope["conversation_id"], scope["branch_id"])):
+            # A remote run must not append its output into an unrelated desktop transcript.
+            if kind == "settled":
+                chat.set_busy(False)
+                chat.set_status("手机端生成已完成；当前浏览的会话保持不变。")
+                _refresh_conversations()
+                if preview_scope is not None:
+                    _spawn(_activate_preview(preview_scope))
+            elif kind == "user":
+                chat.set_busy(True)
+                chat.set_status("手机端正在另一会话生成；可继续浏览历史。")
+            return
         if kind == "user":
             conversation_id = controller.conversation_id
             if conversation_id is not None and conversation_process is None:
@@ -3619,20 +3687,60 @@ def _wire_impl(
     # Read/decrypt once off-thread, then update only the widgets on the GUI thread.
     _refresh_conversations(_run_startup_task(history.list_conversations))
 
+    # No web stack, event broker, network enumeration or LAN widgets until requested.
+    from limbowave.ui.lan_controller import LanAccessController
+
+    def _remote_model_selected(selected: KernelSetup) -> None:
+        nonlocal setup, thinking_trial
+        setup = selected
+        setup_state["value"] = selected
+        thinking_trial = None
+        thinking_state["level"] = selected.default_thinking_level
+        session_endpoint_override["endpoint"] = None
+
+    def _create_lan_server() -> WebServer:
+        # LanAccessController loads these Qt-free modules in a worker first.
+        # Construct subscribers and asyncio-owned objects on this loop, not there.
+        from limbowave.application.services.runtime_facade import RuntimeFacade
+        from limbowave.infrastructure.crypto.lan_password_verifier import VaultPasswordVerifier
+        from limbowave.runtime_composition import RuntimeModelCatalog
+        from limbowave.web.password_gate import PasswordGate
+        from limbowave.web.server import WebServer
+
+        assert key is not None
+        remote_models = RuntimeModelCatalog(
+            settings, credentials, paths.data_root / "runtime",
+            lambda: controller.coordinator().kernel, _remote_model_selected,
+        )
+        facade = RuntimeFacade(
+            controller, uow_factory, models_provider=remote_models.models,
+            select_model=remote_models.select_model,
+            ready=lambda: key is not None and not shutting_down and not resetting,
+        )
+        password_gate = PasswordGate(VaultPasswordVerifier(paths.data_root / "vault.json", key))
+        return WebServer(facade, password_gate=password_gate)
+
+    lan_access = LanAccessController(
+        window, create_server=_create_lan_server, spawn=_spawn,
+        allowed=lambda: key is not None and not resetting and not shutting_down
+        and controller.available,
+    )
+
     def _warm_settings() -> None:
         if credentials is not None:
             _open_settings(warm_only=True)
 
     async def _finish_startup() -> None:
         """Pi 成功启动后才执行依赖 RPC 的初始同步。"""
-        if conversation_process is not None:
-            await conversation_process.warm()
+        # The storage process starts on its first actual request. Waiting for a
+        # spare process here costs startup CPU/RSS even when no chat is opened.
         await _apply_binding_defaults()
 
     async def _shutdown() -> None:
         nonlocal shutting_down
         shutting_down = True
         _LOG.info("application.services_stopping")
+        await lan_access.close()
         request_limiter.stop()
         probe_executor.shutdown(wait=False, cancel_futures=True)
         unsubscribe()
@@ -3831,7 +3939,7 @@ def _run_gui(
         window.chat.set_status("正在停止后台任务并重置数据，完成后退出…")
         loop.stop()
 
-    controller, _tool_ipc, warm_settings, finish_startup, shutdown = _wire(
+    controller, _tool_ipc, _warm_settings, finish_startup, shutdown = _wire(
         window, context.paths, key, on_reset=_request_reset, diagnostics_available=True,
         appearance_prepared=True,
     )
@@ -3841,10 +3949,6 @@ def _run_gui(
         try:
             await controller.start()
             await finish_startup()
-            # Do not compete with the login transition; prepare settings before reporting ready.
-            while window.transition_active:
-                await asyncio.sleep(0.02)
-            warm_settings()
             if controller.available:
                 state = await controller.state()
                 model = state.model_id if state else None

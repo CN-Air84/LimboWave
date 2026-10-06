@@ -341,7 +341,7 @@ def test_export_panel_select_none_blocks_export(qtbot: QtBot) -> None:
 def test_export_panel_selection_and_format_reach_callback(qtbot: QtBot) -> None:
 
     host = _host(qtbot)
-    captured: list[tuple[list[str], list[str], str, Path]] = []
+    captured: list[tuple[list[str], list[str], str, Path, bool]] = []
     panel = ExportPanel(host, _panel_rows(), on_export=lambda *a: captured.append(a))
     panel._set_all(False)
     # 只勾「今天会话」的两条分支
@@ -354,7 +354,8 @@ def test_export_panel_selection_and_format_reach_callback(qtbot: QtBot) -> None:
     go = next(b for b in panel.findChildren(QPushButton) if b.text() == "导出")
     go.click()
     assert len(captured) == 1
-    branch_ids, labels, fmt, target = captured[0]
+    branch_ids, labels, fmt, target, include_model_info = captured[0]
+    assert include_model_info is False
     assert sorted(branch_ids) == ["b3", "b3f"]
     assert set(labels) == {"主线", "分叉"}
     assert fmt == "json"
@@ -404,3 +405,36 @@ def test_export_formats_reuse_checkboxes_and_remain_exclusive(qtbot: QtBot) -> N
         # 再次点击已选格式不能取消唯一选择。
         panel._fmt[fmt].click()
         assert panel._fmt[fmt].isChecked()
+
+
+@pytest.mark.parametrize("include_model_info", [False, True])
+def test_export_panel_model_info_is_opt_in(qtbot: QtBot, include_model_info: bool) -> None:
+    captured = []
+    host = _host(qtbot)
+    panel = ExportPanel(
+        host, _panel_rows(), current_branch_id="b1",
+        on_export=lambda *a: captured.append(a),
+    )
+    assert not panel._include_model_info.isChecked()
+    assert panel._include_model_info.isEnabled()
+    panel._include_model_info.setChecked(include_model_info)
+    panel._go.click()
+    assert captured[0][-1] is include_model_info
+
+
+@pytest.mark.parametrize("fmt", ["md", "txt", "json"])
+def test_export_panel_model_info_only_applies_to_html(qtbot: QtBot, fmt: str) -> None:
+    captured = []
+    host = _host(qtbot)
+    panel = ExportPanel(
+        host, _panel_rows(), current_branch_id="b1",
+        on_export=lambda *a: captured.append(a),
+    )
+    panel._include_model_info.setChecked(True)
+    panel._fmt[fmt].click()
+    assert not panel._include_model_info.isEnabled()
+    panel._fmt["html"].click()
+    assert panel._include_model_info.isEnabled()
+    panel._fmt[fmt].click()
+    panel._go.click()
+    assert captured[0][-1] is False

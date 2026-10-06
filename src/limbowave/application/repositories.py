@@ -18,7 +18,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from datetime import datetime
 from types import TracebackType
 from typing import Protocol
 
@@ -40,6 +41,12 @@ class ConversationRepository(Protocol):
     def get(self, conversation_id: str) -> Conversation | None: ...
 
     def list_all(self) -> list[Conversation]: ...
+
+    def page_summaries(
+        self, *, limit: int, before: tuple[datetime, str] | None = None,
+    ) -> list[tuple[Conversation, str]]:
+        """Newest created first; select current branch by metadata activity only."""
+        ...
 
     def delete(self, conversation_id: str) -> None:
         """删除会话及其全部下级数据（分支/消息/运行/快照/镜像，级联）。"""
@@ -66,6 +73,18 @@ class MessageRepository(Protocol):
     def get(self, message_id: str) -> Message | None: ...
 
     def list_for_branch(self, branch_id: str) -> list[Message]: ...
+
+    def history_position(self, message_id: str) -> tuple[str, str, datetime] | None:
+        """Conversation, owning branch, timestamp; never decrypt message payloads."""
+        ...
+
+    def page_history(
+        self, conversation_id: str, branch_id: str, *, limit: int,
+        before: tuple[datetime, str] | None = None,
+        upper: tuple[datetime, str, bool] | None = None,
+    ) -> list[Message]:
+        """Descending keyset page projecting only public history payload fields."""
+        ...
 
     def count_for_branch(self, branch_id: str) -> int:
         """只取数量，不为列表/侧栏解密消息正文。"""
@@ -98,6 +117,12 @@ class SnapshotRepository(Protocol):
     def get_intent(self, run_id: str) -> RequestIntentSnapshot | None: ...
 
     def list_transport(self, run_id: str) -> list[TransportSnapshot]: ...
+
+    def attachment_ids_for_messages(
+        self, conversation_id: str, message_ids: Sequence[str],
+    ) -> dict[str, tuple[str, ...]]:
+        """Latest attachment references for selected user messages, without private payloads."""
+        ...
 
     def list_all_intents(self) -> list[RequestIntentSnapshot]:
         """全部意图快照。用于附件引用检查（删除文档/图片前的在引用判定）。"""

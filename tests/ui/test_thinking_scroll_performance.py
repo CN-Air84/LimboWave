@@ -107,7 +107,7 @@ def test_body_stream_inserts_instead_of_resetting_document(qtbot, monkeypatch):
     body.setTextCursor(cursor)
     view.append_assistant_delta("追加 <b>不是HTML</b>")
     assert reset.call_count == 0
-    assert body.toPlainText() == "原文\n追加 <b>不是HTML</b>"
+    qtbot.waitUntil(lambda: body.toPlainText() == "原文\n追加 <b>不是HTML</b>")
     assert body.textCursor().selectedText() == "原文"
 
 

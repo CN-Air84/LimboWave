@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from datetime import datetime
+from typing import Any
 
 from limbowave.application.branch_path import branch_messages, current_branch
 from limbowave.application.repositories import UnitOfWorkFactory
@@ -45,6 +46,23 @@ class HistoryService:
 
     def __init__(self, uow_factory: UnitOfWorkFactory) -> None:
         self._uow_factory = uow_factory
+
+    def page_conversations(
+        self, limit: int = 50, cursor: str | None = None,
+    ) -> dict[str, Any]:
+        """Newest-created summaries, bounded to 1..100 items."""
+        from limbowave.application.services.history_pagination import page_conversations
+
+        return page_conversations(self._uow_factory, limit, cursor)
+
+    def page_messages(
+        self, conversation_id: str, branch_id: str,
+        limit: int = 50, cursor: str | None = None,
+    ) -> dict[str, Any]:
+        """Latest page first, chronological within each page, including ancestor context."""
+        from limbowave.application.services.history_pagination import page_messages
+
+        return page_messages(self._uow_factory, conversation_id, branch_id, limit, cursor)
 
     # ---------- 会话列表 ----------
 

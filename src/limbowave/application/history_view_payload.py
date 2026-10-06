@@ -43,9 +43,7 @@ def load_history_view(
     }
     if ids:
         with factory() as uow:
-            for intent in uow.snapshots.list_all_intents():
-                if intent.message_ids and intent.message_ids[-1] in ids:
-                    ids[intent.message_ids[-1]] = tuple(intent.attachment_ids)
+            ids.update(uow.snapshots.attachment_ids_for_messages(conversation_id, list(ids)))
     return HistoryViewPayload(
         branch_id, messages, entries, ids, permissions.get_preset(conversation_id),
         {grant.capability for grant in permissions.list_grants(conversation_id)},

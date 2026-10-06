@@ -133,10 +133,14 @@ async def test_attachment_build_is_background_and_validates_draft(invalidate):
 
     async def send(text, **kwargs):
         sends.append((text, kwargs))
+        return True
 
     namespace = {
         "send_preparing": True, "attachment_tasks": set(), "asyncio": asyncio,
-        "chat": SimpleNamespace(attachments=strip, set_history_loading=lambda *a, **kw: loading_calls.append((a, kw))),
+        "chat": SimpleNamespace(
+            attachments=strip,
+            set_history_loading=lambda *a, **kw: loading_calls.append((a, kw)),
+        ),
         "_display_scope": lambda: (None, None), "run_blocking": run_blocking,
         "attachments": SimpleNamespace(build=build), "_send_with_catalog_sync": send,
         "controller": SimpleNamespace(busy=False,

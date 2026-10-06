@@ -100,6 +100,8 @@ def test_streaming_touches_only_the_stream_row(qtbot: QtBot) -> None:
     for _ in range(10_000):
         view.append_assistant_delta("字")
 
+    # Presentation is frame-coalesced, not synchronously repainted per token.
+    qtbot.waitUntil(lambda: view._stream_row._content.toPlainText() == "起点" + "字" * 10_000)
     counters = _read_counters()
     assert counters[stream_tag] > 0, "流式行必须真的在更新"
     others = {tag: value for tag, value in counters.items() if tag != stream_tag}

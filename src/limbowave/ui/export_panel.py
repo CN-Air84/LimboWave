@@ -96,11 +96,11 @@ class ExportPanel(FloatingPanel):
         *,
         default_dir: str = "",
         current_branch_id: str | None = None,
-        on_export: Callable[[list[str], list[str], str, Path], None],
+        on_export: Callable[[list[str], list[str], str, Path, bool], None],
     ) -> None:
         """``rows``：(conversation_id, title, branches, last_active)。
 
-        ``on_export(branch_ids, branch_labels, fmt, target)`` 由上层执行写出，
+        ``on_export(branch_ids, branch_labels, fmt, target, include_model_info)`` 执行写出，
         结果反馈也由上层负责（面板在点击后立即关闭）。
         """
         super().__init__(parent, "导出", width=470)
@@ -170,6 +170,12 @@ class ExportPanel(FloatingPanel):
         hint = QLabel("多选时每个分支独立保存为编号文件；HTML 内嵌图片，其他格式仅含文本。")
         hint.setWordWrap(True)
         root.addWidget(hint)
+
+        self._include_model_info = QCheckBox("包含模型和站点信息（仅 HTML）")
+        self._include_model_info.setChecked(False)
+        self._include_model_info.setToolTip("默认不导出模型、站点和路由原因；消息正文不做脱敏。")
+        self._fmt["html"].toggled.connect(self._include_model_info.setEnabled)
+        root.addWidget(self._include_model_info)
 
         # ---- 文件名 ----
         name_row = QHBoxLayout()
@@ -260,5 +266,9 @@ class ExportPanel(FloatingPanel):
         ):
             self._error.setText("请输入有效的文件名，不要包含路径或特殊字符。")
             return
+        include_model_info = fmt == "html" and self._include_model_info.isChecked()
         self.close_panel()
-        self._on_export(branch_ids, labels, fmt, Path(directory) / name)
+        self._on_export(
+            branch_ids, labels, fmt, Path(directory) / name,
+            include_model_info,
+        )

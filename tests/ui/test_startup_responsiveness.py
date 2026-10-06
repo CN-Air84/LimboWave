@@ -189,3 +189,64 @@ def test_settings_import_is_deferred_and_widgets_are_built_on_gui_thread(
             loop.run_until_complete(shutdown())
         loop.close()
         asyncio.set_event_loop(None)
+
+
+def test_startup_does_not_load_opt_in_lan_or_warm_storage(
+    qtbot, tmp_path, vault_key, monkeypatch
+):
+    from limbowave.infrastructure.conversation_process import ConversationProcess
+
+    imported = []
+    original_import = builtins.__import__
+
+    def record_import(name, *args, **kwargs):
+        if name in {
+            "limbowave.web.server", "limbowave.ui.lan_access_panel",
+            "limbowave.application.services.runtime_facade",
+        }:
+            imported.append(name)
+        return original_import(name, *args, **kwargs)
+
+    async def unexpected_warm(_self):
+        pytest.fail("an unused storage process must not block startup")
+
+    monkeypatch.setattr(builtins, "__import__", record_import)
+    monkeypatch.setattr(ConversationProcess, "warm", unexpected_warm)
+    monkeypatch.setattr(shell, "probe_shell", lambda *args: None)
+    monkeypatch.setattr(app, "_build_kernel", lambda *args, **kwargs: None)
+    window = MainWindow()
+    qtbot.addWidget(window)
+    loop = QEventLoop(QApplication.instance())
+    asyncio.set_event_loop(loop)
+    shutdown = None
+    try:
+        _, _, _, finish, shutdown = app._wire(
+            window, AppPaths(tmp_path, tmp_path / "logs"), vault_key,
+            appearance_prepared=True,
+        )
+        assert imported == []
+        assert window.findChild(QWidget, "lanAccessPanel") is None
+        assert window.findChild(QWidget, "settingsPage") is None
+        loop.run_until_complete(finish())
+    finally:
+        if shutdown is not None:
+            loop.run_until_complete(shutdown())
+        loop.close()
+        asyncio.set_event_loop(None)
+
+
+def test_ready_path_does_not_prewarm_settings():
+    import ast
+    import inspect
+    import textwrap
+
+    gui = ast.parse(textwrap.dedent(inspect.getsource(app._run_gui)))
+    startup = next(
+        node for node in ast.walk(gui)
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_startup"
+    )
+    assert not any(
+        isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        and node.func.id in {"warm_settings", "_warm_settings"}
+        for node in ast.walk(startup)
+    ), "optional widget construction must not delay chat readiness"

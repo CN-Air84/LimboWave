@@ -37,6 +37,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = REPO_ROOT / "src"
 DEFAULT_DIST = REPO_ROOT / "dist" / "pyinstaller"
 WORK_DIR = REPO_ROOT / "build" / "packager"
+WEB_DIR = REPO_ROOT / "web"
+WEB_STATIC_DIR = SRC_DIR / "limbowave" / "web" / "static"
 
 # 代码里用 Path(__file__) 相对加载的文件资源，PyInstaller 的静态分析看不到，
 # 必须显式收集；目标目录与包内相对路径一一对应。
@@ -47,6 +49,7 @@ DATA_BUNDLES: tuple[tuple[Path, str], ...] = (
         SRC_DIR / "limbowave/infrastructure/crypto/hello_check.ps1",
         "limbowave/infrastructure/crypto",
     ),
+    (WEB_STATIC_DIR, "limbowave/web/static"),
 )
 
 _ICON_SIZES = ((256, 256), (128, 128), (64, 64), (48, 48), (32, 32), (24, 24), (16, 16))
@@ -168,6 +171,42 @@ def _render_svg(source: Path, size: int = 256) -> Image.Image:
     return Image.open(io.BytesIO(bytes(buffer.data())))
 
 
+def build_web_assets(
+    log: Callable[[str], None] = print,
+    on_spawn: Callable[[subprocess.Popen[str]], None] = lambda process: None,
+) -> None:
+    """构建生产前端；不允许缺 npm、构建失败或空输出时继续冻结旧页面。"""
+    npm = shutil.which("npm.cmd" if sys.platform == "win32" else "npm")
+    if npm is None:
+        raise BuildError("未找到 npm，请安装 Node.js（含 npm）并加入 PATH 后重新打包。")
+    for filename in ("package.json", "package-lock.json"):
+        if not (WEB_DIR / filename).is_file():
+            raise BuildError(f"前端构建缺少 {WEB_DIR / filename}；不能跳过 npm ci。")
+    for step in (("ci",), ("run", "typecheck"), ("run", "build", "--", "--emptyOutDir")):
+        args = [npm, *step]
+        label = "npm " + " ".join(step)
+        log("$ " + subprocess.list2cmdline(args))
+        try:
+            process = subprocess.Popen(
+                args, cwd=WEB_DIR, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding="utf-8", errors="replace", bufsize=1,
+            )
+        except OSError as exc:
+            raise BuildError(f"无法启动 {label}：{exc}") from exc
+        on_spawn(process)
+        assert process.stdout is not None
+        for line in process.stdout:
+            log(line.rstrip("\n"))
+        code = process.wait()
+        if code != 0:
+            raise BuildError(f"{label} 退出码 {code}，停止打包，详见上方日志。")
+    index = WEB_STATIC_DIR / "index.html"
+    if not index.is_file() or index.stat().st_size == 0:
+        raise BuildError(f"前端构建未生成非空入口：{index}")
+    if not any(p.is_file() and p.stat().st_size for p in WEB_STATIC_DIR.rglob("*.js")):
+        raise BuildError(f"前端构建未生成 JavaScript 资源：{WEB_STATIC_DIR}")
+
+
 def run_build(
     options: BuildOptions,
     work_dir: Path,
@@ -181,6 +220,7 @@ def run_build(
     missing = _missing_dependency()
     if missing is not None:
         raise BuildError(missing)
+    build_web_assets(log, on_spawn)
     work_dir.mkdir(parents=True, exist_ok=True)
     icon = options.icon
     if icon is not None and sys.platform != "win32":
