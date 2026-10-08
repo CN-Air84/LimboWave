@@ -11,7 +11,7 @@
 8. 超长单行（截断 + 如实标记）
 9. 中文与混合换行符（\\n / \\r\\n / \\r）
 
-另加：行号从 1 开始、不擅自截取、编码检测、DOCX 明确拒绝。
+另加：行号从 1 开始、不擅自截取、编码检测、不支持的类型明确拒绝。
 """
 
 from __future__ import annotations
@@ -257,9 +257,9 @@ def test_end_before_start_rejected(service: FileService, tmp_path: Path) -> None
         service.read(doc.id, 5, 2)
 
 
-def test_docx_explicitly_rejected(service: FileService, tmp_path: Path) -> None:
-    """DOCX 明确标记为不支持，而不是错误解析。"""
-    path = _write(tmp_path / "doc.docx", b"PK\x03\x04 fake docx")
+def test_pdf_explicitly_rejected(service: FileService, tmp_path: Path) -> None:
+    """PDF 明确标记为不支持，而不是错误解析。"""
+    path = _write(tmp_path / "doc.pdf", b"%PDF fake pdf")
     with pytest.raises(UnsupportedFileType, match="不支持"):
         service.index_path(path)
 

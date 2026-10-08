@@ -11,7 +11,7 @@
 7. 空文件、超长单行、中文与混合换行符都是一等公民（见测试矩阵）。
 
 稳定行号的实现：索引时按 **字节偏移** 记录每行起点（``line_offsets``），
-读取时按偏移切片原始字节再按登记编码解码——行号与内容一一对应，
+Word 先提取为 UTF-8 正文；读取时按偏移切片可读字节再按登记编码解码——行号与内容一一对应，
 不受后续格式化影响。
 """
 
@@ -24,7 +24,13 @@ from pathlib import Path
 from uuid import uuid4
 
 from limbowave.application.repositories import UnitOfWorkFactory
+from limbowave.application.services.word_reader import (
+    MAX_WORD_BYTES,
+    WordExtractionError,
+    extract_word_text,
+)
 from limbowave.domain.files import (
+    WORD_SUFFIXES,
     FileDocument,
     FileKind,
     UnsupportedFileType,
@@ -109,18 +115,18 @@ class FileService:
     # ---------- 索引（Task 4.1） ----------
 
     def index_path(self, path: Path) -> FileDocument:
-        """索引一个磁盘文件。不支持的类型抛 UnsupportedFileType（含 DOCX）。
+        """索引一个磁盘文件。不支持的类型抛 UnsupportedFileType（如 PDF）。
 
         重复索引同一路径：内容没变则返回既有登记卡，变了则**更新**登记卡
         （行号与哈希跟着新版本走——旧读取记录仍带旧哈希，可判定版本不一致）。
         """
         kind = classify_path(path)
         if not isinstance(kind, FileKind):
-            raise UnsupportedFileType(f"不是文本文件：{path.name}")
-        raw = path.read_bytes()
+            raise UnsupportedFileType(f"不是可读取的文档：{path.name}")
+        raw = _read_path(path)
         stat = path.stat()
-        encoding, _text = detect_encoding(raw)
-        line_offsets = _compute_line_offsets(raw)
+        encoding, readable = _readable_content(raw, path)
+        line_offsets = _compute_line_offsets(readable)
         content_hash = hashlib.sha256(raw).hexdigest()
 
         with self._uow_factory() as uow:
@@ -190,10 +196,14 @@ class FileService:
         # 变化检测：内容哈希与索引时不一致 → 先重建索引（行号跟着新内容走）
         current_hash = hashlib.sha256(raw).hexdigest()
         changed = current_hash != document.content_hash
+        encoding, readable = _readable_content(
+            raw,
+            Path(document.path) if document.path and document.blob_id is None else None,
+        )
         if changed:
-            document = self._reindex(document, raw)
+            document = self._reindex(document, raw, readable, encoding)
 
-        return self._slice(document, raw, start_line, end, changed)
+        return self._slice(document, readable, start_line, end, changed)
 
     # ---------- 内部 ----------
 
@@ -208,9 +218,15 @@ class FileService:
             return self._blob_store.get(document.blob_id)
         if document.path is None:
             raise FileReadError(f"文档 {document.id} 既没有路径也没有 blob")
-        return Path(document.path).read_bytes()
+        return _read_path(Path(document.path))
 
-    def _reindex(self, document: FileDocument, raw: bytes) -> FileDocument:
+    def _reindex(
+        self,
+        document: FileDocument,
+        raw: bytes,
+        readable: bytes,
+        encoding: str,
+    ) -> FileDocument:
         """内容变化后重建登记卡（新行偏移 + 新哈希），保留稳定 id。"""
         stat = Path(document.path).stat() if document.path else None
         rebuilt = FileDocument(
@@ -219,13 +235,13 @@ class FileService:
             display_name=document.display_name,
             path=document.path,
             blob_id=document.blob_id,
-            encoding=document.encoding,
-            line_count=len(_compute_line_offsets(raw)),
+            encoding=encoding,
+            line_count=len(_compute_line_offsets(readable)),
             size_bytes=len(raw),
             content_hash=hashlib.sha256(raw).hexdigest(),
             mtime_ns=stat.st_mtime_ns if stat else document.mtime_ns,
             created_at=document.created_at,
-            line_offsets=_compute_line_offsets(raw),
+            line_offsets=_compute_line_offsets(readable),
         )
         with self._uow_factory() as uow:
             uow.file_documents.update(rebuilt)
@@ -311,3 +327,27 @@ def _compute_line_offsets(raw: bytes) -> tuple[int, ...]:
         else:
             index += 1
     return tuple(offsets)
+
+
+def _read_path(path: Path) -> bytes:
+    """Bound Word input before loading it; ordinary text keeps its existing behavior."""
+    if path.suffix.lower() not in WORD_SUFFIXES:
+        return path.read_bytes()
+    with path.open("rb") as stream:
+        raw = stream.read(MAX_WORD_BYTES + 1)
+    if len(raw) > MAX_WORD_BYTES:
+        raise FileReadError(
+            f"Word 文件 {path.name} 超过 32 MiB，请拆分后另存为 .docx 或 .txt 再添加。"
+        )
+    return raw
+
+
+def _readable_content(raw: bytes, path: Path | None) -> tuple[str, bytes]:
+    """Keep fingerprints on source bytes and line offsets on extracted UTF-8 text."""
+    if path is not None and path.suffix.lower() in WORD_SUFFIXES:
+        try:
+            return "utf-8", extract_word_text(raw, path.suffix).encode("utf-8")
+        except WordExtractionError as exc:
+            raise FileReadError(f"{path.name}：{exc}") from exc
+    encoding, _text = detect_encoding(raw)
+    return encoding, raw

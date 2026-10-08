@@ -378,6 +378,7 @@ function registerProxiedTool(
 
 /** 应用侧工具名清单。**与 Python 侧 APP_TOOLS / _SCHEMAS 一一对应**（有测试守）。 */
 const APP_TOOL_NAMES = [
+  "get_current_datetime",
   "read_document",
   "list_directory",
   "stat_file",
@@ -393,10 +394,17 @@ const APP_TOOL_NAMES = [
 /** 应用侧工具清单。**与 Python 侧 tool_gateway._SCHEMAS 一一对应**（有测试守）。 */
 function registerAppTools(pi: ExtensionAPI): void {
   registerProxiedTool(pi, {
+    name: "get_current_datetime",
+    label: "获取当前日期和时间",
+    description: "获取此刻设备本地的日期、时间、星期和时区偏移。用户提到某个时间点且有需要时调用。用于确认当前时间或理解今天、明天等相对时间；不要凭记忆猜测当前时间。",
+    snippet: "用户提到某个时间点且有需要时调用",
+    parameters: Type.Object({}),
+  });
+  registerProxiedTool(pi, {
     name: "read_document",
     label: "读取附件文档",
     description:
-      "按 file_id 精确读取用户在消息里附加的 TXT/MD/剪贴板文档。行号从 1 开始，" +
+      "按 file_id 精确读取用户在消息里附加的 TXT/MD/Word（DOC/DOCX）/剪贴板文档。Word 读取正文与表格的提取文本（不含图片识别），行号不是页码。行号从 1 开始，" +
       "start_line/end_line 为闭区间，单次默认最多 200 行；超限会被拒绝并返回建议分段，" +
       "长文件请分段读取。用户消息的附件清单里会给出各文档的 file_id、名称与行数。",
     snippet: "读取用户附加的文本文档（按 file_id 与行范围，需分段）",

@@ -1,7 +1,7 @@
 """文件与附件的领域模型（Phase 4）。
 
 核心区分：
-- ``FileDocument``：被索引的 TXT/MD 文件（或剪贴板临时文档）的**登记卡**——
+- ``FileDocument``：被索引的 TXT/MD/Word 文件（或剪贴板临时文档）的**登记卡**——
   稳定 id、路径、行数、内容哈希、修改时间。文件内容本身不内嵌在登记卡里，
   磁盘文件直接读；剪贴板文档的内容在加密 blob 仓。
 - ``ImageAttachment``：图片附件登记卡。原图字节在加密 blob 仓。
@@ -11,7 +11,7 @@
 - **内容哈希 + mtime** 用于变化检测：文件被改后旧读取记录仍指向当时版本，
   或明确标记版本不一致。
 - 图片不压缩不缩放（原图直传）；任何处理都必须显式记录。
-- DOCX 明确不支持——``UnsupportedFileType``，不是错误解析。
+- Word 先提取正文与表格文字；PDF 等未支持类型明确拒绝。
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from pathlib import Path
 
 
 class FileKind(enum.StrEnum):
-    TEXT = "text"  # .txt
+    TEXT = "text"  # .txt，以及提取为文本的 .doc/.docx
     MARKDOWN = "markdown"  # .md
     CLIPBOARD = "clipboard"  # 剪贴板临时文档
 
@@ -34,16 +34,28 @@ class ImageFormat(enum.StrEnum):
 
 
 class UnsupportedFileType(Exception):
-    """不支持的文件类型（如 DOCX）。明确拒绝，不尝试错误解析。"""
+    """不支持的文件类型（如 PDF）。明确拒绝，不尝试错误解析。"""
 
 
 # 支持的后缀 → 类型
-_TEXT_SUFFIXES = {".txt": FileKind.TEXT, ".md": FileKind.MARKDOWN}
+WORD_SUFFIXES = frozenset({".doc", ".docx"})
+DOCUMENT_FILE_FILTER = "文档 (*.txt *.md *.doc *.docx)"
+ATTACHMENT_FILE_FILTER = "支持的文件 (*.txt *.md *.doc *.docx *.jpg *.jpeg *.png)"
+SUPPORTED_ATTACHMENTS_HINT = (
+    "支持 TXT、Markdown、Word（DOC/DOCX）、JPG、PNG；"
+    "Word 仅提取正文与表格文字，不含图片识别和排版；暂不支持 PDF"
+)
+_TEXT_SUFFIXES = {
+    ".txt": FileKind.TEXT,
+    ".md": FileKind.MARKDOWN,
+    ".doc": FileKind.TEXT,
+    ".docx": FileKind.TEXT,
+}
 _IMAGE_SUFFIXES = {".jpg": ImageFormat.JPEG, ".jpeg": ImageFormat.JPEG, ".png": ImageFormat.PNG}
 
 
 def classify_path(path: Path) -> FileKind | ImageFormat:
-    """按后缀分类。不支持的类型抛 UnsupportedFileType（含 DOCX）。"""
+    """按后缀分类。不支持的类型抛 UnsupportedFileType（如 PDF）。"""
     suffix = path.suffix.lower()
     if suffix in _TEXT_SUFFIXES:
         return _TEXT_SUFFIXES[suffix]
@@ -54,7 +66,7 @@ def classify_path(path: Path) -> FileKind | ImageFormat:
 
 @dataclass(frozen=True, slots=True)
 class FileDocument:
-    """TXT/MD/剪贴板文档的登记卡。不可变；文件变化后重建新卡（索引是版本化的）。"""
+    """TXT/MD/Word/剪贴板文档的登记卡。不可变；文件变化后重建新卡（索引是版本化的）。"""
 
     id: str
     kind: FileKind

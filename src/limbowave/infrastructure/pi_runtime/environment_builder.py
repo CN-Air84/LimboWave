@@ -31,6 +31,7 @@ PARAM_RULES_ENV = "LIMBOWAVE_PARAM_RULES"
 # 模型可用的工具清单：全部是应用侧实现（经工具 IPC 通道执行）。
 # 与扩展 registerAppTools() 及 tool_gateway._SCHEMAS 一一对应（有测试守）。
 APP_TOOLS = (
+    "get_current_datetime",
     "read_document",
     "list_directory",
     "stat_file",

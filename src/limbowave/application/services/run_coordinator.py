@@ -287,6 +287,7 @@ def _arbitrated[**CommandArgs, CommandResult: (bool, str | None)](
     method: Callable[Concatenate[RunCoordinator, CommandArgs], Awaitable[CommandResult]],
 ) -> Callable[Concatenate[RunCoordinator, CommandArgs], Awaitable[CommandResult]]:
     """Reserve state transitions, preserving the controller's typed return contract."""
+
     @wraps(method)
     async def wrapped(
         self: RunCoordinator, /, *args: CommandArgs.args, **kwargs: CommandArgs.kwargs
@@ -300,6 +301,7 @@ def _arbitrated[**CommandArgs, CommandResult: (bool, str | None)](
         except CommandBusy:
             rejected = False if method.__annotations__.get("return") in (bool, "bool") else None
             return cast(CommandResult, rejected)
+
     return wrapped
 
 
@@ -400,8 +402,10 @@ class RunCoordinator:
             task = asyncio.current_task()
         except RuntimeError:
             task = None
-        return self._busy or self._transitioning or (
-            self._command_owner is not None and self._command_owner is not task
+        return (
+            self._busy
+            or self._transitioning
+            or (self._command_owner is not None and self._command_owner is not task)
         )
 
     @property
@@ -429,8 +433,13 @@ class RunCoordinator:
             "conversation_id": live.conversation_id if live else self.conversation_id,
             "branch_id": live.branch_id if live else self.branch_id,
             "run_id": live.run_id if live else self.run_id,
-            "message_id": (live.assistant_message_id if live else
-                           self._last_assistant_message_id if self.run_id else None),
+            "message_id": (
+                live.assistant_message_id
+                if live
+                else self._last_assistant_message_id
+                if self.run_id
+                else None
+            ),
         }
 
     def stream_snapshot(self) -> dict[str, Any] | None:
@@ -439,11 +448,14 @@ class RunCoordinator:
         if live is None:
             return None
         return {
-            **self.event_scope(), "text": live.text, "thinking": live.thinking,
+            **self.event_scope(),
+            "text": live.text,
+            "thinking": live.thinking,
             "status": "running" if self._busy else "settled",
             "tools": public_tool_steps(live.tool_steps),
-            "segments": [{"content": part.content, "thinking": part.thinking}
-                         for part in live.segments],
+            "segments": [
+                {"content": part.content, "thinking": part.thinking} for part in live.segments
+            ],
         }
 
     @property
@@ -522,7 +534,8 @@ class RunCoordinator:
 
     def _diagnostic_context(self) -> dict[str, Any]:
         fields: dict[str, Any] = {
-            "conversation_id": self.conversation_id, "branch_id": self.branch_id,
+            "conversation_id": self.conversation_id,
+            "branch_id": self.branch_id,
             "run_id": self.run_id,
         }
         if self._live is not None:
@@ -538,10 +551,25 @@ class RunCoordinator:
             level, label = diagnostic
             fields = self._diagnostic_context()
             # 不复制事件载荷：正文、思考、附件、工具参数和逐 token 更新都不进调试日志。
-            fields.update({key: data[key] for key in (
-                "conversation_id", "branch_id", "run_id", "message_id", "user_message_id",
-                "tool_call_id", "phase", "is_error", "attempt", "max_attempts", "delay_ms",
-            ) if key in data})
+            fields.update(
+                {
+                    key: data[key]
+                    for key in (
+                        "conversation_id",
+                        "branch_id",
+                        "run_id",
+                        "message_id",
+                        "user_message_id",
+                        "tool_call_id",
+                        "phase",
+                        "is_error",
+                        "attempt",
+                        "max_attempts",
+                        "delay_ms",
+                    )
+                    if key in data
+                }
+            )
             if kind == TOOL:
                 fields["tool_name"] = data.get("name")
                 if data.get("is_error"):
@@ -554,9 +582,13 @@ class RunCoordinator:
             try:
                 handler(event)
             except Exception:
-                _LOG.exception("run.event_subscriber_failed", extra={
-                    **self._diagnostic_context(), "event_kind": kind,
-                })
+                _LOG.exception(
+                    "run.event_subscriber_failed",
+                    extra={
+                        **self._diagnostic_context(),
+                        "event_kind": kind,
+                    },
+                )
 
     async def _on_permission(self, title: str, detail: str) -> bool:
         if self._permission_handler is None:
@@ -663,17 +695,14 @@ class RunCoordinator:
         conversation_id: str,
         branch_id: str,
         known_has_messages: bool | None,
-        *, include_compression: bool = True,
+        *,
+        include_compression: bool = True,
     ) -> _SwitchPreparation:
         """同步读取和解密只做一遍；调用方负责把本方法放在线程中。"""
         with self._uow_factory() as uow:
             conversation = uow.conversations.get(conversation_id)
             branch = uow.branches.get(branch_id)
-            if (
-                conversation is None
-                or branch is None
-                or branch.conversation_id != conversation_id
-            ):
+            if conversation is None or branch is None or branch.conversation_id != conversation_id:
                 return _SwitchPreparation(valid=False)
             runs = uow.runs.list_for_conversation(conversation_id)
             mirrors = uow.runtime.list_for_conversation(conversation_id)
@@ -690,9 +719,7 @@ class RunCoordinator:
                 else bool(branch_path.branch_messages(uow, branch_id))
             )
         snapshot = (
-            self._runtime_states.build_branch_snapshot_from_records(
-                conversation, mirrors, leaf
-            )
+            self._runtime_states.build_branch_snapshot_from_records(conversation, mirrors, leaf)
             if leaf is not None
             else None
         )
@@ -761,7 +788,10 @@ class RunCoordinator:
 
     @_arbitrated
     async def apply_compression(
-        self, version_id: str, *, edited_summary: str | None = None,
+        self,
+        version_id: str,
+        *,
+        edited_summary: str | None = None,
     ) -> bool:
         """Apply the preview to the runtime before atomically marking it accepted."""
         return await self._change_compression(version_id, None, edited_summary)
@@ -772,28 +802,32 @@ class RunCoordinator:
         return await self._change_compression(None, branch_id, None)
 
     def _prepare_compression_change(
-        self, version_id: str | None, branch_id: str, edited_summary: str | None,
+        self,
+        version_id: str | None,
+        branch_id: str,
+        edited_summary: str | None,
     ) -> tuple[RuntimeStateSnapshot, CompressionVersion | None]:
         conversation_id = self._active_conversation_id
         if conversation_id is None:
-            raise ValueError('还没有会话可压缩')
-        prepared = self._prepare_switch(
-            conversation_id, branch_id, None, include_compression=False
-        )
+            raise ValueError("还没有会话可压缩")
+        prepared = self._prepare_switch(conversation_id, branch_id, None, include_compression=False)
         if prepared.snapshot is None:
-            raise ValueError('缺少可恢复的运行时记录，未修改上下文')
+            raise ValueError("缺少可恢复的运行时记录，未修改上下文")
         snapshot = prepared.snapshot
         with self._uow_factory() as uow:
             if version_id is None:
                 if uow.compressions.get_active(branch_id) is None:
-                    raise ValueError('当前分支没有启用的压缩版本')
+                    raise ValueError("当前分支没有启用的压缩版本")
                 return snapshot, None
             version = uow.compressions.get(version_id)
-            if (version is None or version.branch_id != branch_id
-                    or version.conversation_id != conversation_id):
-                raise ValueError('请先切回该压缩版本所属的会话分支')
+            if (
+                version is None
+                or version.branch_id != branch_id
+                or version.conversation_id != conversation_id
+            ):
+                raise ValueError("请先切回该压缩版本所属的会话分支")
             if version.status not in {CompressionStatus.PREVIEWED, CompressionStatus.ACCEPTED}:
-                raise ValueError('该版本尚未成功生成，不能启用')
+                raise ValueError("该版本尚未成功生成，不能启用")
             if edited_summary is not None:
                 version = version.with_edited_summary(edited_summary)
             messages = branch_path.branch_messages(uow, branch_id)
@@ -801,7 +835,9 @@ class RunCoordinator:
         return project_compression(snapshot, version, messages, mirrors), version
 
     def _commit_compression_change(
-        self, branch_id: str, version: CompressionVersion | None,
+        self,
+        branch_id: str,
+        version: CompressionVersion | None,
     ) -> None:
         with self._uow_factory() as uow:
             if version is None:
@@ -812,16 +848,23 @@ class RunCoordinator:
             uow.commit()
 
     async def _change_compression(
-        self, version_id: str | None, requested_branch: str | None,
+        self,
+        version_id: str | None,
+        requested_branch: str | None,
         edited_summary: str | None,
     ) -> bool:
         kernel, branch_id = self._kernel, self._active_branch_id
-        if (self.busy or not self._runtime_valid or kernel is None or branch_id is None
-                or (requested_branch is not None and requested_branch != branch_id)):
-            self._emit(ERROR, message='当前正忙或分支已切换，未应用压缩')
+        if (
+            self.busy
+            or not self._runtime_valid
+            or kernel is None
+            or branch_id is None
+            or (requested_branch is not None and requested_branch != branch_id)
+        ):
+            self._emit(ERROR, message="当前正忙或分支已切换，未应用压缩")
             return False
         if not kernel.capabilities().has(KernelCapability.RUNTIME_RESTORE):
-            self._emit(ERROR, message='当前内核不支持应用压缩上下文')
+            self._emit(ERROR, message="当前内核不支持应用压缩上下文")
             return False
         conversation_id = self._active_conversation_id
         assert conversation_id is not None
@@ -835,7 +878,7 @@ class RunCoordinator:
                 try:
                     result = await kernel.restore_runtime_state(snapshot)
                     if result is None or not result.success:
-                        raise RuntimeError(getattr(result, 'error', None) or '应用压缩上下文失败')
+                        raise RuntimeError(getattr(result, "error", None) or "应用压缩上下文失败")
                     await run_blocking(self._commit_compression_change, branch_id, version)
                     self._runtime_valid = True
                 except BaseException:
@@ -855,7 +898,7 @@ class RunCoordinator:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            self._emit(ERROR, message=f'应用压缩失败：{redact_text(str(exc))}')
+            self._emit(ERROR, message=f"应用压缩失败：{redact_text(str(exc))}")
             return False
 
     # ---------- 分支（Task 3.2） ----------
@@ -894,8 +937,8 @@ class RunCoordinator:
     async def retry_user_message(self, message_id: str) -> str | None:
         """重试一条发送失败的用户消息。
 
-        无论内核是否已有运行时记录，都在当前分支重发原文，不分叉。
-        旧运行与部分输出保留，新尝试由标准 send 路径记为新一轮。
+        保留旧运行与部分输出的审计记录，但先恢复最初尝试之前的模型上下文。
+        新尝试仍由标准 send 路径落库并复用气泡，不创建应用分支。
         """
         if self.busy:
             self._emit(ERROR, message="上一条回复还在进行中，请先等待或停止")
@@ -907,7 +950,13 @@ class RunCoordinator:
             return None
         try:
             with self.runtime_transition():
-                text, payload = await self._storage_call("_prepare_retry", message_id)
+                self._memory_cancelled = False
+                text, payload, prepared = await self._storage_call("_prepare_retry", message_id)
+                if self._memory_cancelled:
+                    return None
+                await self._restore_retry_context(prepared)
+                if self._memory_cancelled:
+                    return None
         except Exception as exc:
             self._emit(ERROR, message=f"重试准备失败：{redact_text(str(exc))}")
             return None
@@ -919,17 +968,92 @@ class RunCoordinator:
             _retry_of_message_id=message_id,
         )
 
-    def _prepare_retry(self, message_id: str) -> tuple[str, AttachmentPayload]:
+    def _prepare_retry(
+        self, message_id: str, *, rebuild_attachments: bool = True,
+    ) -> tuple[str, AttachmentPayload, _SwitchPreparation]:
+        """恢复边界按消息 ID/重试链计算，绝不按重复文本删历史。"""
         with self._uow_factory() as uow:
             message = uow.messages.get(message_id)
             if message is None or message.role is not MessageRole.USER:
                 raise ValueError("找不到要重试的用户消息")
-            if (message.conversation_id != self._active_conversation_id
-                    or self._active_branch_id is None
-                    or not any(m.id == message_id for m in
-                               branch_path.branch_messages(uow, self._active_branch_id))):
-                raise ValueError("只能重试当前分支中的用户消息")
-        return message.content, self._attachments_for_message(message_id)
+            messages = branch_path.branch_messages(uow, self._active_branch_id or "")
+            users = [m for m in messages if m.role is MessageRole.USER]
+            if (
+                message.conversation_id != self._active_conversation_id
+                or not users or users[-1].id != message_id
+            ):
+                raise ValueError("只能重试当前分支最后一条用户消息")
+            runs = uow.runs.list_for_conversation(message.conversation_id)
+            runs_by_user = {run.user_message_id: run for run in runs}
+            source_id = message_id
+            seen: set[str] = set()
+            while source_id in runs_by_user:
+                if source_id in seen:
+                    raise ValueError("重试来源存在循环，无法安全恢复上下文")
+                seen.add(source_id)
+                previous = runs_by_user[source_id].retry_of_message_id
+                if previous is None:
+                    break
+                source_id = previous
+            source_index = next((i for i, m in enumerate(messages) if m.id == source_id), None)
+            if source_index is None:
+                raise ValueError("重试来源不在当前分支，无法安全恢复上下文")
+            prefix = messages[:source_index]
+            snapshot = None
+            if prefix:
+                conversation = uow.conversations.get(message.conversation_id)
+                branch = uow.branches.get(self._active_branch_id or "")
+                assert branch is not None
+                mirrors = uow.runtime.list_for_conversation(message.conversation_id)
+                # Prefer the original user's parent: it includes tool results and native
+                # compaction entries immediately preceding the attempt. If Pi never
+                # accepted that user, fall back to the preceding committed run's leaf.
+                entry_id = self._entry_for_message(uow, message.conversation_id, source_id)
+                source = next((m for m in mirrors if m.entry_id == entry_id), None)
+                prefix_ids = {m.id for m in prefix}
+                leaf = source.parent_entry_id if source is not None else (
+                    branch_path.branch_leaf_entry_from_records(
+                        branch, [run for run in runs if run.user_message_id in prefix_ids], mirrors,
+                    )
+                )
+                if leaf is not None:
+                    snapshot = self._runtime_states.build_branch_snapshot_from_records(
+                        conversation, mirrors, leaf,
+                    )
+                if snapshot is None:
+                    raise ValueError("重试前的历史缺少运行时记录，未重发消息")
+                snapshot = uncompressed_snapshot(snapshot)
+                compression = uow.compressions.get_active(branch.id)
+                if compression is not None:
+                    snapshot = project_compression(snapshot, compression, prefix, mirrors)
+            uow.commit()  # persist any legacy orphan-link repair performed above
+        payload = (
+            self._attachments_for_message(message_id)
+            if rebuild_attachments else AttachmentPayload()
+        )
+        return message.content, payload, _SwitchPreparation(
+            valid=True, has_messages=bool(prefix), snapshot=snapshot,
+        )
+
+    async def _restore_retry_context(self, prepared: _SwitchPreparation) -> None:
+        """Only mutate the runtime, never application branches or prior attempt audits."""
+        kernel = self._kernel
+        if kernel is None:
+            raise RuntimeError("未配置可用的模型内核")
+        snapshot = prepared.snapshot
+        if snapshot is not None and snapshot.entries:
+            if not kernel.capabilities().has(KernelCapability.RUNTIME_RESTORE):
+                raise RuntimeError("当前内核不支持恢复重试上下文，未重发消息")
+            self._runtime_valid = False
+            result = await kernel.restore_runtime_state(snapshot)
+            if result is None or not result.success:
+                raise RuntimeError(getattr(result, "error", None) or "恢复重试上下文失败")
+        elif prepared.has_messages:
+            raise RuntimeError("重试前的历史缺少运行时记录，未重发消息")
+        else:
+            self._runtime_valid = False
+            await kernel.new_session()
+        self._runtime_valid = True
 
     @_arbitrated
     async def fork_message(self, assistant_message_id: str) -> str | None:
@@ -990,7 +1114,8 @@ class RunCoordinator:
             BRANCHED,
             branch_id=branch.id,
             parent_branch_id=branch.parent_branch_id,
-            from_message_id=assistant_message_id, history=history,
+            from_message_id=assistant_message_id,
+            history=history,
         )
         return str(branch.id)
 
@@ -1023,7 +1148,8 @@ class RunCoordinator:
                 self._runtime_states.build_branch_snapshot_from_records(
                     uow.conversations.get(target.conversation_id), mirrors, leaf
                 )
-                if leaf is not None else None
+                if leaf is not None
+                else None
             )
             if snapshot is None or not snapshot.entries:
                 raise ValueError("该回复没有完整的运行时记录，无法分叉")
@@ -1033,7 +1159,7 @@ class RunCoordinator:
                 memory_anchor = run.user_message_id
 
         index = next(i for i, message in enumerate(messages) if message.id == target.id)
-        history = history_payload(messages[:index + 1], uow_factory=self._uow_factory)
+        history = history_payload(messages[: index + 1], uow_factory=self._uow_factory)
         return branch, snapshot, memory_anchor, history
 
     @_arbitrated
@@ -1052,9 +1178,13 @@ class RunCoordinator:
         if prepared.retry_in_place:
             return await self.retry_user_message(prepared.source.id)
         return await self._fork_and_send(
-            prepared.source.id, prepared.source.content, require_role=MessageRole.USER,
-            attachment_ids=prepared.payload.attachment_ids, images=prepared.payload.images,
-            document_note=prepared.payload.document_note, _prepared=prepared,
+            prepared.source.id,
+            prepared.source.content,
+            require_role=MessageRole.USER,
+            attachment_ids=prepared.payload.attachment_ids,
+            images=prepared.payload.images,
+            document_note=prepared.payload.document_note,
+            _prepared=prepared,
         )
 
     def _prepare_regeneration(self, assistant_message_id: str) -> _BranchPreparation:
@@ -1066,15 +1196,17 @@ class RunCoordinator:
             if not any(m.id == target.id for m in messages):
                 raise ValueError("只能重新生成当前分支中的助手回复")
             run = uow.runs.get(target.run_id) if target.run_id else None
-            users = [m for m in messages if m.role is MessageRole.USER
-                     and m.created_at <= target.created_at]
+            users = [
+                m
+                for m in messages
+                if m.role is MessageRole.USER and m.created_at <= target.created_at
+            ]
             if not users:
                 raise ValueError("找不到可重生成的用户消息")
             source = (uow.messages.get(run.user_message_id) if run else None) or users[-1]
             retry = target.status in {MessageStatus.PARTIAL, MessageStatus.FAILED} or (
-                run is not None and run.status in {
-                    RunStatus.FAILED, RunStatus.ABORTED, RunStatus.INTERRUPTED
-                }
+                run is not None
+                and run.status in {RunStatus.FAILED, RunStatus.ABORTED, RunStatus.INTERRUPTED}
             )
         if retry:
             return _BranchPreparation(source, None, [], retry_in_place=True)
@@ -1096,14 +1228,21 @@ class RunCoordinator:
             # Commit only repaired orphan links here, before leaving the worker transaction.
             uow.commit()
         # 先带上分叉来源完成重试折叠，再移除它；先截断会让旧尝试复活。
-        prefix = [entry for entry in history_payload(
-            messages[:index + 1], uow_factory=self._uow_factory,
-            branch_id=self._active_branch_id,
-        ) if entry.message_id != source.id]
+        prefix = [
+            entry
+            for entry in history_payload(
+                messages[: index + 1],
+                uow_factory=self._uow_factory,
+                branch_id=self._active_branch_id,
+            )
+            if entry.message_id != source.id
+        ]
         return _BranchPreparation(source, entry, prefix)
 
     def _persist_branch(
-        self, branch: Branch, memory_anchor: str,
+        self,
+        branch: Branch,
+        memory_anchor: str,
     ) -> tuple[list[HistoryEntry], RuntimeStateSnapshot | None]:
         with self._uow_factory() as uow:
             uow.branches.add(branch)
@@ -1114,8 +1253,11 @@ class RunCoordinator:
         history = history_payload(messages, uow_factory=self._uow_factory, branch_id=branch.id)
         # Native fork may drop an appended compaction, or retain an obsolete overlay.
         # Rebuild only when needed; branching-only kernels keep their existing path.
-        snapshot = (self._prepare_switch(branch.conversation_id, branch.id, None).snapshot
-                    if has_compression else None)
+        snapshot = (
+            self._prepare_switch(branch.conversation_id, branch.id, None).snapshot
+            if has_compression
+            else None
+        )
         return history, snapshot
 
     async def _restore_branch_compression(self, snapshot: RuntimeStateSnapshot | None) -> None:
@@ -1152,7 +1294,11 @@ class RunCoordinator:
         return await self.switch_conversation(self._active_conversation_id, branch_id)
 
     async def _fork_and_send(
-        self, message_id: str, text: str, *, require_role: MessageRole,
+        self,
+        message_id: str,
+        text: str,
+        *,
+        require_role: MessageRole,
         attachment_ids: list[str] | None = None,
         images: list[dict[str, Any]] | None = None,
         document_note: str | None = None,
@@ -1206,8 +1352,11 @@ class RunCoordinator:
             self._emit(ERROR, message=f"分叉失败：{redact_text(str(exc))}")
             return None
         self._emit(
-            BRANCHED, branch_id=branch.id, parent_branch_id=branch.parent_branch_id,
-            from_message_id=message_id, history=history,
+            BRANCHED,
+            branch_id=branch.id,
+            parent_branch_id=branch.parent_branch_id,
+            from_message_id=message_id,
+            history=history,
         )
         if self.branch_ready is not None:
             # A different history window needs incremental Qt rendering; USER must follow it.
@@ -1389,12 +1538,13 @@ class RunCoordinator:
         self._command_owner = None
         self._memory_cancelled = False
         # message_id 随事件带出：分支操作（编辑/重生成）要以消息为锚点
-        retry_data = (
-            {"retry_of_message_id": _retry_of_message_id} if _retry_of_message_id else {}
-        )
+        retry_data = {"retry_of_message_id": _retry_of_message_id} if _retry_of_message_id else {}
         self._emit(
-            USER, text=text, message_id=user_message_id,
-            attachment_ids=tuple(attachment_ids), **retry_data,
+            USER,
+            text=text,
+            message_id=user_message_id,
+            attachment_ids=tuple(attachment_ids),
+            **retry_data,
         )
 
         self._transitioning = True
@@ -1404,19 +1554,7 @@ class RunCoordinator:
                 await self.before_prompt()
             if self._cancel_before_prompt(self._live):
                 return run_id
-            if self.memory_service is not None and self.memory_context is not None:
-                self.memory_service.clear_approvals()
-                await self._kernel.set_memory_context(
-                    await self._storage_call("_memory_prompt", self.memory_context)
-                )
-            if self._cancel_before_prompt(self._live):
-                return run_id
-            # Attachment identity is application state, not part of a lossy model summary.
-            # Sync even an empty manifest so a previous branch's references cannot linger.
-            await self._kernel.set_attachment_context(
-                await self._storage_call("_attachment_prompt", run_id, branch_id)
-            )
-            if self._cancel_before_prompt(self._live):
+            if not await self._sync_prompt_context(self._live):
                 return run_id
             # 注记只进内核 prompt；落库的用户消息保持原文（审计与 UI 都看原文）。
             # 运行时镜像记录的是内核实际收到的 prompt，恢复/fork 不会丢附件线索。
@@ -1438,6 +1576,21 @@ class RunCoordinator:
         finally:
             self._transitioning = False
         return run_id
+
+    async def _sync_prompt_context(self, live: _LiveRun) -> bool:
+        """Session restore clears extension context; rebind it on every attempt."""
+        assert self._kernel is not None
+        if self.memory_service is not None and self.memory_context is not None:
+            self.memory_service.clear_approvals()
+            await self._kernel.set_memory_context(
+                await self._storage_call("_memory_prompt", self.memory_context)
+            )
+        if self._cancel_before_prompt(live):
+            return False
+        await self._kernel.set_attachment_context(
+            await self._storage_call("_attachment_prompt", live.run_id, live.branch_id)
+        )
+        return not self._cancel_before_prompt(live)
 
     def _cancel_before_prompt(self, live: _LiveRun) -> bool:
         if self._live is not live or live.finalize_scheduled or not self._busy:
@@ -1497,12 +1650,14 @@ class RunCoordinator:
                     seen.add(attachment_id)
                     document = uow.file_documents.get(attachment_id)
                     if document is not None:
-                        documents.append({
-                            "file_id": document.id,
-                            "name": document.display_name,
-                            "path": document.path,
-                            "line_count": document.line_count,
-                        })
+                        documents.append(
+                            {
+                                "file_id": document.id,
+                                "name": document.display_name,
+                                "path": document.path,
+                                "line_count": document.line_count,
+                            }
+                        )
         return {"run_id": run_id, "branch_id": branch_id, "documents": documents}
 
     def _memory_prompt(self, context: MemoryRunContext) -> dict[str, object]:
@@ -1636,19 +1791,28 @@ class RunCoordinator:
                 prepared: ToolStep | None = None
                 if live is not None and event.kind in {"tool.start", "tool.end"}:
                     call_id = str(event.payload.get("toolCallId") or "")
-                    previous = next((step for step in live.tool_steps
-                                     if step.tool_call_id == call_id), None)
+                    previous = next(
+                        (step for step in live.tool_steps if step.tool_call_id == call_id), None
+                    )
                     started = live.tool_started_at.get(call_id)
-                    duration = (max(0, int((received_at - started) * 1000))
-                                if started is not None
-                                else previous.duration_ms if previous is not None else 0)
-                    offset = max(0, int(
-                        (received_at - (live.run_started_monotonic or received_at)) * 1000
-                    ))
+                    duration = (
+                        max(0, int((received_at - started) * 1000))
+                        if started is not None
+                        else previous.duration_ms
+                        if previous is not None
+                        else 0
+                    )
+                    offset = max(
+                        0, int((received_at - (live.run_started_monotonic or received_at)) * 1000)
+                    )
                     try:
                         prepared = await self._storage_call(
-                            "prepare_tool_event", event.kind, event.payload, previous,
-                            offset, duration,
+                            "prepare_tool_event",
+                            event.kind,
+                            event.payload,
+                            previous,
+                            offset,
+                            duration,
                         )
                     except Exception as exc:
                         # Never repeat failed CPU work on the GUI thread. Keep the original
@@ -1656,12 +1820,18 @@ class RunCoordinator:
                         message = f"工具步骤处理失败：{redact_text(str(exc))}"
                         self._emit(ERROR, message=message)
                         prepared = replace(
-                            previous or ToolStep(
-                                call_id, str(event.payload.get("toolName") or "tool"),
-                                created_at_ms=offset, args=dict(event.payload.get("args") or {}),
+                            previous
+                            or ToolStep(
+                                call_id,
+                                str(event.payload.get("toolName") or "tool"),
+                                created_at_ms=offset,
+                                args=dict(event.payload.get("args") or {}),
                             ),
-                            status=ToolStatus.ERROR, error=message, duration_ms=duration,
-                            display_summary="工具步骤处理失败", display_detail=message,
+                            status=ToolStatus.ERROR,
+                            error=message,
+                            duration_ms=duration,
+                            display_summary="工具步骤处理失败",
+                            display_detail=message,
                         )
                     if self._live is not live:
                         continue
@@ -1670,7 +1840,10 @@ class RunCoordinator:
             self._kernel_event_task = None
 
     def _handle_kernel_event(
-        self, event: KernelEvent, *, prepared: ToolStep | None = None,
+        self,
+        event: KernelEvent,
+        *,
+        prepared: ToolStep | None = None,
         received_at: float | None = None,
     ) -> None:
         kind = event.kind
@@ -1836,7 +2009,7 @@ class RunCoordinator:
 
     def _should_retry(self, live: _LiveRun) -> bool:
         """是否该重试这一轮。**分类来自领域规则，这里只做编排判断。**"""
-        if live.error is None or live.route_error:
+        if live.error is None or live.route_error or not self._runtime_valid:
             return False
         policy = self._retry_policy()
         error_class = self._classify_failure(live)
@@ -1921,15 +2094,35 @@ class RunCoordinator:
                 return  # 期间被取消/切走
             self._transitioning = True
             try:
+                try:
+                    _, _, prepared = await self._storage_call(
+                        "_prepare_retry", live.user_message_id, rebuild_attachments=False,
+                    )
+                    if self._cancel_before_prompt(live):
+                        return
+                    await self._restore_retry_context(prepared)
+                except Exception:
+                    # A context failure is not a provider connection failure, even
+                    # when its error text contains "timeout". Never blindly resend.
+                    self._runtime_valid = False
+                    raise
+                if self._cancel_before_prompt(live):
+                    return
                 await self._prepare_route(live)
                 if self._cancel_before_prompt(live):
                     return
-                await self._kernel.send_message(live.user_text, images=live.images or None)
+                if not await self._sync_prompt_context(live):
+                    return
+                await self._kernel.send_message(
+                    live.sent_prompt if live.sent_prompt is not None else live.user_text,
+                    images=live.images or None,
+                )
             except Exception as exc:
                 if self._cancel_before_prompt(live):
                     return
                 live.route_error = isinstance(exc, RouteMismatchError)
                 live.error = redact_text(str(exc))
+                live.stop_reason = "error"
                 self._on_settled()  # 再走一次判定（可能还有次数）
             finally:
                 self._transitioning = False
@@ -1998,15 +2191,20 @@ class RunCoordinator:
     @staticmethod
     def _remember_segment(live: _LiveRun) -> None:
         if live.text or live.thinking or live.segment_tool_call_ids:
-            live.segments.append(AssistantMessageSegment(
-                content=live.text,
-                thinking=live.thinking,
-                tool_call_ids=tuple(live.segment_tool_call_ids),
-            ))
+            live.segments.append(
+                AssistantMessageSegment(
+                    content=live.text,
+                    thinking=live.thinking,
+                    tool_call_ids=tuple(live.segment_tool_call_ids),
+                )
+            )
 
     def _record_tool_start(
-        self, live: _LiveRun | None, payload: dict[str, Any],
-        prepared: ToolStep | None = None, received_at: float | None = None,
+        self,
+        live: _LiveRun | None,
+        payload: dict[str, Any],
+        prepared: ToolStep | None = None,
+        received_at: float | None = None,
     ) -> ToolStep | None:
         """记开始事件；同一份权威记录同步传给 UI，而不是只发名称和状态。"""
         if live is None:
@@ -2033,8 +2231,11 @@ class RunCoordinator:
         return step
 
     def _record_tool_end(
-        self, live: _LiveRun | None, payload: dict[str, Any],
-        prepared: ToolStep | None = None, received_at: float | None = None,
+        self,
+        live: _LiveRun | None,
+        payload: dict[str, Any],
+        prepared: ToolStep | None = None,
+        received_at: float | None = None,
     ) -> ToolStep | None:
         """补全状态、结果、耗时和错误，保留原步骤的分段归属。"""
         if live is None:
@@ -2048,7 +2249,9 @@ class RunCoordinator:
         for index, step in enumerate(live.tool_steps):
             if step.tool_call_id == call_id:
                 done = prepared or finish_tool_step(
-                    step, result=result, is_error=is_error,
+                    step,
+                    result=result,
+                    is_error=is_error,
                     duration_ms=duration_ms if started is not None else step.duration_ms,
                 )
                 live.tool_steps[index] = done
@@ -2061,7 +2264,9 @@ class RunCoordinator:
                 created_at_ms=self._offset_ms(live),
                 args=dict(payload.get("args") or {}),
             ),
-            result=result, is_error=is_error, duration_ms=duration_ms,
+            result=result,
+            is_error=is_error,
+            duration_ms=duration_ms,
         )
         live.tool_steps.append(done)
         live.segment_tool_call_ids.append(call_id)
@@ -2188,12 +2393,18 @@ class RunCoordinator:
             )
             uow.commit()
 
-        _LOG.info("run.finalized", extra={
-            "run_id": live.run_id, "conversation_id": live.conversation_id,
-            "branch_id": live.branch_id, "status": status.value,
-            "duration_ms": max(0, round((time.monotonic() - live.run_started_monotonic) * 1000))
-            if live.run_started_monotonic is not None else None,
-        })
+        _LOG.info(
+            "run.finalized",
+            extra={
+                "run_id": live.run_id,
+                "conversation_id": live.conversation_id,
+                "branch_id": live.branch_id,
+                "status": status.value,
+                "duration_ms": max(0, round((time.monotonic() - live.run_started_monotonic) * 1000))
+                if live.run_started_monotonic is not None
+                else None,
+            },
+        )
         if status is RunStatus.INTERRUPTED:
             self._emit(
                 RUN_INTERRUPTED,

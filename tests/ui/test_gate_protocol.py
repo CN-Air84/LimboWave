@@ -221,3 +221,12 @@ def test_run_context_tracks_logical_model_switch() -> None:
     state["value"] = second
     assert context().logical_model_id == "model-b"
     assert context().endpoint_id == "relay-b"
+
+
+@pytest.mark.parametrize("preset", list(PermissionPreset))
+async def test_current_datetime_respects_permission_preset(
+    gate_env: tuple[PermissionService, ToolGateway], preset: PermissionPreset,
+) -> None:
+    handler = _handler(gate_env, preset)
+    allowed = await handler(*_gate("get_current_datetime", {}))
+    assert allowed is (preset is not PermissionPreset.CHAT_ONLY)

@@ -27,8 +27,12 @@ from limbowave.ui.settings_panel import SettingsPage
     ],
 )
 def test_data_security_page_relays_data_requests(
-    qtbot: QtBot, tmp_path: Path, vault_key: VaultKey,
-    with_vault: bool, button_text: str, signal_name: str,
+    qtbot: QtBot,
+    tmp_path: Path,
+    vault_key: VaultKey,
+    with_vault: bool,
+    button_text: str,
+    signal_name: str,
 ) -> None:
     from PySide6.QtWidgets import QPushButton
 
@@ -59,7 +63,10 @@ def test_data_security_page_relays_data_requests(
 
 @pytest.mark.parametrize("title", ["数据", "安全", "数据与安全"])
 def test_data_security_navigation_selects_merged_page(
-    qtbot: QtBot, tmp_path: Path, vault_key: VaultKey, title: str,
+    qtbot: QtBot,
+    tmp_path: Path,
+    vault_key: VaultKey,
+    title: str,
 ) -> None:
     settings = SettingsService(ConfigurationService(JsonConfigRepository(tmp_path / "config.json")))
     credentials = CredentialService(SecretStore(vault_key, tmp_path / "vault" / "secrets.json"))
@@ -73,7 +80,9 @@ def test_data_security_navigation_selects_merged_page(
 
 
 def test_data_security_page_scrolls_to_reset_in_small_window(
-    qtbot: QtBot, tmp_path: Path, vault_key: VaultKey,
+    qtbot: QtBot,
+    tmp_path: Path,
+    vault_key: VaultKey,
 ) -> None:
     from PySide6.QtCore import QPoint
     from PySide6.QtWidgets import QPushButton, QScrollArea
@@ -252,7 +261,9 @@ def test_endpoint_ready_auto_discovers_then_save_opens_actual_models(
 
 
 def test_discovery_failure_routes_manual_add_then_explicit_batch_probe(
-    qtbot: QtBot, tmp_path: Path, vault_key: VaultKey,
+    qtbot: QtBot,
+    tmp_path: Path,
+    vault_key: VaultKey,
 ) -> None:
     from limbowave.application.services.model_probe import DiscoveryResult
     from limbowave.domain.providers import EndpointConfig, ProviderProtocol
@@ -262,7 +273,9 @@ def test_discovery_failure_routes_manual_add_then_explicit_batch_probe(
     page = SettingsPage(None, settings, credentials)
     qtbot.addWidget(page)
     endpoint = EndpointConfig(
-        id="relay", name="Relay", base_url="https://example.com/v1",
+        id="relay",
+        name="Relay",
+        base_url="https://example.com/v1",
         api=ProviderProtocol.OPENAI_COMPLETIONS,
     )
     page.actual_models.activate_endpoint(endpoint, discover=False)
@@ -291,7 +304,9 @@ def test_settings_page_relays_unverified_manual_save(
     page = SettingsPage(None, settings, credentials)
     qtbot.addWidget(page)
     endpoint = EndpointConfig(
-        id="relay", name="Relay", base_url="https://example.com/v1",
+        id="relay",
+        name="Relay",
+        base_url="https://example.com/v1",
         api=ProviderProtocol.OPENAI_COMPLETIONS,
     )
     page.actual_models.activate_endpoint(endpoint, discover=False)
@@ -303,7 +318,9 @@ def test_settings_page_relays_unverified_manual_save(
 
 
 def test_capability_edit_roundtrips_through_service_and_reopens(
-    qtbot: QtBot, tmp_path: Path, vault_key: VaultKey,
+    qtbot: QtBot,
+    tmp_path: Path,
+    vault_key: VaultKey,
 ) -> None:
     from PySide6.QtCore import Qt
 
@@ -313,7 +330,9 @@ def test_capability_edit_roundtrips_through_service_and_reopens(
     settings = SettingsService(ConfigurationService(JsonConfigRepository(tmp_path / "config.json")))
     credentials = CredentialService(SecretStore(vault_key, tmp_path / "vault" / "secrets.json"))
     endpoint = EndpointConfig(
-        id="relay", name="Relay", base_url="https://example.com/v1",
+        id="relay",
+        name="Relay",
+        base_url="https://example.com/v1",
         api=ProviderProtocol.OPENAI_COMPLETIONS,
     )
     settings.upsert_endpoint(endpoint)
@@ -329,8 +348,11 @@ def test_capability_edit_roundtrips_through_service_and_reopens(
         row.checkboxes["supports_streaming"].click()
     change = signal.args[0]
     config, _ = settings.set_model_capability(
-        endpoint_id=change.endpoint.id, model_id=change.model_id, display_name=change.display_name,
-        capability=change.capability, supported=change.supported,
+        endpoint_id=change.endpoint.id,
+        model_id=change.model_id,
+        display_name=change.display_name,
+        capability=change.capability,
+        supported=change.supported,
     )
     actual = config.actual_model("relay", "m")
     assert actual is not None
@@ -346,15 +368,20 @@ def test_capability_edit_roundtrips_through_service_and_reopens(
     assert not restored.selected.isChecked()
     assert restored.checkboxes["supports_streaming"].checkState() == Qt.CheckState.Checked
     settings.set_model_capability(
-        endpoint_id="relay", model_id="m", display_name="M",
-        capability="supports_streaming", supported=False,
+        endpoint_id="relay",
+        model_id="m",
+        display_name="M",
+        capability="supports_streaming",
+        supported=False,
     )
     reopened.prepare_open(None)
     assert restored.checkboxes["supports_streaming"].checkState() == Qt.CheckState.Unchecked
 
 
 def test_probe_edit_lock_survives_endpoint_switch_and_covers_logical_page(
-    qtbot: QtBot, tmp_path: Path, vault_key: VaultKey,
+    qtbot: QtBot,
+    tmp_path: Path,
+    vault_key: VaultKey,
 ) -> None:
     from limbowave.domain.providers import EndpointConfig, ProviderProtocol
     from limbowave.ui.model_probe_page import ModelProbeTask
@@ -362,7 +389,9 @@ def test_probe_edit_lock_survives_endpoint_switch_and_covers_logical_page(
     settings = SettingsService(ConfigurationService(JsonConfigRepository(tmp_path / "config.json")))
     credentials = CredentialService(SecretStore(vault_key, tmp_path / "vault" / "secrets.json"))
     endpoint = EndpointConfig(
-        id="relay", name="Relay", base_url="https://example.com/v1",
+        id="relay",
+        name="Relay",
+        base_url="https://example.com/v1",
         api=ProviderProtocol.OPENAI_COMPLETIONS,
     )
     other = endpoint.model_copy(update={"id": "other"})
@@ -416,7 +445,9 @@ def test_entry_snapshot_keeps_tab_content_at_live_position(
 
 
 def test_endpoint_subtabs_match_appearance_layout_and_animation(
-    qtbot: QtBot, tmp_path: Path, vault_key: VaultKey,
+    qtbot: QtBot,
+    tmp_path: Path,
+    vault_key: VaultKey,
 ) -> None:
     settings = SettingsService(ConfigurationService(JsonConfigRepository(tmp_path / "config.json")))
     credentials = CredentialService(SecretStore(vault_key, tmp_path / "vault" / "secrets.json"))
@@ -449,7 +480,8 @@ def test_endpoint_subtabs_match_appearance_layout_and_animation(
     workspace.select_subtab("实际模型", animated=True)
     assert stack._effect.isEnabled()
     qtbot.waitUntil(
-        lambda: stack.current_index == 1 and not stack._effect.isEnabled(), timeout=1500,
+        lambda: stack.current_index == 1 and not stack._effect.isEnabled(),
+        timeout=1500,
     )
     assert tabs._indicator.x() > previous_indicator_x
     workspace.select_subtab("端点配置", animated=False)
@@ -458,7 +490,9 @@ def test_endpoint_subtabs_match_appearance_layout_and_animation(
 
 
 def test_direct_actual_models_navigation_selects_parent_and_child(
-    qtbot: QtBot, tmp_path: Path, vault_key: VaultKey,
+    qtbot: QtBot,
+    tmp_path: Path,
+    vault_key: VaultKey,
 ) -> None:
     settings = SettingsService(ConfigurationService(JsonConfigRepository(tmp_path / "config.json")))
     credentials = CredentialService(SecretStore(vault_key, tmp_path / "vault" / "secrets.json"))
@@ -593,19 +627,27 @@ def test_restyle_rebuilds_rgba_surfaces_after_theme_switch(
 
 
 def test_endpoint_sidebar_is_shared_and_switches_model_context(
-    qtbot: QtBot, tmp_path: Path, vault_key: VaultKey,
+    qtbot: QtBot,
+    tmp_path: Path,
+    vault_key: VaultKey,
 ) -> None:
     from limbowave.domain.providers import EndpointConfig, ProviderProtocol
 
     settings = SettingsService(ConfigurationService(JsonConfigRepository(tmp_path / "config.json")))
     credentials = CredentialService(SecretStore(vault_key, tmp_path / "vault" / "secrets.json"))
     for endpoint_id in ("first", "second"):
-        settings.upsert_endpoint(EndpointConfig(
-            id=endpoint_id, name=endpoint_id, base_url="https://example.com/v1",
-            api=ProviderProtocol.OPENAI_COMPLETIONS,
-        ))
+        settings.upsert_endpoint(
+            EndpointConfig(
+                id=endpoint_id,
+                name=endpoint_id,
+                base_url="https://example.com/v1",
+                api=ProviderProtocol.OPENAI_COMPLETIONS,
+            )
+        )
         settings.record_unverified_model(
-            endpoint_id=endpoint_id, model_id=f"{endpoint_id}-model", display_name=endpoint_id,
+            endpoint_id=endpoint_id,
+            model_id=f"{endpoint_id}-model",
+            display_name=endpoint_id,
         )
     page = SettingsPage(None, settings, credentials)
     qtbot.addWidget(page)
@@ -643,7 +685,11 @@ def test_endpoint_sidebar_is_shared_and_switches_model_context(
 @pytest.mark.parametrize("endpoints", [False, True])
 @pytest.mark.parametrize("subtab", [0, 1])
 def test_list_selection_animates_right_content_and_keeps_subtab(
-    qtbot: QtBot, tmp_path: Path, vault_key: VaultKey, endpoints: bool, subtab: int,
+    qtbot: QtBot,
+    tmp_path: Path,
+    vault_key: VaultKey,
+    endpoints: bool,
+    subtab: int,
 ) -> None:
     from PySide6.QtCore import QPoint
 
@@ -653,10 +699,14 @@ def test_list_selection_animates_right_content_and_keeps_subtab(
     settings = SettingsService(ConfigurationService(JsonConfigRepository(tmp_path / "config.json")))
     credentials = CredentialService(SecretStore(vault_key, tmp_path / "secrets.json"))
     for suffix in ("a", "b", "c"):
-        settings.upsert_endpoint(EndpointConfig(
-            id=suffix, name=suffix, base_url="https://example.com/v1",
-            api=ProviderProtocol.OPENAI_COMPLETIONS,
-        ))
+        settings.upsert_endpoint(
+            EndpointConfig(
+                id=suffix,
+                name=suffix,
+                base_url="https://example.com/v1",
+                api=ProviderProtocol.OPENAI_COMPLETIONS,
+            )
+        )
         settings.create_model(LogicalModel(id=suffix, name=suffix))
     page = SettingsPage(None, settings, credentials)
     qtbot.addWidget(page)
@@ -727,7 +777,9 @@ def test_list_selection_animates_right_content_and_keeps_subtab(
 
 
 def test_add_all_models_persists_catalog_without_probing(
-    qtbot: QtBot, tmp_path: Path, vault_key: VaultKey,
+    qtbot: QtBot,
+    tmp_path: Path,
+    vault_key: VaultKey,
 ) -> None:
     from limbowave.application.services.model_probe import DiscoveredModel, DiscoveryResult
     from limbowave.domain.providers import EndpointConfig, ProviderProtocol
@@ -736,29 +788,42 @@ def test_add_all_models_persists_catalog_without_probing(
     settings = SettingsService(ConfigurationService(JsonConfigRepository(tmp_path / "config.json")))
     credentials = CredentialService(SecretStore(vault_key, tmp_path / "vault" / "secrets.json"))
     endpoint = EndpointConfig(
-        id="relay", name="Relay", base_url="https://example.com/v1",
+        id="relay",
+        name="Relay",
+        base_url="https://example.com/v1",
         api=ProviderProtocol.OPENAI_COMPLETIONS,
     )
     settings.upsert_endpoint(endpoint)
     settings.set_model_capability(
-        endpoint_id="relay", model_id="saved", display_name="Saved",
-        capability="supports_tools", supported=True,
+        endpoint_id="relay",
+        model_id="saved",
+        display_name="Saved",
+        capability="supports_tools",
+        supported=True,
     )
     page = SettingsPage(None, settings, credentials)
     qtbot.addWidget(page)
     page.actual_models.activate_endpoint(
-        endpoint, discover=False, actual_models=settings.load().actual_models,
+        endpoint,
+        discover=False,
+        actual_models=settings.load().actual_models,
     )
-    page.apply_model_discovery(endpoint, DiscoveryResult(
-        (DiscoveredModel("saved", "Saved"), DiscoveredModel("new", "New")), "ok",
-    ))
+    page.apply_model_discovery(
+        endpoint,
+        DiscoveryResult(
+            (DiscoveredModel("saved", "Saved"), DiscoveredModel("new", "New")),
+            "ok",
+        ),
+    )
     probes: list[object] = []
     saved: list[str] = []
     page.model_probe_requested.connect(probes.append)
 
     def save(task: ModelProbeTask) -> None:
         settings.record_unverified_model(
-            endpoint_id=task.endpoint.id, model_id=task.model_id, display_name=task.display_name,
+            endpoint_id=task.endpoint.id,
+            model_id=task.model_id,
+            display_name=task.display_name,
         )
         saved.append(task.model_id)
         page.apply_manual_model_save(task.endpoint.id, task.model_id)
@@ -776,14 +841,18 @@ def test_add_all_models_persists_catalog_without_probing(
     assert added.supports_thinking is None
     assert added.supports_tools is False  # 未验证模型沿用服务的保守工具能力默认值。
     page.actual_models.activate_endpoint(
-        endpoint, discover=False, actual_models=config.actual_models,
+        endpoint,
+        discover=False,
+        actual_models=config.actual_models,
     )
     assert all(row.saved and not row.selected.isChecked() for row in page.actual_models._items())
     assert not page.actual_models._select_all.isEnabled()
 
 
 def test_about_tab_navigation_and_reopening(
-    qtbot: QtBot, tmp_path: Path, vault_key: VaultKey,
+    qtbot: QtBot,
+    tmp_path: Path,
+    vault_key: VaultKey,
 ) -> None:
     from PySide6.QtCore import Qt
 
@@ -819,7 +888,11 @@ def test_about_tab_navigation_and_reopening(
     ],
 )
 def test_settings_subtabs_slide_horizontally_in_both_directions(
-    qtbot: QtBot, tmp_path: Path, vault_key: VaultKey, title: str, workspace_attr: str,
+    qtbot: QtBot,
+    tmp_path: Path,
+    vault_key: VaultKey,
+    title: str,
+    workspace_attr: str,
 ) -> None:
     from PySide6.QtCore import QAbstractAnimation, QPoint
 
@@ -828,7 +901,9 @@ def test_settings_subtabs_slide_horizontally_in_both_directions(
     settings = SettingsService(ConfigurationService(JsonConfigRepository(tmp_path / "config.json")))
     credentials = CredentialService(SecretStore(vault_key, tmp_path / "secrets.json"))
     page = SettingsPage(
-        None, settings, credentials,
+        None,
+        settings,
+        credentials,
         preferences=PreferencesService(tmp_path / "preferences.json"),
     )
     qtbot.addWidget(page)
@@ -869,7 +944,10 @@ def test_settings_subtabs_slide_horizontally_in_both_directions(
 
 
 def test_request_log_loading_failure_and_reopen_do_not_poison_settings(
-    qtbot: QtBot, tmp_path: Path, vault_key: VaultKey, monkeypatch,
+    qtbot: QtBot,
+    tmp_path: Path,
+    vault_key: VaultKey,
+    monkeypatch,
 ) -> None:
     from concurrent.futures import Future
 

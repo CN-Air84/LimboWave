@@ -34,9 +34,12 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import math
+import re
 import weakref
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from dataclasses import dataclass
 from typing import cast
 
 from PySide6.QtCore import (
@@ -94,16 +97,19 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QTextBrowser,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
 from limbowave.application.history_payload import HistoryEntry as HistoryEntry
+from limbowave.application.services.send_queue import QueuedSend
 from limbowave.domain.conversation import AssistantMessageSegment
+from limbowave.domain.files import SUPPORTED_ATTACHMENTS_HINT
 from limbowave.domain.permissions import PermissionPreset
 from limbowave.domain.tool_step import ToolStep, finish
 from limbowave.ui import markdown_render, soft_shadow, theme
-from limbowave.ui.attachment_bar import AttachmentBar, AttachmentMenu
+from limbowave.ui.attachment_bar import AttachmentBar, AttachmentMenu, DraftAttachment
 from limbowave.ui.backdrop import BackdropEngine
 from limbowave.ui.compression_widgets import (
     CompressButton,
@@ -116,6 +122,7 @@ from limbowave.ui.model_selector import ModelSelector, ModelSite
 from limbowave.ui.popup_material import install_popup_material
 from limbowave.ui.popup_motion import PopupMotion
 from limbowave.ui.run_state_label import RunStateLabel
+from limbowave.ui.send_queue_panel import SendQueuePanel
 from limbowave.ui.sent_attachments import SentAttachment, SentAttachmentStrip
 from limbowave.ui.streaming_text import StreamingTextBuffer
 from limbowave.ui.thinking_block import ThinkingBlock as _ThinkingBlock
@@ -834,7 +841,7 @@ class _BubbleRow(QWidget):
         assert self._content is not None
         if isinstance(self._content, QTextBrowser):
             return self._content.toPlainText()
-        return self._content.text()
+        return self._content.property("search_original") or self._content.text()
 
     # ----- 流式与定稿 -----
 
@@ -1620,13 +1627,20 @@ class _ComposerInput(QPlainTextEdit):
     image_paste_failed = Signal(str)
     image_paste_busy = Signal(bool)
     paste_generation: Callable[[], int]
+    attachments_enabled = True
 
     def canInsertFromMimeData(self, source: QMimeData) -> bool:
+        if not self.attachments_enabled:
+            return source.hasText() and not _local_paths(source)
         if _local_paths(source) or source.hasImage():
             return True
         return super().canInsertFromMimeData(source)
 
     def insertFromMimeData(self, source: QMimeData) -> None:
+        if not self.attachments_enabled:
+            if source.hasText() and not _local_paths(source):
+                self.insertPlainText(source.text())
+            return
         paths = _local_paths(source)
         if paths:
             self.files_pasted.emit(paths)
@@ -1853,10 +1867,22 @@ class _ComposerRowLayout(QLayout):
         )
 
 
+@dataclass(frozen=True)
+class ComposerDraft:
+    """Session-only UI state; never persist unencrypted prompt text to disk."""
+
+    text: str = ""
+    attachments: tuple[DraftAttachment, ...] = ()
+    editing_message_id: str | None = None
+
+
 class ChatView(QWidget):
     """最小聊天视图。通过信号表达意图，经方法接收展示更新。"""
 
     message_submitted = Signal(str)
+    message_queued = Signal(str)
+    queue_cancel_requested = Signal(str)
+    queue_resume_requested = Signal()
     stop_requested = Signal()
     # 分支动作（Task 3.2）：只外发 message_id，业务在应用层；分支切换入口在左栏
     edit_message_requested = Signal(str)  # message_id
@@ -1881,9 +1907,14 @@ class ChatView(QWidget):
     # 高级栏展开进度（0 = 收起，1 = 展开），动画中逐帧发出；上层据此摆放高级栏
     advanced_progress_changed = Signal(float)
 
-    def __init__(self, parent: QWidget | None = None, *, read_only: bool = False) -> None:
+    def __init__(
+        self, parent: QWidget | None = None, *, read_only: bool = False, draft_only: bool = False
+    ) -> None:
         super().__init__(parent)
-        self._read_only = read_only
+        self._queue_mode = False
+        self._draft_restore_failed = False
+        self._draft_only = draft_only
+        self._read_only = read_only or draft_only
         self._docked = False
         self._advanced_expanded = False
         self._dock_progress = 0.0  # 0 = 居中，1 = 停靠底部
@@ -1934,10 +1965,20 @@ class ChatView(QWidget):
         self._history_transition_generation = 0
         self._history_rest_pos: QPoint | None = None
         self._build()
-        if read_only:
+        self._attachment_bar.changed.connect(self._sync_send_button)
+        if self._read_only:
             self.set_available(False)
-            self._composer.setEnabled(False)
-            self._input.setPlaceholderText("另一会话正在生成；可切回查看进度，完成后即可在这里继续")
+            self._composer.setEnabled(draft_only)
+        if draft_only:
+            self._input.setPlaceholderText("在这里写草稿，切换会话后仍会保留…")
+            self._input.attachments_enabled = False
+            self._input.setAcceptDrops(False)
+            self._composer.setAcceptDrops(False)
+            self._attachment_bar.setEnabled(False)
+            self._edit_banner.setEnabled(False)
+            self._logical_model.setEnabled(False)
+            self._advanced_btn.setEnabled(False)
+            self.set_draft_waiting()
         self._fit_column()
 
     def set_backdrop_engine(
@@ -1985,6 +2026,25 @@ class ChatView(QWidget):
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
+
+        self._search_query = ""
+        self._search_ids: list[str] = []
+        self._search_index = -1
+        self._search_bar = QWidget()
+        search_layout = QHBoxLayout(self._search_bar)
+        self._search_label = QLabel()
+        self._search_label.setTextFormat(Qt.TextFormat.PlainText)
+        search_layout.addWidget(self._search_label, 1)
+        self._search_previous = QPushButton("上一个匹配")
+        self._search_next = QPushButton("下一个匹配")
+        close_search = QPushButton("关闭定位")
+        for button in (self._search_previous, self._search_next, close_search):
+            search_layout.addWidget(button)
+        self._search_previous.clicked.connect(lambda: self._move_search_match(-1))
+        self._search_next.clicked.connect(lambda: self._move_search_match(1))
+        close_search.clicked.connect(self.clear_search_matches)
+        root.addWidget(self._search_bar)
+        self._search_bar.hide()
 
         # 分支切换在左栏：双击会话行展开分支（见 sidebar）
 
@@ -2076,6 +2136,20 @@ class ChatView(QWidget):
         self._edit_banner.setVisible(False)
         text_column.addWidget(self._edit_banner)
 
+        self._draft_notice = QLabel()
+        self._draft_notice.setWordWrap(True)
+        self._draft_notice.setStyleSheet(
+            f"color: {theme.TEXT_SECONDARY}; font-size: {theme.FS_SMALL}px;"
+            " background: transparent;"
+        )
+        self._draft_notice.setVisible(self._draft_only)
+        text_column.addWidget(self._draft_notice)
+
+        self._queue_panel = SendQueuePanel()
+        self._queue_panel.cancel_requested.connect(self.queue_cancel_requested.emit)
+        self._queue_panel.resume_requested.connect(self.queue_resume_requested.emit)
+        text_column.addWidget(self._queue_panel)
+
         self._attachment_bar = AttachmentBar()
         text_column.addWidget(self._attachment_bar)
 
@@ -2122,7 +2196,9 @@ class ChatView(QWidget):
             f" color: {theme.ACCENT}; }}"
             f"QPushButton:disabled {{ color: {theme.TEXT_SECONDARY}; }}"
         )
-        self._attach_btn.setToolTip("添加附件，也可以把文件拖到输入框")
+        self._attach_btn.setToolTip(
+            "添加附件，也可以把文件拖到输入框\n" + SUPPORTED_ATTACHMENTS_HINT
+        )
         # 点击弹出上拉菜单选择来源，而不是直接打开文件选择器
         bar = self._attachment_bar
         self._attach_menu = AttachmentMenu(self)
@@ -2237,7 +2313,11 @@ class ChatView(QWidget):
 
     def _on_send(self) -> None:
         text = self._input.toPlainText().strip()
-        if not text or self._history_loading or self._pending_pastes > 0:
+        if self._can_queue():
+            # The app clears the composer only after the immutable entry is accepted.
+            self.message_queued.emit(text)
+            return
+        if not self._can_send() or self._queue_mode:
             return
         self._input.clear()
         self._set_docked(True)
@@ -2248,6 +2328,51 @@ class ChatView(QWidget):
             self.edit_submitted.emit(editing_id, text)
             return
         self.message_submitted.emit(text)
+
+    def set_send_queue(
+        self, entries: tuple[tuple[int, QueuedSend], ...], total: int,
+        paused_reason: str, *, can_enqueue: bool, dispatching: bool = False,
+    ) -> None:
+        self._queue_mode = can_enqueue
+        self._queue_panel.update_queue(entries, total, paused_reason, dispatching=dispatching)
+        self._send_btn.setText("排队" if can_enqueue else "↑")
+        self._send_btn.setAccessibleName("加入发送队列" if can_enqueue else "发送")
+        self._send_btn.setVisible(not self._busy or can_enqueue)
+        if self._draft_only:
+            self.set_draft_waiting()
+        self._sync_send_button()
+
+    def snapshot_draft(self) -> ComposerDraft:
+        return ComposerDraft(
+            self._input.toPlainText(), self._attachment_bar.snapshot(), self._editing_id
+        )
+
+    def set_draft(self, draft: ComposerDraft) -> None:
+        """Replace only composer state when its conversation/branch changes."""
+        self._attachment_bar.restore(draft.attachments)
+        self._set_editing(draft.editing_message_id)
+        self._input.setPlainText(draft.text)
+        self._sync_send_button()
+
+    def set_draft_waiting(self, *, restore_failed: bool | None = None) -> None:
+        if not self._draft_only:
+            return
+        if restore_failed is not None:
+            self._draft_restore_failed = restore_failed
+        if self._queue_mode:
+            self._draft_notice.setText(
+                "可先编辑文字草稿；点击「排队」后将依次自动发送。队列仅本次打开期间保留。"
+            )
+            self._send_btn.setToolTip("加入发送队列（Ctrl+Enter）")
+            return
+        state = (
+            "切换失败，请在侧栏重新打开此会话后发送。" if self._draft_restore_failed
+            else "另一会话正在生成，完成后可手动发送。"
+        )
+        self._draft_notice.setText(
+            state + "可先编辑文字草稿；切换时保留（仅本次打开期间），不会自动发送。"
+        )
+        self._send_btn.setToolTip(state)
 
     def restore_draft(self, text: str) -> None:
         """Return a rejected submission without overwriting text typed meanwhile."""
@@ -2284,10 +2409,29 @@ class ChatView(QWidget):
 
     def _sync_send_button(self) -> None:
         """发送按钮只在可用、空闲且确有文本时点亮。"""
-        has_text = bool(self._input.toPlainText().strip())
-        self._send_btn.setEnabled(
-            self._available and not self._busy and not self._compressing
-            and not self._history_loading and not self._pending_pastes and has_text
+        self._send_btn.setEnabled(self._can_queue() if self._queue_mode else self._can_send())
+        if self._queue_mode:
+            hint = (
+                "附件或编辑旧消息暂不支持排队，请等待后手动发送"
+                if self._editing_id is not None or self.attachments.attachment_ids()
+                else "加入发送队列（Ctrl+Enter）"
+            )
+            self._send_btn.setToolTip(hint)
+        elif not self._draft_only:
+            self._send_btn.setToolTip("发送（Ctrl+Enter）")
+
+    def _can_queue(self) -> bool:
+        return bool(
+            self._queue_mode and not self._history_loading and not self._compressing
+            and not self._pending_pastes and self._editing_id is None
+            and not self.attachments.attachment_ids() and self._input.toPlainText().strip()
+        )
+
+    def _can_send(self) -> bool:
+        return bool(
+            self._available and not self._read_only and not self._busy
+            and not self._compressing and not self._history_loading
+            and not self._pending_pastes and self._input.toPlainText().strip()
         )
 
     def _on_logical_model_changed(self, index: int) -> None:
@@ -2374,19 +2518,24 @@ class ChatView(QWidget):
                 seen[model_id] = name or model_id
         self._logical_model.blockSignals(True)
         self._logical_model.clear()
-        if not seen:
-            self._logical_model.addItem("逻辑模型")
-            self._logical_model.setEnabled(False)
-        else:
-            for model_id, name in seen.items():
-                self._logical_model.addItem(name, model_id)
-            self._logical_model.setEnabled(True)
+        for model_id, name in seen.items():
+            self._logical_model.addItem(name, model_id)
+        if current and current not in seen:
+            # Never display a valid replacement while the runtime still targets the
+            # removed model. A data-less item also lets selecting the first real
+            # model emit currentIndexChanged and actually update the route.
+            self._logical_model.addItem(f"模型已不可用：{current}")
+            self._logical_model.setCurrentIndex(self._logical_model.count() - 1)
+        elif seen:
             index = self._logical_model.findData(current)
             self._logical_model.setCurrentIndex(index if index >= 0 else 0)
+        else:
+            self._logical_model.addItem("逻辑模型")
+        self._logical_model.setEnabled(bool(seen))
         self._logical_model.blockSignals(False)
 
     def set_compress_available(self, available: bool) -> None:
-        self._compress_btn.setEnabled(available)
+        self._compress_btn.setEnabled(available and not self._read_only)
 
     def note_tool_step(
         self, name: str, tool_call_id: str, *, is_error: bool, phase: str,
@@ -2441,7 +2590,7 @@ class ChatView(QWidget):
             self._available and not self._compressing and not self._history_loading
             and not self._read_only
         )
-        self._input.setEnabled(enabled)
+        self._input.setEnabled(enabled or (self._draft_only and not self._history_loading))
         self._attach_btn.setEnabled(enabled)
         self._permission_btn.setEnabled(enabled)
         self._sync_send_button()
@@ -2465,7 +2614,7 @@ class ChatView(QWidget):
             self._set_docked(False, reveal_advanced=False)
         self._sync_history_loading_overlay()
         self._transcript_host.setEnabled(not loading)
-        self._composer.setEnabled(not loading and not self._read_only)
+        self._composer.setEnabled(not loading and (not self._read_only or self._draft_only))
         self._sync_input_enabled()
 
     def _sync_history_loading_overlay(self) -> None:
@@ -2630,7 +2779,7 @@ class ChatView(QWidget):
             self._settle_assistant_run()
         self._stop_btn.setVisible(busy)
         self._stop_btn.setEnabled(busy)
-        self._send_btn.setVisible(not busy)
+        self._send_btn.setVisible(not busy or self._queue_mode)
         self._sync_send_button()
 
     def set_attachment_resolver(
@@ -2855,6 +3004,146 @@ class ChatView(QWidget):
         for row in self._rows:
             row.set_retry_available(False)
 
+    def clear_search_matches(self) -> None:
+        """Remove presentation-only highlighting without changing message contents."""
+        self._search_query = ""
+        self._search_ids = []
+        self._search_index = -1
+        self._search_bar.hide()
+        self._highlight_search()
+
+    def _highlight_search(self) -> None:
+        pattern = (re.compile(re.escape(self._search_query), re.IGNORECASE)
+                   if self._search_query else None)
+        for row in self._rows:
+            if row._role == "user" and isinstance(row.label, QLabel):
+                label = row.label
+                original = label.property("search_original")
+                if original is None:
+                    original = label.text()
+                if pattern:
+                    label.setProperty("search_original", original)
+                    pieces: list[str] = []
+                    end = 0
+                    for match in pattern.finditer(original):
+                        pieces.append(html.escape(original[end:match.start()]))
+                        pieces.append('<span style="background-color:#ffd166;color:#202020">'
+                                      + html.escape(match.group()) + '</span>')
+                        end = match.end()
+                    pieces.append(html.escape(original[end:]))
+                    label.setTextFormat(Qt.TextFormat.RichText)
+                    label.setText(
+                        '<span style="white-space:pre-wrap">' + ''.join(pieces) + '</span>'
+                    )
+                elif label.property("search_original") is not None:
+                    label.setTextFormat(Qt.TextFormat.PlainText)
+                    label.setText(original)
+                    label.setProperty("search_original", None)
+            for segment in row._segments:
+                browser = segment.content
+                if browser is None:
+                    continue
+                selections = []
+                if pattern:
+                    text = browser.toPlainText()
+                    for match in pattern.finditer(text):
+                        selection = QTextEdit.ExtraSelection()
+                        cursor = QTextCursor(browser.document())
+                        # Qt positions use UTF-16 code units, not Python code points.
+                        start = len(text[:match.start()].encode("utf-16-le")) // 2
+                        end = len(text[:match.end()].encode("utf-16-le")) // 2
+                        cursor.setPosition(start)
+                        cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
+                        selection.cursor = cursor
+                        selection.format.setBackground(QColor("#ffd166"))
+                        selection.format.setForeground(QColor("#202020"))
+                        selections.append(selection)
+                browser.setExtraSelections(selections)
+
+    def show_search_match(self, query: str, message_id: str) -> bool:
+        """Locate a message, including older pages and merged assistant segments."""
+        query = query.strip()
+        if not query:
+            self.clear_search_matches()
+            return False
+        ids = [entry.message_id for entry in self._full_history
+               if entry.message_id and query.casefold() in entry.content.casefold()]
+        # Live messages may not yet be part of the history cache.
+        for row in self._rows:
+            candidates = [(row._message_id, row.content_text())] if row._role == "user" else [
+                (segment.message_id, segment.content.toPlainText())
+                for segment in row._segments if segment.content is not None
+            ]
+            for candidate, text in candidates:
+                if candidate and candidate not in ids and query.casefold() in text.casefold():
+                    ids.append(candidate)
+        if message_id not in ids:
+            self.clear_search_matches()
+            return False
+        self._search_query = query
+        self._search_ids = ids
+        self._search_index = ids.index(message_id)
+        return self._focus_search_match()
+
+    def _move_search_match(self, direction: int) -> None:
+        if self._search_ids:
+            self._search_index = (self._search_index + direction) % len(self._search_ids)
+            self._focus_search_match()
+
+    def _focus_search_match(self) -> bool:
+        message_id = self._search_ids[self._search_index]
+        index = next((i for i, entry in enumerate(self._full_history)
+                      if entry.message_id == message_id), len(self._full_history))
+        while index < self._history_offset:
+            self._load_earlier()
+        self._cancel_history_anchor()
+        self._highlight_search()
+        target: QWidget | None = None
+        for row in self._rows:
+            for segment in row._segments:
+                if segment.message_id == message_id and segment.content is not None:
+                    if target is None:
+                        target = segment.content
+                    if segment.content.extraSelections():
+                        target = segment.content
+                        break
+            if target is not None:
+                break
+            if row._message_id == message_id:
+                target = row.label or row
+                break
+        if target is None:
+            self.clear_search_matches()
+            return False
+        self._search_label.setText(
+            f"当前分支 · 匹配消息 {self._search_index + 1}/{len(self._search_ids)}"
+            f" · {self._search_query}"
+        )
+        self._search_bar.show()
+        self._search_previous.setEnabled(len(self._search_ids) > 1)
+        self._search_next.setEnabled(len(self._search_ids) > 1)
+        self._stick_to_bottom = False
+        self._user_scrolled_up = True
+        self._transcript.activate()
+
+        def scroll() -> None:
+            from shiboken6 import isValid
+
+            if not isValid(target) or not self._search_ids:
+                return
+            if self._search_ids[self._search_index] != message_id:
+                return
+            y = target.mapTo(self._transcript_host, QPoint()).y()
+            if isinstance(target, QTextBrowser):
+                selections = target.extraSelections()
+                if selections:
+                    y += target.cursorRect(selections[0].cursor).y()
+            self._scroll.verticalScrollBar().setValue(max(0, y - 64))
+
+        scroll()
+        QTimer.singleShot(0, self, scroll)
+        return True
+
     def clear_transcript(self) -> None:
         """清空消息区与已加载的历史（切换会话前调用）。只影响展示。
 
@@ -2863,6 +3152,7 @@ class ChatView(QWidget):
         """
         self.cancel_edit()  # 被编辑的消息不在新会话里
         self._cancel_history_transition()
+        self.clear_search_matches()
         self._full_history = []
         self._history_offset = 0
         self._reset_rows()
@@ -2998,6 +3288,7 @@ class ChatView(QWidget):
     def _prepare_history_window(
         self, messages: Sequence[HistoryEntry | tuple[str, str, str, str | None]]
     ) -> None:
+        self.clear_search_matches()
         self.cancel_edit()  # 换了会话或分支，正在编辑的消息已不在眼前
         self._set_docked(
             bool(messages) or self._history_loading_overlay_requested, reveal_advanced=False

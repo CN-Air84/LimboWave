@@ -19,6 +19,7 @@ from limbowave.domain.permissions import Capability, ExecutionMode
 from limbowave.infrastructure.memory_repositories import InMemoryStore, in_memory_uow_factory
 
 TOOLS = {
+    "get_current_datetime": {},
     "add_session_memory": {"content": "secret", "call_id": "call", "run_id": "run"},
     "read_document": {"file_id": "attachment"},
     "list_directory": {"path": "."},

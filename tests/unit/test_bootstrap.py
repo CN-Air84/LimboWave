@@ -77,3 +77,48 @@ def test_chinese_paths_round_trip(tmp_path: Path) -> None:
     payload.write_text(text, encoding="utf-8")
 
     assert payload.read_text(encoding="utf-8") == text
+
+
+@pytest.mark.parametrize(
+    ("layout", "git_marker", "frozen", "expected"),
+    [
+        ("src/limbowave", "directory", False, True),
+        ("src/limbowave", "file", False, True),
+        ("src/limbowave", "directory", True, False),
+        ("src/limbowave", "absent", False, False),
+        ("site-packages/limbowave", "directory", False, False),
+        ("build/limbowave", "directory", False, False),
+    ],
+)
+def test_development_environment_requires_unfrozen_source_checkout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    layout: str,
+    git_marker: str,
+    frozen: bool,
+    expected: bool,
+) -> None:
+    module = tmp_path / layout / "bootstrap.py"
+    module.parent.mkdir(parents=True)
+    module.touch()
+    (tmp_path / "pyproject.toml").write_text('[project]\nname = "limbowave"\n')
+    if git_marker == "directory":
+        (tmp_path / ".git").mkdir()
+    elif git_marker == "file":
+        (tmp_path / ".git").write_text("gitdir: ../main/.git/worktrees/test\n")
+    monkeypatch.setattr(bootstrap, "__file__", str(module))
+    monkeypatch.setattr(bootstrap.sys, "frozen", frozen, raising=False)
+    assert bootstrap.is_development_environment() is expected
+    assert create_context().development is expected
+
+
+def test_source_without_project_metadata_is_not_development(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = tmp_path / "src/limbowave/bootstrap.py"
+    module.parent.mkdir(parents=True)
+    module.touch()
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setattr(bootstrap, "__file__", str(module))
+    assert not bootstrap.is_development_environment()

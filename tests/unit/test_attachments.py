@@ -241,3 +241,20 @@ async def test_document_only_send_reaches_kernel(store: InMemoryStore) -> None:
     run_id = await coord.send("", attachment_ids=["file_x"], document_note="[用户附加了文档]")
     assert run_id is not None
     assert kernel.sent[0] == "[用户附加了文档]"
+
+
+@pytest.mark.parametrize("suffix", [".doc", ".docx"])
+def test_word_attachment_note_and_readable_body(services, tmp_path, suffix):
+    from tests.word_fixtures import doc_bytes, docx_bytes, paragraph
+    files, _images, attachments = services
+    path = tmp_path / ("合同" + suffix)
+    path.write_bytes(doc_bytes([("机密合同正文\r", False)]) if suffix == ".doc"
+                     else docx_bytes(paragraph("机密合同正文")))
+    document = files.index_path(path)
+    payload = attachments.build([document.id])
+    assert payload.attachment_ids == [document.id]
+    assert payload.images == []
+    assert path.name in payload.document_note
+    assert "Word" in payload.document_note and "行号不是页码" in payload.document_note
+    assert "机密合同正文" not in payload.document_note
+    assert files.read(document.id).text == "机密合同正文"

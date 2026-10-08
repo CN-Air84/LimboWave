@@ -297,6 +297,7 @@ async def test_app_loading_reads_and_markdown_are_off_thread_and_duplicates_igno
         select()
         await _until(entered.is_set)
         assert window.chat.history_loading
+        assert window.chat._input.toPlainText() == "草稿"
         assert not window.chat._send_btn.isEnabled()
         assert not window.sidebar._list.isEnabled()
         assert window.sidebar._settings_btn.isEnabled()
@@ -314,8 +315,9 @@ async def test_app_loading_reads_and_markdown_are_off_thread_and_duplicates_igno
         assert controller.conversation_id == "c1"
         assert controller.branch_id == "b1"
         assert [row.content_text() for row in window.chat._rows] == ["问题", "回答"]
-        assert window.chat._input.toPlainText() == "草稿"
-        assert window.chat._send_btn.isEnabled()
+        # Successful navigation selects the target draft, not the previous composer.
+        assert window.chat._input.toPlainText() == ""
+        assert not window.chat._send_btn.isEnabled()
         assert window.sidebar._list.isEnabled()
     finally:
         release.set()

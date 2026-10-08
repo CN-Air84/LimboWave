@@ -660,3 +660,25 @@ def test_read_document_requires_authorization_like_other_reads(
     result = gateway.invoke("read_document", {"file_id": file_id}, CONV)
     assert not result.ok
     assert result.data.get("needs_confirmation") is True
+
+
+@pytest.mark.parametrize("suffix", [".doc", ".docx"])
+def test_read_word_document_through_gateway(permissions, workspace, tmp_path, suffix):
+    from limbowave.application.services.file_service import FileService
+    from tests.word_fixtures import doc_bytes, docx_bytes, paragraph
+    files = FileService(in_memory_uow_factory(InMemoryStore()))
+    path = tmp_path / ("attachment" + suffix)
+    path.write_bytes(doc_bytes([("标题\r合同正文\r", False)]) if suffix == ".doc"
+                     else docx_bytes(paragraph("标题") + paragraph("合同正文")))
+    card = files.index_path(path)
+    gateway = ToolGateway(permissions, workspace, documents=files)
+    permissions.grant(CONV, Capability.FILE_READ, allowed_paths=(str(workspace),))
+    result = gateway.invoke("read_document", {"file_id": card.id, "start_line": 2,
+                                             "end_line": 2}, CONV)
+    assert result.ok, result.error
+    assert result.data["text"] == "合同正文"
+    assert result.data["total_lines"] == 2
+    path.write_bytes(b"broken")
+    failed = gateway.invoke("read_document", {"file_id": card.id}, CONV)
+    assert not failed.ok
+    assert "另存为" in failed.error

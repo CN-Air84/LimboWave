@@ -30,6 +30,7 @@ _pending_tool_calls: list[dict[str, Any]] = []
 # 失败注入：_fail_next > 0 时，接下来的请求返回错误（默认连接重置式失败用 503）。
 _fail_next = 0
 _fail_status = 503
+_fail_message: str | None = None
 
 
 def _tool_call_chunk(model: str, *, index: int, call_id: str, name: str, args_json: str) -> bytes:
@@ -113,7 +114,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         # 控制通道：PUT /control/fail，body {"count": n, "status": 503}，接下来 n 次请求失败
         if self.path.rstrip("/").endswith("/control/fail"):
-            global _fail_next, _fail_status
+            global _fail_next, _fail_status, _fail_message
             raw = self.rfile.read(int(self.headers.get("Content-Length", "0")))
             try:
                 spec = json.loads(raw)
@@ -123,6 +124,7 @@ class Handler(BaseHTTPRequestHandler):
             with _lock:
                 _fail_next = int(spec.get("count", 1))
                 _fail_status = int(spec.get("status", 503))
+                _fail_message = spec.get("message")
             self._send_json(200, {"ok": True, "fail_next": _fail_next, "status": _fail_status})
             return
         self._send_json(404, {"error": {"message": f"unknown path {self.path}"}})
@@ -165,7 +167,10 @@ class Handler(BaseHTTPRequestHandler):
         if status != 200:
             self._send_json(
                 status,
-                {"error": {"message": f"mock injected failure ({status})", "type": "server_error"}},
+                { "error": {
+                    "message": _fail_message or f"mock injected failure ({status})",
+                    "type": "server_error",
+                }},
             )
             return
 

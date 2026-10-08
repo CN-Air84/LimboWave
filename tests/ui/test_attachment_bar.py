@@ -170,3 +170,19 @@ def test_attach_menu_actions_emit_bar_signals(qtbot: QtBot) -> None:
     for action, signal in zip(actions, signals, strict=True):
         with qtbot.waitSignal(signal, timeout=1000):
             action.trigger()
+
+
+def test_word_support_is_visible_in_attachment_menu(qtbot: QtBot) -> None:
+    from limbowave.domain.files import ATTACHMENT_FILE_FILTER, DOCUMENT_FILE_FILTER
+    from limbowave.ui.attachment_bar import AttachmentMenu
+    menu = AttachmentMenu()
+    qtbot.addWidget(menu)
+    action = next(item for item in menu.actions() if item.text() == "文档")
+    assert "DOC/DOCX" in action.toolTip()
+    assert "暂不支持 PDF" in action.toolTip()
+    assert menu.toolTipsVisible()
+    for file_filter in (ATTACHMENT_FILE_FILTER, DOCUMENT_FILE_FILTER):
+        assert "*.doc " in file_filter and "*.docx" in file_filter
+        assert "*.pdf" not in file_filter
+    with qtbot.waitSignal(menu.documents_requested):
+        action.trigger()

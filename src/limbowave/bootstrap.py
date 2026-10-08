@@ -32,6 +32,23 @@ class AppContext:
     python_version: str
     frozen: bool
 
+    @property
+    def development(self) -> bool:
+        return not self.frozen and is_development_environment()
+
+
+def is_development_environment() -> bool:
+    """Only an unfrozen source checkout enables developer-only entry points."""
+    if getattr(sys, "frozen", False):
+        return False
+    source = Path(__file__).resolve()
+    root = source.parents[2]
+    return (
+        source == root / "src" / "limbowave" / "bootstrap.py"
+        and (root / "pyproject.toml").is_file()
+        and (root / ".git").exists()
+    )
+
 
 def resolve_paths() -> AppPaths:
     """解析路径但不落盘，便于测试注入临时目录。

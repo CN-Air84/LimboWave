@@ -41,6 +41,7 @@ CAPABILITY_TEXT = {
     Capability.FILE_WRITE: "文件写入",
     Capability.TERMINAL: "终端执行",
     Capability.MEMORY_WRITE: "会话记忆",
+    Capability.CLOCK_READ: "当前日期和时间",
     Capability.NETWORK: "联网访问",
 }
 

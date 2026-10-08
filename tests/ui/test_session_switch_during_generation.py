@@ -81,7 +81,8 @@ async def test_browse_does_not_interrupt_or_redirect_live_reply(wired, qtbot):
     assert controller.busy
     assert not kernel.aborted
     assert not kernel.restored
-    assert not preview._input.isEnabled()
+    assert preview._input.isEnabled()
+    assert not preview._send_btn.isEnabled()
     kernel.emit("message.update", {
         "assistantMessageEvent": {"type": "text_delta", "delta": " after switch"}
     })
@@ -188,7 +189,8 @@ async def test_invalid_history_keeps_preview_and_can_return_to_live(wired):
     await wait_for(lambda: not window.chat.history_loading and len(preview._rows) == 3)
     assert window.sidebar._active_conversation_id == history_id
     assert controller.conversation_id == live_id
-    assert not preview._composer.isEnabled()
+    assert preview._composer.isEnabled()
+    assert not preview._send_btn.isEnabled()
     window.sidebar.conversation_selected.emit(live_id)
     await wait_for(lambda: window.history_preview is None)
     assert window.chat._busy
@@ -256,7 +258,8 @@ async def test_branch_navigation_and_restore_failure_keep_runtime_isolated(wired
                    and len(window.history_preview._rows) == 3)
     assert controller.conversation_id == live_id
     assert window.sidebar._active_branch_id == history_branch
-    assert not window.history_preview._composer.isEnabled()
+    assert window.history_preview._composer.isEnabled()
+    assert not window.history_preview._send_btn.isEnabled()
     # No automatic retry loop, and a failed restore cannot send to the wrong context.
     await asyncio.sleep(0.1)
     assert len(window.history_preview._rows) == 3

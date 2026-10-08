@@ -46,11 +46,12 @@ from limbowave.application.services.run_coordinator import (
     DEFAULT_CONVERSATION_TITLE,
     RunContext,
 )
+from limbowave.application.services.send_queue import QueuedSend, SendQueue
 from limbowave.application.services.session_controller import ChatEvent, SessionController
 from limbowave.application.services.thinking_trial import ThinkingTrial
 from limbowave.bootstrap import APP_DISPLAY_NAME, APP_NAME, AppContext, AppPaths, create_context
 from limbowave.domain.conversation import Message
-from limbowave.domain.files import FileKind
+from limbowave.domain.files import ATTACHMENT_FILE_FILTER, DOCUMENT_FILE_FILTER, FileKind
 from limbowave.domain.redaction import redact_text
 from limbowave.infrastructure.crypto.secret_store import migrate_legacy_secrets
 from limbowave.infrastructure.crypto.vault import InvalidPassword, Vault, VaultKey
@@ -58,9 +59,10 @@ from limbowave.infrastructure.database.sqlite_repositories import sqlite_uow_fac
 from limbowave.infrastructure.diagnostics import LogConfig, LogLevel
 from limbowave.infrastructure.diagnostics.runtime import DiagnosticRuntime
 from limbowave.infrastructure.memory_repositories import in_memory_uow_factory
+from limbowave.infrastructure.restart import restart_into_oobe
 from limbowave.infrastructure.tools.ipc_server import IPC_ENV, RATE_LIMIT_IPC_ENV, ToolIpcServer
 from limbowave.ui import markdown_render
-from limbowave.ui.chat_view import HISTORY_PAGE, HistoryEntry
+from limbowave.ui.chat_view import HISTORY_PAGE, ChatView, ComposerDraft, HistoryEntry
 from limbowave.ui.floating import (
     FloatingPanel,
     ask_alert,
@@ -247,6 +249,18 @@ def _show_startup_alert(parent: QWidget, title: str, detail: str) -> None:
     _run_panel_until_closed(panel)
 
 
+def _configuration_needs_onboarding(paths: AppPaths) -> bool:
+    """还没有可路由的模型时，先走首次引导，而不是直接进一个发不出消息的聊天。"""
+    from limbowave.application.services.configuration_service import ConfigurationService
+    from limbowave.application.services.onboarding import needs_onboarding
+    from limbowave.infrastructure.configuration.json_config_repository import (
+        JsonConfigRepository,
+    )
+
+    config = ConfigurationService(JsonConfigRepository(paths.data_root / "config.json")).load()
+    return needs_onboarding(config)
+
+
 def _unlock_vault(paths: AppPaths, parent: QWidget) -> VaultKey | None:
     """启动时的资料库解锁流。
 
@@ -370,6 +384,7 @@ def _run_context(
     ``override`` 是会话级站点覆盖（§四.3）：非空时意图快照记录**实际使用的端点**，
     与该会话真正生效的路由一致——记录与执行不能脱节。
     """
+
     def _context() -> RunContext:
         active_setup = setup.get("value") if isinstance(setup, dict) else setup
         if active_setup is None:
@@ -383,7 +398,9 @@ def _run_context(
         if active_setup.supports_thinking is False:
             level = "off"
         elif active_setup.thinking_level_locked or (
-            level and level != "off" and active_setup.available_thinking_levels
+            level
+            and level != "off"
+            and active_setup.available_thinking_levels
             and level not in active_setup.available_thinking_levels
         ):
             level = active_setup.default_thinking_level or "off"
@@ -392,7 +409,8 @@ def _run_context(
                 logical_model_id=active_setup.logical_model_id,
                 endpoint_id=chosen,
                 routing_reason=(
-                    active_setup.routing_reason if chosen == active_setup.endpoint_id
+                    active_setup.routing_reason
+                    if chosen == active_setup.endpoint_id
                     else f"会话级站点覆盖（配置默认是 {active_setup.endpoint_id}）"
                 ),
                 app_params=dict(active_setup.app_params),
@@ -555,8 +573,12 @@ def _make_permission_handler(
                 return False
             call_id = gate.get("call_id")
             params = gate.get("input")
-            if (not isinstance(call_id, str) or not call_id
-                    or not isinstance(params, dict) or set(params) != {"content"}):
+            if (
+                not isinstance(call_id, str)
+                or not call_id
+                or not isinstance(params, dict)
+                or set(params) != {"content"}
+            ):
                 return False
             content = params.get("content")
             if not isinstance(content, str):
@@ -569,14 +591,21 @@ def _make_permission_handler(
                 )
                 asked = not allowed
                 if asked:
-                    allowed = await _ask_memory_user(window, "添加会话记忆？",
+                    allowed = await _ask_memory_user(
+                        window,
+                        "添加会话记忆？",
                         f"""会话 {context.conversation_id} · 分支 {context.branch_id}
 
-{content}""")
+{content}""",
+                    )
                 allowed = allowed and memory_context is not None and memory_context() == context
                 await run_blocking(
                     memory_service.record_decision,
-                    context, call_id, content, allowed=allowed, asked=asked
+                    context,
+                    call_id,
+                    content,
+                    allowed=allowed,
+                    asked=asked,
                 )
                 allowed = allowed and memory_context is not None and memory_context() == context
                 if not allowed:
@@ -622,7 +651,8 @@ def _make_permission_handler(
             if preset is PermissionPreset.READ_ONLY:
                 risk, _reason = classify_risk(request)
                 allowed = (
-                    request.capability in (Capability.FILE_READ, Capability.NETWORK)
+                    request.capability
+                    in (Capability.FILE_READ, Capability.NETWORK, Capability.CLOCK_READ)
                     and risk is RiskLevel.NORMAL
                 )
                 await run_blocking(
@@ -717,12 +747,19 @@ def _wire(
     diagnostics_available: bool = False,
     appearance_prepared: bool = False,
 ) -> tuple[
-    SessionController, ToolIpcServer | None, Callable[[], None],
-    Callable[[], Awaitable[None]], Callable[[], Awaitable[None]],
+    SessionController,
+    ToolIpcServer | None,
+    Callable[[], None],
+    Callable[[], Awaitable[None]],
+    Callable[[], Awaitable[None]],
 ]:
     with ExitStack() as rollback:
         result = _wire_impl(
-            window, paths, key, rollback=rollback, on_reset=on_reset,
+            window,
+            paths,
+            key,
+            rollback=rollback,
+            on_reset=on_reset,
             diagnostics_available=diagnostics_available,
             appearance_prepared=appearance_prepared,
         )
@@ -758,7 +795,8 @@ def _wire_impl(
     # Later units of work still open/close their own connections on the calling thread.
     storage = (
         _run_startup_task(partial(sqlite_uow_factory, paths.data_root / "limbowave.db", key))
-        if key is not None else None
+        if key is not None
+        else None
     )
     if storage is not None:
         rollback.callback(storage.close)
@@ -771,6 +809,18 @@ def _wire_impl(
     # Display navigation must not move the single kernel away from an active run.
     preview_scope: tuple[str, str] | None = None
     detached_scope: tuple[str | None, str | None] | None = None
+    # UI-only snapshots: no plaintext draft persistence outside this unlocked window.
+    drafts: dict[tuple[str | None, str | None], ComposerDraft] = {}
+    send_queue = SendQueue()
+    queue_running = False
+    queue_dispatching = False
+    queue_active: QueuedSend | None = None
+
+    def _remember_drafts() -> None:
+        live_scope = detached_scope or (controller.conversation_id, controller.branch_id)
+        drafts[live_scope] = chat.snapshot_draft()
+        if preview_scope is not None and window.history_preview is not None:
+            drafts[preview_scope] = window.history_preview.snapshot_draft()
 
     def _display_scope() -> tuple[str | None, str | None]:
         return preview_scope or detached_scope or (controller.conversation_id, controller.branch_id)
@@ -803,9 +853,7 @@ def _wire_impl(
 
     shell_env = _run_startup_task(partial(probe_shell, paths.data_root))
     terminal = TerminalTools(create_executor(shell_env)) if shell_env is not None else None
-    tool_gateway = ToolGateway(
-        permissions, paths.data_root, documents=files, terminal=terminal
-    )
+    tool_gateway = ToolGateway(permissions, paths.data_root, documents=files, terminal=terminal)
     # 装配可观测：read_document 报「文档服务未配置」时，先看这条日志——
     # documents=False 意味着这个进程跑在未解锁状态，或是修复前的旧进程。
     _LOG.info(
@@ -874,6 +922,7 @@ def _wire_impl(
             ),
         )
         loop = asyncio.get_event_loop_policy().get_event_loop()
+
         def _rollback_ipc(server: ToolIpcServer = tool_ipc) -> None:
             loop.run_until_complete(server.stop())
 
@@ -905,9 +954,11 @@ def _wire_impl(
             ConversationProcessConfig,
         )
 
-        conversation_process = ConversationProcess(ConversationProcessConfig(
-            paths.data_root / "limbowave.db", paths.data_root, key.key_bytes()
-        ))
+        conversation_process = ConversationProcess(
+            ConversationProcessConfig(
+                paths.data_root / "limbowave.db", paths.data_root, key.key_bytes()
+            )
+        )
         rollback.callback(conversation_process.close_unstarted)
         controller.coordinator().storage_worker = conversation_process
 
@@ -926,9 +977,9 @@ def _wire_impl(
     )
     from limbowave.infrastructure.crypto.secret_store import SecretStore
 
-    memories = MemoryService(uow_factory, ConfigurationService(
-        JsonConfigRepository(paths.data_root / "config.json")
-    ))
+    memories = MemoryService(
+        uow_factory, ConfigurationService(JsonConfigRepository(paths.data_root / "config.json"))
+    )
     controller.set_memory_service(memories)
     tool_gateway.memory_service = memories
     tool_gateway.memory_context = lambda: controller.memory_context
@@ -988,9 +1039,7 @@ def _wire_impl(
         # §10.1：pwsh 缺失回退到 Windows PowerShell 5.1 必须**明示**给用户
         chat.set_status(f"终端环境：{shell_env.kind.value} {shell_env.version}（回退）")
 
-    def _apply_appearance(
-        preview: object | None = None, *, refresh_history: bool = False
-    ) -> None:
+    def _apply_appearance(preview: object | None = None, *, refresh_history: bool = False) -> None:
         """Apply a committed theme or an editor preview without persisting the latter."""
         from shiboken6 import isValid
 
@@ -1031,9 +1080,11 @@ def _wire_impl(
             _refresh_conversations()
             messages = _current_messages()
             if messages:
-                chat.load_history(_history_payload(
-                    messages, uow_factory=uow_factory, branch_id=controller.branch_id
-                ))
+                chat.load_history(
+                    _history_payload(
+                        messages, uow_factory=uow_factory, branch_id=controller.branch_id
+                    )
+                )
         chat.set_status(
             f"外观预览：{definition.name}"
             if preview is not None
@@ -1047,6 +1098,7 @@ def _wire_impl(
         history_list_generation += 1
         generation = history_list_generation
         if summaries is None:
+
             async def _read_list() -> None:
                 loaded = await history_reader.read(history.list_conversations)
                 if generation == history_list_generation:
@@ -1054,10 +1106,7 @@ def _wire_impl(
 
             _spawn(_read_list())
             return
-        rows = [
-            (s.conversation.id, s.conversation.title, s.message_count)
-            for s in summaries
-        ]
+        rows = [(s.conversation.id, s.conversation.title, s.message_count) for s in summaries]
         sidebar.show_conversations(rows)
         _refresh_branches()  # 当前会话指示 + 已展开会话的分支消息数
 
@@ -1170,8 +1219,12 @@ def _wire_impl(
     attachment_tasks: set[asyncio.Task[Any]] = set()
 
     async def _prepare_attachment_send(
-        text: str, ids: list[str], scope: tuple[str | None, str | None],
-        message_id: str | None = None, *, draft_generation: int,
+        text: str,
+        ids: list[str],
+        scope: tuple[str | None, str | None],
+        message_id: str | None = None,
+        *,
+        draft_generation: int,
     ) -> None:
         nonlocal send_preparing
         # 发送准备只锁定交互，保留聊天内容，不显示会话加载遮罩。
@@ -1180,27 +1233,37 @@ def _wire_impl(
             while attachment_tasks:
                 await asyncio.gather(*tuple(attachment_tasks))
                 ids = chat.attachments.attachment_ids()
-            if (_display_scope() != scope or controller.busy
-                    or chat.attachments.generation != draft_generation):
+            if (
+                _display_scope() != scope
+                or controller.busy
+                or chat.attachments.generation != draft_generation
+            ):
                 chat.restore_draft(text)
                 chat.set_status("运行目标已变化或正在忙，输入已保留。")
                 return
             with controller.coordinator().runtime_transition():
                 payload = await run_blocking(attachments.build, ids) if attachments else None
-                if (_display_scope() != scope
-                        or chat.attachments.generation != draft_generation):
+                if _display_scope() != scope or chat.attachments.generation != draft_generation:
                     return
             chat.attachments.clear()
             chat.set_history_loading(False)
-            kwargs: dict[str, Any] = {
-                "attachment_ids": payload.attachment_ids, "images": payload.images,
-                "document_note": payload.document_note,
-            } if payload else {}
+            kwargs: dict[str, Any] = (
+                {
+                    "attachment_ids": payload.attachment_ids,
+                    "images": payload.images,
+                    "document_note": payload.document_note,
+                }
+                if payload
+                else {}
+            )
             if message_id is None:
                 if not await _send_with_catalog_sync(text, **kwargs):
                     chat.restore_draft(text)
             else:
-                await controller.edit_user_message(message_id, text, **kwargs)
+                if not await _send_with_catalog_sync(
+                    send_action=partial(controller.edit_user_message, message_id, text, **kwargs)
+                ):
+                    chat.restore_draft(text)
         finally:
             send_preparing = False
             chat.set_history_loading(False)
@@ -1234,9 +1297,9 @@ def _wire_impl(
         ids = chat.attachments.attachment_ids()
         scope = _display_scope()
         send_preparing = True
-        _spawn(_prepare_attachment_send(
-            text, ids, scope, draft_generation=chat.attachments.generation
-        ))
+        _spawn(
+            _prepare_attachment_send(text, ids, scope, draft_generation=chat.attachments.generation)
+        )
 
     window.command_requested.connect(_send)
 
@@ -1259,6 +1322,8 @@ def _wire_impl(
         return True
 
     def _on_stop() -> None:
+        send_queue.pause("已停止生成，请确认后继续队列")
+        _sync_queue_views()
         # 压缩遮罩盖住了对话的停止键。遮罩还在时，这一下只属于压缩。
         if chat.compressing:
             if _abort_compression():
@@ -1356,7 +1421,9 @@ def _wire_impl(
             )
 
     async def _import_attachments(
-        paths: list[str], raw: bytes | None, generation: int,
+        paths: list[str],
+        raw: bytes | None,
+        generation: int,
         scope: tuple[str | None, str | None],
     ) -> None:
         assert images is not None and files is not None
@@ -1403,9 +1470,9 @@ def _wire_impl(
         if files is None or images is None:
             chat.set_status("资料库未解锁：附件功能不可用")
             return
-        _queue_attachment(_import_attachments(
-            paths, raw, chat.attachments.generation, _display_scope()
-        ))
+        _queue_attachment(
+            _import_attachments(paths, raw, chat.attachments.generation, _display_scope())
+        )
 
     def _attach_paths(paths: list[str]) -> None:
         _queue_import(paths)
@@ -1416,9 +1483,7 @@ def _wire_impl(
     def _attach_files() -> None:
         from PySide6.QtWidgets import QFileDialog
 
-        paths, _ = QFileDialog.getOpenFileNames(
-            window, "添加附件", "", "支持的文件 (*.txt *.md *.jpg *.jpeg *.png)"
-        )
+        paths, _ = QFileDialog.getOpenFileNames(window, "添加附件", "", ATTACHMENT_FILE_FILTER)
         _attach_paths(paths)
 
     def _attach_clipboard() -> None:
@@ -1511,7 +1576,8 @@ def _wire_impl(
         from PySide6.QtWidgets import QComboBox, QListWidget, QListWidgetItem, QPushButton
 
         others = [
-            s for s in await history_reader.read(history.list_conversations)
+            s
+            for s in await history_reader.read(history.list_conversations)
             if s.conversation.id != controller.conversation_id
         ]
         if not others:
@@ -1583,7 +1649,7 @@ def _wire_impl(
         lambda: _pick_files("添加图片", "图片 (*.jpg *.jpeg *.png)")
     )
     chat.attachments.attach_documents_requested.connect(
-        lambda: _pick_files("添加文档", "文档 (*.txt *.md)")
+        lambda: _pick_files("添加文档", DOCUMENT_FILE_FILTER)
     )
     chat.attachments.attach_folder_requested.connect(_attach_folder)
     chat.attachments.attach_snippet_requested.connect(_attach_snippet)
@@ -1611,17 +1677,21 @@ def _wire_impl(
             controller.coordinator().kernel,
             settings=config_settings,  # type: ignore[arg-type]
         )
-        if (preview_scope is not None
-                or scope != (controller.conversation_id, controller.branch_id)
-                or generation != usage_refresh_generation["value"]):
+        if (
+            preview_scope is not None
+            or scope != (controller.conversation_id, controller.branch_id)
+            or generation != usage_refresh_generation["value"]
+        ):
             return
         if scope[1] is not None:
             active = await run_blocking(compression.get_active, scope[1])
             if active is not None:
                 compression_trigger.mark_handled(scope[1])
-        if (preview_scope is not None
-                or scope != (controller.conversation_id, controller.branch_id)
-                or generation != usage_refresh_generation["value"]):
+        if (
+            preview_scope is not None
+            or scope != (controller.conversation_id, controller.branch_id)
+            or generation != usage_refresh_generation["value"]
+        ):
             return
         percent = report.usage.percent if report.usage else None
         chat.set_context_usage(percent, report.display)
@@ -1673,26 +1743,28 @@ def _wire_impl(
 
     def _compression_event(event: KernelEvent) -> None:
         # Isolated streams reach presentation only, never the main run coordinator.
-        if event.kind != 'message.update':
+        if event.kind != "message.update":
             return
-        delta = event.payload.get('assistantMessageEvent') or {}
-        if delta.get('type') == 'thinking_delta':
-            chat.append_thinking_delta(str(delta.get('delta', '')))
-        elif delta.get('type') == 'text_delta':
-            chat.append_assistant_delta(str(delta.get('delta', '')))
+        delta = event.payload.get("assistantMessageEvent") or {}
+        if delta.get("type") == "thinking_delta":
+            chat.append_thinking_delta(str(delta.get("delta", "")))
+        elif delta.get("type") == "text_delta":
+            chat.append_assistant_delta(str(delta.get("delta", "")))
 
     async def _do_compress(
-        *, automatic: bool = False, retry_version_id: str | None = None,
+        *,
+        automatic: bool = False,
+        retry_version_id: str | None = None,
     ) -> None:
         coordinator = controller.coordinator()
         conversation_id, branch_id = controller.conversation_id, coordinator.branch_id
         if conversation_id is None or branch_id is None:
-            chat.set_status('还没有会话可压缩')
+            chat.set_status("还没有会话可压缩")
             return
         kernel = coordinator.kernel
         if kernel is None or coordinator.busy or preview_scope is not None:
             if not automatic:
-                chat.set_status('当前正忙或未配置内核，无法压缩')
+                chat.set_status("当前正忙或未配置内核，无法压缩")
             return
         ticket = compression_trigger.try_begin(branch_id, automatic=automatic)
         if ticket is None:
@@ -1704,28 +1776,31 @@ def _wire_impl(
                 if previous is None or previous.branch_id != branch_id:
                     chat.set_status("请先切回该压缩版本所属的分支")
                     return
-            if (preview_scope is not None or coordinator.kernel is not kernel
-                    or (coordinator.conversation_id, coordinator.branch_id)
-                    != (conversation_id, branch_id)):
+            if (
+                preview_scope is not None
+                or coordinator.kernel is not kernel
+                or (coordinator.conversation_id, coordinator.branch_id)
+                != (conversation_id, branch_id)
+            ):
                 return
             # Freeze the preview boundary/route while its isolated model is running.
             with coordinator.runtime_transition():
                 await coordinator.wait_idle()
                 report = await compression.estimate(kernel)
                 version = await run_blocking(
-                    compression.create_version, conversation_id, branch_id,
+                    compression.create_version,
+                    conversation_id,
+                    branch_id,
                     tokens_before=report.usage.tokens if report.usage else 0,
-                    compression_model_id=setup.logical_model_id if setup else '',
-                    compression_endpoint_id=setup.endpoint_id if setup else '',
+                    compression_model_id=setup.logical_model_id if setup else "",
+                    compression_endpoint_id=setup.endpoint_id if setup else "",
                 )
                 await _run_compression(version.id, kernel)
 
             from limbowave.ui.compression_widgets import CompressionPreviewDialog
 
-            panel = FloatingPanel(window, '压缩预览', width=760)
-            dialog = CompressionPreviewDialog(
-                compression, version.id, panel, runtime_managed=True
-            )
+            panel = FloatingPanel(window, "压缩预览", width=760)
+            dialog = CompressionPreviewDialog(compression, version.id, panel, runtime_managed=True)
             dialog.setWindowFlags(Qt.WindowType.Widget)
 
             async def apply_version(version_id: str, edited: str) -> None:
@@ -1777,9 +1852,7 @@ def _wire_impl(
         preset = permission_preset_draft[0]
         permissions.set_preset(conversation_id, preset)
         if preset is PermissionPreset.CUSTOM:
-            saved = {
-                grant.capability for grant in permissions.list_grants(conversation_id)
-            }
+            saved = {grant.capability for grant in permissions.list_grants(conversation_id)}
             if saved != permission_custom_draft:
                 permissions.replace_custom_grants(
                     conversation_id,
@@ -1794,9 +1867,12 @@ def _wire_impl(
     async def _flush_prompt_permissions() -> None:
         if conversation_process is not None and controller.conversation_id is not None:
             await conversation_process.call(
-                "permissions", (controller.conversation_id, controller.branch_id),
-                controller.conversation_id, permission_preset_draft[0],
-                set(permission_custom_draft), str(tool_gateway.workspace_root),
+                "permissions",
+                (controller.conversation_id, controller.branch_id),
+                controller.conversation_id,
+                permission_preset_draft[0],
+                set(permission_custom_draft),
+                str(tool_gateway.workspace_root),
             )
 
     if conversation_process is not None:
@@ -1824,8 +1900,10 @@ def _wire_impl(
     async def _prepare_custom_permission_panel() -> None:
         conversation_id = controller.conversation_id
         selected = (
-            {grant.capability for grant in
-             await run_blocking(permissions.list_grants, conversation_id)}
+            {
+                grant.capability
+                for grant in await run_blocking(permissions.list_grants, conversation_id)
+            }
             if conversation_id is not None
             else set(permission_custom_draft)
         )
@@ -1842,7 +1920,8 @@ def _wire_impl(
             if conversation_id is not None:
                 async with permission_updates:
                     await run_blocking(
-                        permissions.replace_custom_grants, conversation_id,
+                        permissions.replace_custom_grants,
+                        conversation_id,
                         capabilities,
                         workspace_root=str(tool_gateway.workspace_root),
                     )
@@ -1890,7 +1969,9 @@ def _wire_impl(
         branches: list[tuple[str, str, int]]
 
     def _read_history_view(
-        conversation_id: str, branch_id: str | None, cached_items: set[str],
+        conversation_id: str,
+        branch_id: str | None,
+        cached_items: set[str],
         prepared: HistoryViewPayload | None = None,
     ) -> _LoadedHistory | None:
         data = prepared or load_history_view(uow_factory, conversation_id, branch_id)
@@ -1898,29 +1979,41 @@ def _wire_impl(
             return None
         branch_id, messages, payload = data.branch_id, data.messages, data.entries
         offset = max(0, len(payload) - HISTORY_PAGE)
-        while (0 < offset < len(payload) and payload[offset].run_id is not None
-               and payload[offset - 1].run_id == payload[offset].run_id):
+        while (
+            0 < offset < len(payload)
+            and payload[offset].run_id is not None
+            and payload[offset - 1].run_id == payload[offset].run_id
+        ):
             offset -= 1
         rendered = {
             text: markdown_render.render(text)
-            for entry in payload[offset:] if entry.role == "assistant"
-            for text in ([part.content for part in entry.segments]
-                         if entry.segments else [entry.content])
+            for entry in payload[offset:]
+            if entry.role == "assistant"
+            for text in (
+                [part.content for part in entry.segments] if entry.segments else [entry.content]
+            )
         }
         # 一次读取所有用户消息的附件索引，避免每渲染一行都在 GUI 线程扫描/解密快照。
         ids = data.attachment_ids
         # 与消息窗口一样只解码当前页图片，避免长会话一次载入全部原图。
-        visible_users = {
-            entry.message_id for entry in payload[offset:] if entry.role == "user"
-        }
+        visible_users = {entry.message_id for entry in payload[offset:] if entry.role == "user"}
         attachment_ids = {
-            aid for message_id, values in ids.items() if message_id in visible_users
+            aid
+            for message_id, values in ids.items()
+            if message_id in visible_users
             for aid in values
         }
         items = {aid: _read_sent_attachment(aid) for aid in attachment_ids - cached_items}
         return _LoadedHistory(
-            branch_id, messages, payload, rendered, ids, items,
-            data.preset, data.capabilities, data.branches,
+            branch_id,
+            messages,
+            payload,
+            rendered,
+            ids,
+            items,
+            data.preset,
+            data.capabilities,
+            data.branches,
         )
 
     def _set_history_loading(loading: bool, text: str = "正在加载会话…") -> None:
@@ -1932,25 +2025,49 @@ def _wire_impl(
 
     async def _activate_preview(scope: tuple[str, str]) -> None:
         # A queued completion must not override a more recent sidebar selection.
-        if preview_scope == scope and not controller.busy and not shutting_down:
+        if (
+            preview_scope == scope
+            and not controller.busy
+            and not shutting_down
+            and not send_queue.ready
+            and not queue_dispatching
+        ):
             await _open_history(*scope, from_preview=True)
 
     async def _open_history(
-        conversation_id: str, branch_id: str | None = None, *, from_preview: bool = False
+        conversation_id: str,
+        branch_id: str | None = None,
+        *,
+        from_preview: bool = False,
+        preview_only: bool = False,
+        keep_preview: bool = False,
+        from_queue: bool = False,
     ) -> None:
         nonlocal preview_scope, detached_scope
-        if chat.history_loading or chat.compressing or shutting_down:
+        if (
+            chat.history_loading
+            or chat.compressing
+            or shutting_down
+            or (queue_dispatching and not from_queue)
+        ):
             sidebar.set_active(*_display_scope())
             return
-        if detached_scope is None and conversation_id == controller.conversation_id and (
-            branch_id is None or branch_id == controller.branch_id
+        _remember_drafts()
+        if (
+            not preview_only
+            and detached_scope is None
+            and conversation_id == controller.conversation_id
+            and (branch_id is None or branch_id == controller.branch_id)
         ):
+            if keep_preview:
+                return
             # Return to the actual live widgets, including draft, tools and partial text.
             preview_scope = None
             detached_scope = None
             window.clear_history_preview()
             sidebar.set_active(*_display_scope())
             toolbar.setEnabled(True)
+            _sync_queue_views()
             return
         label = "分支" if branch_id is not None else "会话"
         _set_history_loading(True, f"正在加载{label}…")
@@ -1978,16 +2095,19 @@ def _wire_impl(
             # Cache attachments for both surfaces; never change active permission drafts
             # or kernel scope just to look at another conversation during generation.
             sent_ids_by_message.update(loaded.attachment_ids)
-            sent_items.update({
-                aid: _display_attachment(data) for aid, data in loaded.attachments.items()
-            })
-            if controller.busy:
+            sent_items.update(
+                {aid: _display_attachment(data) for aid, data in loaded.attachments.items()}
+            )
+            if controller.busy or preview_only:
                 preview = window.prepare_history_preview()
+                _wire_queue_view(preview)
                 preview.set_attachment_resolver(_sent_attachments)
                 preview.set_permission_preset(loaded.preset)
                 preview.set_tool_steps_visible(not chat._tool_steps_hidden)
                 await preview.load_history_incrementally(loaded.payload, rendered=loaded.rendered)
                 preview_scope = (conversation_id, loaded.branch_id)
+                preview.set_draft(drafts.get(preview_scope, ComposerDraft()))
+                preview.set_draft_waiting(restore_failed=False)
                 sidebar.set_branches(conversation_id, loaded.branches)
                 window.show_history_preview()
                 preview_loaded = True
@@ -1997,6 +2117,8 @@ def _wire_impl(
                 conversation_id, loaded.branch_id, known_has_messages=bool(loaded.messages)
             )
             if not switched:
+                if window.history_preview is not None:
+                    window.history_preview.set_draft_waiting(restore_failed=True)
                 (window.history_preview or chat).add_error(
                     f"切换{label}失败：当前正忙或无法恢复历史上下文"
                 )
@@ -2005,23 +2127,221 @@ def _wire_impl(
             permission_custom_draft.clear()
             permission_custom_draft.update(loaded.capabilities)
             chat.set_permission_preset(loaded.preset)
-            sidebar.set_branches(conversation_id, loaded.branches)
+            if not keep_preview:
+                sidebar.set_branches(conversation_id, loaded.branches)
             await chat.load_history_incrementally(loaded.payload, rendered=loaded.rendered)
-            preview_scope = None
+            chat.set_draft(drafts.get((conversation_id, loaded.branch_id), ComposerDraft()))
+            if not keep_preview:
+                preview_scope = None
+                window.clear_history_preview()
             detached_scope = None
-            window.clear_history_preview()
             chat.set_status(f"已切换到历史{label}（{len(loaded.messages)} 条消息）")
             _refresh_agent_state()
             _spawn(_refresh_usage())
         finally:
             sidebar.set_active(*_display_scope())
             _set_history_loading(False)
+            _sync_queue_views()
             # Settlement may have arrived during either threaded reading or rendering.
             if (
-                preview_scope is not None and not controller.busy
+                preview_scope is not None
+                and not controller.busy
+                and not preview_only
+                and not keep_preview
                 and (preview_loaded or (not from_preview and not attempted_switch))
             ):
                 _spawn(_activate_preview(preview_scope))
+
+    # ---------- 跨会话文字发送队列（只在本次解锁窗口内存中保留） ----------
+
+    def _sync_queue_views() -> None:
+        live_scope = detached_scope or (controller.conversation_id, controller.branch_id)
+        for view, scope in ((chat, live_scope), (window.history_preview, preview_scope)):
+            if view is None:
+                continue
+            entries = tuple(
+                (index, item)
+                for index, item in enumerate(send_queue.items, 1)
+                if item.scope == scope
+            )
+            can_enqueue = bool(
+                scope is not None
+                and all(scope)
+                and controller.available
+                and (controller.busy or send_queue.items)
+                and not shutting_down
+            )
+            view.set_send_queue(
+                entries,
+                len(send_queue.items),
+                send_queue.paused_reason,
+                can_enqueue=can_enqueue,
+                dispatching=queue_dispatching,
+            )
+
+    def _enqueue_text(view: ChatView, text: str) -> None:
+        scope = (
+            preview_scope
+            if view is window.history_preview
+            else (detached_scope or (controller.conversation_id, controller.branch_id))
+        )
+        if (
+            shutting_down
+            or view.history_loading
+            or not view._can_queue()
+            or view.snapshot_draft().text.strip() != text.strip()
+            or scope is None
+            or scope[0] is None
+            or scope[1] is None
+        ):
+            return
+        try:
+            send_queue.enqueue((scope[0], scope[1]), text)
+        except ValueError as exc:
+            view.add_error(str(exc))
+            return
+        view.set_draft(ComposerDraft())
+        drafts[scope] = view.snapshot_draft()
+        _sync_queue_views()
+        _kick_queue()
+
+    def _cancel_queued(item_id: str) -> None:
+        _remember_drafts()
+        pending = next((item for item in send_queue.items if item.id == item_id), None)
+        if pending is not None and drafts.get(pending.scope, ComposerDraft()).editing_message_id:
+            (window.history_preview or chat).add_error("请先完成或取消旧消息编辑，再撤回排队消息")
+            return
+        item = send_queue.cancel(item_id)
+        if item is None:
+            return
+        _remember_drafts()
+        draft = drafts.get(item.scope, ComposerDraft())
+        text = f"{draft.text}\n{item.text}" if draft.text else item.text
+        drafts[item.scope] = replace(draft, text=text)
+        live_scope = detached_scope or (controller.conversation_id, controller.branch_id)
+        if item.scope == live_scope:
+            chat.set_draft(drafts[item.scope])
+        if item.scope == preview_scope and window.history_preview is not None:
+            window.history_preview.set_draft(drafts[item.scope])
+        _sync_queue_views()
+        _kick_queue()
+        if not send_queue.items and preview_scope is not None:
+            _spawn(_activate_preview(preview_scope))
+
+    def _resume_queue() -> None:
+        if queue_dispatching:
+            return
+        send_queue.resume()
+        _sync_queue_views()
+        _kick_queue()
+
+    def _wire_queue_view(view: ChatView) -> None:
+        if view.property("sendQueueWired"):
+            return
+        view.setProperty("sendQueueWired", True)
+        view.message_queued.connect(lambda text: _enqueue_text(view, text))
+        view.queue_cancel_requested.connect(_cancel_queued)
+        view.queue_resume_requested.connect(_resume_queue)
+
+    def _kick_queue() -> None:
+        nonlocal queue_running
+        if not shutting_down and send_queue.ready and not queue_running:
+            queue_running = True
+            _spawn(_queue_worker())
+
+    async def _queue_worker() -> None:
+        nonlocal queue_running
+        try:
+            await _drain_queue()
+        finally:
+            queue_running = False
+
+    def _queue_scope_exists(scope: tuple[str, str]) -> bool:
+        with uow_factory() as uow:
+            branch = uow.branches.get(scope[1])
+            return (
+                uow.conversations.get(scope[0]) is not None
+                and branch is not None
+                and branch.conversation_id == scope[0]
+            )
+
+    async def _drain_queue() -> None:
+        nonlocal queue_dispatching, queue_active
+        from limbowave.application.services.run_coordinator import CommandBusy
+
+        while not shutting_down and send_queue.ready:
+            # Poll only while pending; transient loading/model/compression commands have
+            # no common completion signal. There is still only one worker and one run.
+            if controller.busy or chat.history_loading or chat.compressing or send_preparing:
+                await asyncio.sleep(0.1)
+                continue
+            try:
+                with controller.coordinator().command_scope():
+                    queue_dispatching = True
+                    item = send_queue.begin()
+                    if item is None:
+                        return
+                    queue_active = item
+                    _sync_queue_views()
+                    await controller.wait_idle()
+                    if not await history_reader.read(_queue_scope_exists, item.scope):
+                        raise RuntimeError("目标会话或分支已不存在，请撤回草稿")
+                    # Preserve the selected saved conversation as a draft-only surface.
+                    selected = _display_scope()
+                    if (
+                        selected != item.scope
+                        and preview_scope is None
+                        and selected[0] is not None
+                        and selected[1] is not None
+                    ):
+                        await _open_history(
+                            selected[0], selected[1], preview_only=True, from_queue=True
+                        )
+                        if preview_scope != selected:
+                            raise RuntimeError("无法保留当前会话视图，队列已暂停")
+                    keep_preview = preview_scope is not None and preview_scope != item.scope
+                    await _open_history(*item.scope, keep_preview=keep_preview, from_queue=True)
+                    if (controller.conversation_id, controller.branch_id) != item.scope:
+                        raise RuntimeError("无法恢复目标会话或分支，请重新打开后继续队列")
+                    if shutting_down:
+                        return
+                    # Explicitly estimate the restored target, not the visible preview.
+                    report = await compression.estimate(
+                        controller.coordinator().kernel,
+                        settings=_compression_settings(),  # type: ignore[arg-type]
+                    )
+                    if report.action.value == "block":
+                        raise RuntimeError("目标会话上下文接近上限，请压缩后继续队列")
+                    if send_queue.paused_reason:
+                        raise RuntimeError(send_queue.paused_reason)
+                    accepted = await _send_with_catalog_sync(item.text)
+                    if not accepted:
+                        raise RuntimeError("发送未被接受，请检查模型与会话状态后继续队列")
+                    # Acceptance is normally removed by the user event, before model I/O.
+                    send_queue.accept(item.id)
+            except CommandBusy:
+                if queue_active is not None:
+                    send_queue.fail(queue_active.id, "其他设备正在提交，请稍后继续队列")
+                else:
+                    await asyncio.sleep(0.1)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if queue_active is not None:
+                    send_queue.fail(queue_active.id, redact_text(str(exc)))
+            finally:
+                queue_active = None
+                queue_dispatching = False
+                _sync_queue_views()
+        if (
+            not shutting_down
+            and not controller.busy
+            and preview_scope is not None
+            and not send_queue.paused_reason
+        ):
+            await _activate_preview(preview_scope)
+
+    _wire_queue_view(chat)
 
     async def _open_conversation(conversation_id: str) -> None:
         await _open_history(conversation_id)
@@ -2039,16 +2359,44 @@ def _wire_impl(
         if shutting_down or generation != history_list_generation:
             return
         rows = [(h.conversation.id, f"{h.conversation.title} — {h.snippet}") for h in hits]
-        sidebar.show_search_results(rows)
+        targets = [
+            (
+                h.conversation.id,
+                h.message.branch_id if h.message else None,
+                h.message.id if h.message else None,
+                text.strip(),
+            )
+            for h in hits
+        ]
+        sidebar.show_search_results(rows, targets=targets)
         if results is not None and isValid(results):
             from PySide6.QtWidgets import QListWidgetItem
 
             results.clear()
-            for conversation_id, label in rows:
+            for (_, label), target in zip(rows, targets, strict=True):
                 item = QListWidgetItem(label)
-                item.setData(Qt.ItemDataRole.UserRole, conversation_id)
+                item.setData(Qt.ItemDataRole.UserRole, target)
                 results.addItem(item)
 
+    async def _open_search_target(target: tuple[str, str | None, str | None, str]) -> None:
+        conversation_id, branch_id, message_id, query = target
+        if chat.history_loading or chat.compressing or shutting_down:
+            return
+        await _open_history(conversation_id, branch_id)
+        displayed_conversation, displayed_branch = _display_scope()
+        if displayed_conversation != conversation_id or (
+            branch_id is not None and displayed_branch != branch_id
+        ):
+            return
+        surface = window.history_preview if preview_scope is not None else chat
+        if surface is not None:
+            if message_id is not None:
+                if not surface.show_search_match(query, message_id):
+                    surface.set_status("未能定位搜索消息，请重新搜索")
+            else:
+                surface.clear_search_matches()
+
+    sidebar.search_hit_selected.connect(lambda target: _spawn(_open_search_target(target)))
     search_timer.timeout.connect(lambda: _spawn(_search_history()))
 
     def _on_search(text: str, results: Any = None) -> None:
@@ -2079,10 +2427,10 @@ def _wire_impl(
             _on_search(text, results)
 
         def _open_hit(item: QListWidgetItem) -> None:
-            conversation_id = item.data(Qt.ItemDataRole.UserRole)
-            if conversation_id:
+            target = item.data(Qt.ItemDataRole.UserRole)
+            if target:
                 panel.close_panel()
-                _spawn(_open_conversation(str(conversation_id)))
+                _spawn(_open_search_target(target))
 
         edit.textChanged.connect(_refresh_hits)
         results.itemClicked.connect(_open_hit)
@@ -2091,9 +2439,7 @@ def _wire_impl(
 
     settings_page: SettingsPage | None = None
 
-    def _open_settings(
-        initial_tab: str | None = None, *, warm_only: bool = False
-    ) -> None:
+    def _open_settings(initial_tab: str | None = None, *, warm_only: bool = False) -> None:
         nonlocal settings_page
         if credentials is None:
             chat.set_status("资料库未解锁：设置不可用")
@@ -2169,7 +2515,9 @@ def _wire_impl(
             try:
                 result = await _run_probe(
                     partial(probe_model_capabilities, on_progress=report_progress),
-                    task.endpoint, task.model_id, secret,
+                    task.endpoint,
+                    task.model_id,
+                    secret,
                 )
             except Exception:
                 if isValid(page):
@@ -2289,9 +2637,12 @@ def _wire_impl(
 
     async def _on_new_conversation() -> None:
         nonlocal preview_scope, detached_scope
-        if chat.history_loading:
+        if chat.history_loading or queue_dispatching:
             return
+        _remember_drafts()
         if await controller.new_session():
+            drafts.pop((None, None), None)
+            chat.set_draft(ComposerDraft())
             preview_scope = None
             detached_scope = None
             window.clear_history_preview()
@@ -2301,6 +2652,7 @@ def _wire_impl(
             permission_preset_draft[0] = PermissionPreset.CHAT_ONLY
             permission_custom_draft.clear()
             chat.set_permission_preset(PermissionPreset.CHAT_ONLY)
+            _sync_queue_views()
         else:
             chat.set_status("未能新建会话：当前正忙，或内核上下文未成功重置")
         _refresh_branches()  # 左栏指示跟随（新会话落库前没有高亮行）
@@ -2310,14 +2662,9 @@ def _wire_impl(
         _spawn(_rename_conversation(conversation_id))
 
     async def _rename_conversation(conversation_id: str) -> None:
-        current = next(
-            (
-                s.conversation.title
-                for s in await history_reader.read(history.list_conversations)
-                if s.conversation.id == conversation_id
-            ),
-            "",
-        )
+        current = await history_reader.read(history.title, conversation_id)
+        if current is None:
+            return
 
         def _do_rename(new_title: str) -> None:
             _spawn(_rename(new_title))
@@ -2326,17 +2673,52 @@ def _wire_impl(
             await run_blocking(history.rename, conversation_id, new_title)
             _refresh_conversations()
 
+        async def _suggest_title() -> str | None:
+            if shutting_down:
+                return None
+            # 与应用退出流程共享任务生命周期，先停临时内核再关历史存储。
+            task = asyncio.current_task()
+            if task is not None:
+                _pending_tasks.add(task)
+            try:
+                route = _active_title_route()
+                kernel = controller.coordinator().kernel
+                if route is None or kernel is None:
+                    raise ValueError("请先配置可用的模型和站点，再使用 AI 重命名。")
+
+                # 读取目标会话的完整分支，而非首轮事件或另一个会话的内核上下文。
+                displayed_id, branch_id = _display_scope()
+                if displayed_id != conversation_id:
+                    branch_id = (
+                        controller.branch_id
+                        if controller.conversation_id == conversation_id else None
+                    )
+                if branch_id is not None:
+                    messages = await history_reader.read(history.branch_messages, branch_id)
+                else:
+                    opened = await history_reader.read(history.open_conversation, conversation_id)
+                    messages = opened[1] if opened is not None else []
+                if not any(message.content.strip() for message in messages):
+                    raise ValueError("这个会话还没有可用于命名的对话内容，请先手动输入名称。")
+                return await conversation_titles.suggest_for_messages(
+                    kernel, messages, provider=route[0], model_id=route[1],
+                )
+            finally:
+                if task is not None:
+                    _pending_tasks.discard(task)
+
         ask_prompt(
             window,
             "重命名会话",
             "新标题：",
             _do_rename,
             default_text=current,
+            on_suggest=_suggest_title,
         )
 
     def _on_delete(conversation_id: str) -> None:
         async def _delete() -> None:
-            if controller.busy:
+            if controller.busy or queue_dispatching:
                 chat.set_status("当前会话仍在进行中或正在切换，请稍后删除")
                 return
             is_active = controller.conversation_id == conversation_id
@@ -2350,8 +2732,15 @@ def _wire_impl(
                     await controller.wait_idle()
             if not await run_blocking(history.delete, conversation_id):
                 return
+            for item in send_queue.items:
+                if item.scope[0] == conversation_id:
+                    send_queue.cancel(item.id)
+            _sync_queue_views()
+            for scope in [scope for scope in drafts if scope[0] == conversation_id]:
+                del drafts[scope]
             if is_active:
                 chat.clear_transcript()
+                chat.set_draft(ComposerDraft())
             _refresh_conversations()
             _refresh_agent_state()
 
@@ -2375,8 +2764,9 @@ def _wire_impl(
         current = next(
             (
                 label
-                for candidate_id, label, _count in
-                await history_reader.read(history.list_branches, conversation_id)
+                for candidate_id, label, _count in await history_reader.read(
+                    history.list_branches, conversation_id
+                )
                 if candidate_id == branch_id
             ),
             "",
@@ -2472,9 +2862,15 @@ def _wire_impl(
 
         def load_rows() -> list[Any]:
             return [
-                (summary.conversation.id, summary.conversation.title,
-                 [(bid, label) for bid, label, _ in
-                  history.list_branches(summary.conversation.id)], summary.last_activity)
+                (
+                    summary.conversation.id,
+                    summary.conversation.title,
+                    [
+                        (bid, label)
+                        for bid, label, _ in history.list_branches(summary.conversation.id)
+                    ],
+                    summary.last_activity,
+                )
                 for summary in history.list_conversations()
             ]
 
@@ -2490,7 +2886,10 @@ def _wire_impl(
         from limbowave.infrastructure.crypto.blob_store import BlobStore
 
         def _run_export(
-            branch_ids: list[str], _labels: list[str], fmt: str, target: Path,
+            branch_ids: list[str],
+            _labels: list[str],
+            fmt: str,
+            target: Path,
             include_model_info: bool,
         ) -> None:
             def _proceed(ok: bool) -> None:
@@ -2504,7 +2903,8 @@ def _wire_impl(
                 try:
                     config = settings.load()
                     exporter = ExportService(
-                        uow_factory, blob_store,
+                        uow_factory,
+                        blob_store,
                         include_model_info=include_model_info,
                         model_names={model.id: model.name for model in config.models},
                         endpoint_names={
@@ -2520,13 +2920,19 @@ def _wire_impl(
                 chat.set_status(f"已导出 {len(outputs)} 个分支到 {destination}")
 
             ask_confirm(
-                window, "导出前请确认", privacy_notice(include_model_info=include_model_info),
-                _proceed, confirm_text="导出",
+                window,
+                "导出前请确认",
+                privacy_notice(include_model_info=include_model_info),
+                _proceed,
+                confirm_text="导出",
             )
 
         ExportPanel(
-            window, rows, default_dir=str(Path.home()),
-            current_branch_id=controller.coordinator().branch_id, on_export=_run_export,
+            window,
+            rows,
+            default_dir=str(Path.home()),
+            current_branch_id=controller.coordinator().branch_id,
+            on_export=_run_export,
         )
 
     def _backup() -> None:
@@ -2716,9 +3122,11 @@ def _wire_impl(
                 "history_payload", (None, branch_id), branch_id
             )
             return result
-        return await history_reader.read(lambda: _history_payload(
-            history.branch_messages(branch_id), uow_factory=uow_factory, branch_id=branch_id
-        ))
+        return await history_reader.read(
+            lambda: _history_payload(
+                history.branch_messages(branch_id), uow_factory=uow_factory, branch_id=branch_id
+            )
+        )
 
     def _current_messages() -> list[Message]:
         """当前定位分支的完整对话（含分叉前继承的前缀）。未定位返回空。"""
@@ -2732,6 +3140,7 @@ def _wire_impl(
         ``user`` 事件。此时不能使用异步的渐隐/渐显切换：否则新用户气泡先追加，
         动画完成后又被分叉点快照覆盖。只有用户主动切换分支时才播放动画。
         """
+
         async def show() -> None:
             scope = _display_scope()
             payload = await _load_branch_payload(branch_id)
@@ -2776,10 +3185,15 @@ def _wire_impl(
         if chat.history_loading or send_preparing:
             return
         send_preparing = True
-        _spawn(_prepare_attachment_send(
-            new_text, chat.attachments.attachment_ids(), _display_scope(), message_id,
-            draft_generation=chat.attachments.generation,
-        ))
+        _spawn(
+            _prepare_attachment_send(
+                new_text,
+                chat.attachments.attachment_ids(),
+                _display_scope(),
+                message_id,
+                draft_generation=chat.attachments.generation,
+            )
+        )
 
     def _on_fork(message_id: str) -> None:
         if detached_scope is not None:
@@ -2805,7 +3219,9 @@ def _wire_impl(
         async def regenerate() -> None:
             nonlocal regenerate_pending
             try:
-                await controller.regenerate(message_id)
+                await _send_with_catalog_sync(
+                    send_action=partial(controller.regenerate, message_id)
+                )
             finally:
                 regenerate_pending = False
                 if not shutting_down:
@@ -2819,7 +3235,9 @@ def _wire_impl(
             return
         if chat.history_loading:
             return
-        _spawn(controller.retry_user_message(message_id))
+        _spawn(
+            _send_with_catalog_sync(send_action=partial(controller.retry_user_message, message_id))
+        )
 
     def _on_switch_branch(conversation_id: str, branch_id: str) -> None:
         _spawn(_open_history(conversation_id, branch_id))
@@ -2840,9 +3258,7 @@ def _wire_impl(
     chat.regenerate_requested.connect(_on_regenerate)
     chat.retry_requested.connect(_on_retry)
     sidebar.branch_switch_requested.connect(_on_switch_branch)
-    sidebar.branches_requested.connect(
-        lambda cid: _spawn(_load_branches(cid))
-    )
+    sidebar.branches_requested.connect(lambda cid: _spawn(_load_branches(cid)))
 
     # ---------- 工具步骤（§三.2） ----------
 
@@ -2958,14 +3374,15 @@ def _wire_impl(
         )
         endpoint = session_endpoint_override["endpoint"] or setup.endpoint_id
         # 站点展示用显示名（EndpointConfig.name），id 只作会话目标标识
-        endpoint_label = next(
-            (e.name for e in config.endpoints if e.id == endpoint), endpoint
-        )
+        endpoint_label = next((e.name for e in config.endpoints if e.id == endpoint), endpoint)
         suffix = "（会话覆盖）" if session_endpoint_override["endpoint"] else ""
         toolbar.set_model_info(setup.logical_model_id, f"{endpoint_label}{suffix}")
         chat.set_logical_models(
-            model_entries, setup.logical_model_id, sites=model_sites,
-            current_endpoint=endpoint, overridden=bool(session_endpoint_override["endpoint"]),
+            model_entries,
+            setup.logical_model_id,
+            sites=model_sites,
+            current_endpoint=endpoint,
+            overridden=bool(session_endpoint_override["endpoint"]),
         )
         _sync_toolbar_route_candidates()
 
@@ -2987,7 +3404,8 @@ def _wire_impl(
 
         temporary_levels: dict[tuple[str, str], tuple[str, ...]] = (
             {(thinking_trial.endpoint_id, thinking_trial.model_id): (thinking_trial.level,)}
-            if thinking_trial is not None else {}
+            if thinking_trial is not None
+            else {}
         )
 
         def prepare_catalog() -> Any:
@@ -2996,10 +3414,10 @@ def _wire_impl(
                 catalog, temporary_thinking_levels=temporary_levels
             )
 
-        sync = await run_blocking(prepare_catalog)
-        if sync.fingerprint == catalog_state["fingerprint"]:
-            return True
         try:
+            sync = await run_blocking(prepare_catalog)
+            if sync.fingerprint == catalog_state["fingerprint"]:
+                return True
             await kernel.reload_models(sync.env, sync.registered)
         except Exception as exc:
             chat.add_error(f"模型目录热更新失败：{redact_text(str(exc))}")
@@ -3007,8 +3425,44 @@ def _wire_impl(
         catalog_state["fingerprint"] = sync.fingerprint
         return True
 
-    async def _send_with_catalog_sync(text: str, **send_kwargs: Any) -> bool:
-        """Reserve target restoration, model sync and acceptance as one transition."""
+    def _refresh_current_route() -> bool:
+        """Refresh the selected binding, never silently choose another model/site."""
+        nonlocal setup
+        if setup is None or "model" not in setup.app_params:
+            return True  # Unrouted temporary controllers have no binding to refresh.
+        from limbowave.application.services.routing_service import RoutingService
+        from limbowave.composition import kernel_setup
+        from limbowave.domain.routing import RoutingError
+
+        try:
+            decision = RoutingService(settings.load()).route(
+                setup.logical_model_id, endpoint_id=setup.endpoint_id
+            )
+        except RoutingError as exc:
+            _refresh_toolbar()
+            chat.set_status(f"当前模型或站点已不可用，请重新选择模型：{exc}")
+            return False
+        kernel = controller.coordinator().kernel
+        if kernel is None:
+            return False
+        refreshed = replace(kernel_setup(kernel, decision), routing_reason=setup.routing_reason)
+        baseline = thinking_trial.base_setup if thinking_trial is not None else setup
+        if replace(baseline, runtime_thinking_levels=None) != refreshed:
+            # Clear a trial only when its underlying binding/configuration changed.
+            # Otherwise an ordinary send would discard the user's opt-in level.
+            _clear_thinking_trial()
+            setup = refreshed
+            setup_state["value"] = setup
+            _refresh_toolbar()
+        return True
+
+    async def _send_with_catalog_sync(
+        text: str = "",
+        *,
+        send_action: Callable[[], Awaitable[str | None]] | None = None,
+        **send_kwargs: Any,
+    ) -> bool:
+        """Reserve restoration, route/catalog refresh and all desktop send actions."""
         nonlocal detached_scope
         from limbowave.application.services.run_coordinator import CommandBusy
 
@@ -3029,44 +3483,28 @@ def _wire_impl(
                         return False
                     detached_scope = None
                     toolbar.setEnabled(True)
-                if setup is not None:
+                if setup is not None and "model" in setup.app_params:
+                    # Match RunCoordinator's preflight: temporary unrouted kernels
+                    # do not depend on a configured catalog or unlocked credentials.
                     with controller.coordinator().runtime_transition():
-                        if not await _sync_model_catalog():
+                        if not _refresh_current_route() or not await _sync_model_catalog():
                             return False
+                if send_action is not None:
+                    return await send_action() is not None
                 return await controller.send(text, **send_kwargs) is not None
         except CommandBusy:
             chat.set_status("另一个设备正在提交，输入已保留。")
             return False
 
     async def _on_config_changed() -> None:
-        """设置页关闭后：热更新模型目录，并让当前运行上下文跟上新配置。"""
-        nonlocal setup
+        """设置页关闭后刷新；忙碌时延后，由下一次发送重新核对当前绑定。"""
         request_limiter.configure(settings.load().endpoints)
         if controller.busy:
             return
         with controller.coordinator().runtime_transition():
             _clear_thinking_trial()
-            if setup is None or not await _sync_model_catalog():
+            if setup is None or not _refresh_current_route() or not await _sync_model_catalog():
                 return
-            from limbowave.application.services.routing_service import RoutingService
-            from limbowave.composition import kernel_setup
-
-            current = next(
-                (
-                    d
-                    for d in RoutingService(settings.load()).catalog()
-                    if d.model.id == setup.logical_model_id and d.endpoint.id == setup.endpoint_id
-                ),
-                None,
-            )
-            if current is None:
-                chat.set_status("当前模型或站点已从配置中移除，请重新选择模型")
-                return
-            kernel = controller.coordinator().kernel
-            assert kernel is not None
-            # 只刷新能力与参数，不改路由：保留原路由理由
-            setup = replace(kernel_setup(kernel, current), routing_reason=setup.routing_reason)
-            setup_state["value"] = setup
             _refresh_toolbar()
             await _refresh_thinking_level()
 
@@ -3082,17 +3520,21 @@ def _wire_impl(
             _refresh_toolbar()
             return
         with controller.coordinator().runtime_transition():
-            if model_id == setup.logical_model_id and endpoint_id is None:
-                return
-
             from limbowave.application.services.routing_service import RoutingService
             from limbowave.composition import kernel_setup
             from limbowave.domain.routing import RoutingError
 
+            routing = RoutingService(settings.load())
+            if model_id == setup.logical_model_id and endpoint_id is None:
+                try:
+                    routing.route(model_id, endpoint_id=setup.endpoint_id)
+                except RoutingError:
+                    pass  # Explicit re-selection may recover a removed binding.
+                else:
+                    return  # Preserve a still-valid session endpoint override.
+
             try:
-                decision = RoutingService(settings.load()).route(
-                    model_id, endpoint_id=endpoint_id or None
-                )
+                decision = routing.route(model_id, endpoint_id=endpoint_id or None)
             except RoutingError as exc:
                 chat.set_status(str(exc))
                 _refresh_toolbar()
@@ -3184,23 +3626,36 @@ def _wire_impl(
             _clear_thinking_trial()
             assert setup is not None
             trial = ThinkingTrial(
-                setup, str(setup.app_params.get("model", "")), level,
+                setup,
+                str(setup.app_params.get("model", "")),
+                level,
                 thinking_state["level"] or "off",
             )
             thinking_trial = trial
             original_levels = tuple(
-                candidate for candidate in (setup.runtime_thinking_levels or ("off",))
+                candidate
+                for candidate in (setup.runtime_thinking_levels or ("off",))
                 if (setup.supports_thinking is not False or candidate == "off")
                 and (not setup.thinking_level_locked or candidate == setup.default_thinking_level)
-                and (not setup.available_thinking_levels or candidate == "off"
-                     or candidate in setup.available_thinking_levels)
+                and (
+                    not setup.available_thinking_levels
+                    or candidate == "off"
+                    or candidate in setup.available_thinking_levels
+                )
             )
             setup = replace(
-                setup, supports_thinking=True, thinking_level_locked=False,
+                setup,
+                supports_thinking=True,
+                thinking_level_locked=False,
                 thinking_trial_id=trial.id,
-                available_thinking_levels=tuple(dict.fromkeys((
-                    *original_levels, level,
-                ))),
+                available_thinking_levels=tuple(
+                    dict.fromkeys(
+                        (
+                            *original_levels,
+                            level,
+                        )
+                    )
+                ),
                 runtime_thinking_levels=None,
             )
             setup_state["value"] = setup
@@ -3237,11 +3692,15 @@ def _wire_impl(
                 from limbowave.application.services.routing_service import RoutingService
                 from limbowave.composition import kernel_setup
 
-                current = next((
-                    decision for decision in RoutingService(config).catalog()
-                    if decision.endpoint.id == trial.endpoint_id
-                    and decision.model_id == trial.model_id
-                ), None)
+                current = next(
+                    (
+                        decision
+                        for decision in RoutingService(config).catalog()
+                        if decision.endpoint.id == trial.endpoint_id
+                        and decision.model_id == trial.model_id
+                    ),
+                    None,
+                )
                 if current is not None:
                     # 用户可能在下一轮进行中确认；取消试用时也应恢复最新保存的能力。
                     trial.base_setup = kernel_setup(trial.base_setup.kernel, current)
@@ -3267,7 +3726,8 @@ def _wire_impl(
             "\n请求成功不代表服务端确实采用了该思考强度，接口也可能忽略参数。"
             "\n确认后只保存这个站点、实际模型与等级；暂不保存则仅保留临时解锁。",
             lambda accepted: _spawn(_confirm_thinking_trial(trial)) if accepted else None,
-            confirm_text="标记为支持", cancel_text="暂不保存",
+            confirm_text="标记为支持",
+            cancel_text="暂不保存",
         )
 
     async def _on_thinking_level(level: str) -> None:
@@ -3468,7 +3928,8 @@ def _wire_impl(
 
         def _source_is_current() -> bool:
             return not controller.busy and location == (
-                controller.conversation_id, controller.coordinator().branch_id
+                controller.conversation_id,
+                controller.coordinator().branch_id,
             )
 
         async def _switch_and_resend() -> None:
@@ -3482,7 +3943,9 @@ def _wire_impl(
             if not await _apply_endpoint_override(endpoint_id) or not _source_is_current():
                 return
             chat.set_status(f"已切到 {endpoint_id}，正在重试…")
-            await controller.retry_user_message(user_message_id)
+            await _send_with_catalog_sync(
+                send_action=partial(controller.retry_user_message, user_message_id)
+            )
 
         def _on_failover(ok: bool) -> None:
             if ok:
@@ -3543,14 +4006,33 @@ def _wire_impl(
         nonlocal branch_render_task, detached_scope
         kind = event.kind
         data = event.data
+        if (
+            kind == "user"
+            and queue_active is not None
+            and (controller.conversation_id, controller.branch_id) == queue_active.scope
+            and data.get("text") == queue_active.text
+        ):
+            # A persisted user event is acceptance, even if provider startup then fails.
+            send_queue.accept(queue_active.id)
+        elif kind in {"error", "run_interrupted"}:
+            send_queue.pause("操作出现错误或中断，请检查后继续队列")
+        elif kind == "assistant_end" and data.get("stop_reason") in {"aborted", "error"}:
+            send_queue.pause("生成已停止或失败，请确认后继续队列")
+        if kind in {"user", "error", "settled", "run_interrupted", "assistant_end"}:
+            _sync_queue_views()
+        if kind == "settled":
+            _kick_queue()
         if kind == "remote_target_changing":
             if detached_scope is None:
                 detached_scope = (data.get("conversation_id"), data.get("branch_id"))
             toolbar.setEnabled(False)
             return
         scope = controller.coordinator().event_scope()
-        if (scope["run_origin"] == "web" and detached_scope is not None
-                and detached_scope != (scope["conversation_id"], scope["branch_id"])):
+        if (
+            scope["run_origin"] == "web"
+            and detached_scope is not None
+            and detached_scope != (scope["conversation_id"], scope["branch_id"])
+        ):
             # A remote run must not append its output into an unrelated desktop transcript.
             if kind == "settled":
                 chat.set_busy(False)
@@ -3655,9 +4137,7 @@ def _wire_impl(
             # 否则历史切换动画的延迟回调会删掉刚接上的新气泡。
             # 原分支的内容仍留在原分支里。
             if "history" in data:
-                if not chat.apply_branch_history(
-                    data["history"], str(data.get("from_message_id"))
-                ):
+                if not chat.apply_branch_history(data["history"], str(data.get("from_message_id"))):
                     chat.set_history_loading(True, "正在准备分支…")
                     branch_render_task = asyncio.create_task(
                         chat.load_history_incrementally(data["history"])
@@ -3709,11 +4189,16 @@ def _wire_impl(
 
         assert key is not None
         remote_models = RuntimeModelCatalog(
-            settings, credentials, paths.data_root / "runtime",
-            lambda: controller.coordinator().kernel, _remote_model_selected,
+            settings,
+            credentials,
+            paths.data_root / "runtime",
+            lambda: controller.coordinator().kernel,
+            _remote_model_selected,
         )
         facade = RuntimeFacade(
-            controller, uow_factory, models_provider=remote_models.models,
+            controller,
+            uow_factory,
+            models_provider=remote_models.models,
             select_model=remote_models.select_model,
             ready=lambda: key is not None and not shutting_down and not resetting,
         )
@@ -3721,9 +4206,12 @@ def _wire_impl(
         return WebServer(facade, password_gate=password_gate)
 
     lan_access = LanAccessController(
-        window, create_server=_create_lan_server, spawn=_spawn,
-        allowed=lambda: key is not None and not resetting and not shutting_down
-        and controller.available,
+        window,
+        create_server=_create_lan_server,
+        spawn=_spawn,
+        allowed=lambda: (
+            key is not None and not resetting and not shutting_down and controller.available
+        ),
     )
 
     def _warm_settings() -> None:
@@ -3739,6 +4227,7 @@ def _wire_impl(
     async def _shutdown() -> None:
         nonlocal shutting_down
         shutting_down = True
+        send_queue.clear()
         _LOG.info("application.services_stopping")
         await lan_access.close()
         request_limiter.stop()
@@ -3784,7 +4273,9 @@ def _wire_impl(
 
 
 def _history_payload(
-    messages: list[Message], *, uow_factory: UnitOfWorkFactory | None = None,
+    messages: list[Message],
+    *,
+    uow_factory: UnitOfWorkFactory | None = None,
     branch_id: str | None = None,
 ) -> list[HistoryEntry]:
     from limbowave.application.history_payload import history_payload
@@ -3803,13 +4294,22 @@ def _report(context: AppContext, window: MainWindow) -> None:
     print("[smoke] ok")
 
 
+_RESTART_OOBE = 23
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = list(sys.argv if argv is None else argv)
     if not args or args[0].startswith("-"):
         args.insert(0, "limbowave")
+    restart_args = list(args)
     parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
-    parser.add_argument("--log-level", choices=[level.name for level in LogLevel] + ["CRIT"],
-                        type=str.upper, default="INFO")
+    parser.add_argument("--oobe", action="store_true")
+    parser.add_argument(
+        "--log-level",
+        choices=[level.name for level in LogLevel] + ["CRIT"],
+        type=str.upper,
+        default="INFO",
+    )
     parser.add_argument("--log-console", action="store_true")
     parser.add_argument("--log-dir", type=Path)
     options, remaining = parser.parse_known_args(args[1:])
@@ -3827,15 +4327,41 @@ def main(argv: Sequence[str] | None = None) -> int:
     with ExitStack() as cleanup:
         diagnostics = cleanup.enter_context(DiagnosticRuntime(config))
         cleanup.enter_context(QtDiagnosticsBridge(diagnostics.manager))
-        _LOG.info("application.startup", extra={
-            "version": __version__, "python": context.python_version,
-            "frozen": context.frozen, "smoke": smoke, "log_dir": str(config.directory),
-        })
+        _LOG.info(
+            "application.startup",
+            extra={
+                "version": __version__,
+                "python": context.python_version,
+                "frozen": context.frozen,
+                "smoke": smoke,
+                "log_dir": str(config.directory),
+            },
+        )
         try:
-            exit_code = _run_gui(args, context, diagnostics, cleanup, smoke=smoke)
-            return exit_code
+            exit_code = _run_gui(
+                args, context, diagnostics, cleanup, smoke=smoke, force_oobe=options.oobe
+            )
         finally:
             _LOG.info("application.shutdown", extra={"exit_code": exit_code})
+
+    if exit_code == _RESTART_OOBE:
+        # Storage, IPC, event loop and the diagnostics directory lock are now released.
+        try:
+            restart_into_oobe(restart_args, frozen=context.frozen)
+        except OSError as exc:
+            host = QWidget()
+            host.setWindowTitle(APP_DISPLAY_NAME)
+            host.resize(560, 320)
+            host.show()
+            try:
+                _show_startup_alert(
+                    host, "重启失败", "未能重新启动应用，请手动打开。" + NL + redact_text(str(exc))
+                )
+            finally:
+                host.close()
+            return 1
+        return 0
+    return exit_code
 
 
 def _dispose_gui_loop(loop: asyncio.AbstractEventLoop) -> None:
@@ -3845,9 +4371,9 @@ def _dispose_gui_loop(loop: asyncio.AbstractEventLoop) -> None:
             task.cancel()
         if pending:
             try:
-                loop.run_until_complete(asyncio.wait_for(
-                    asyncio.gather(*pending, return_exceptions=True), timeout=2.0
-                ))
+                loop.run_until_complete(
+                    asyncio.wait_for(asyncio.gather(*pending, return_exceptions=True), timeout=2.0)
+                )
             except Exception:
                 _LOG.exception("application.pending_task_cleanup_failed")
         loop.close()
@@ -3855,10 +4381,19 @@ def _dispose_gui_loop(loop: asyncio.AbstractEventLoop) -> None:
 
 
 def _run_gui(
-    args: Sequence[str], context: AppContext, diagnostics: DiagnosticRuntime, cleanup: ExitStack,
-    *, smoke: bool,
+    args: Sequence[str],
+    context: AppContext,
+    diagnostics: DiagnosticRuntime,
+    cleanup: ExitStack,
+    *,
+    smoke: bool,
+    force_oobe: bool = False,
 ) -> int:
     app = build_application(args)
+    oobe_debug_enabled = context.development
+    if force_oobe and not oobe_debug_enabled:
+        _LOG.warning("application.oobe_debug_denied")
+        force_oobe = False
 
     if not smoke:
         # 首次绘制前恢复外观，避免已构造控件保留默认深色内联样式。
@@ -3890,8 +4425,25 @@ def _run_gui(
     cleanup.callback(_dispose_gui_loop, loop)
 
     # 主窗口不接收业务上下文：窗口只展示与发命令，装配由上层负责。
-    window = MainWindow()
+    window = MainWindow(enable_oobe_debug=oobe_debug_enabled)
     cleanup.callback(window.close)
+    restart_requested = False
+    reset_request: DataResetService | None = None
+
+    def _request_oobe_restart() -> None:
+        nonlocal restart_requested
+        if not oobe_debug_enabled or smoke or restart_requested or reset_request is not None:
+            return
+        restart_requested = True
+        # Honor a settings page's unsaved-change guard instead of discarding its edits.
+        if not window.close():
+            restart_requested = False
+            return
+        _LOG.info("application.oobe_restart_requested")
+        if loop.is_running():
+            loop.stop()
+
+    window.oobe_restart_requested.connect(_request_oobe_restart)
     from limbowave.ui.diagnostics_runtime import DiagnosticsWindow
 
     diagnostics_window = DiagnosticsWindow(
@@ -3928,11 +4480,18 @@ def _run_gui(
 
     key = _unlock_vault(context.paths, window)
     _LOG.info("vault.unlock_result", extra={"unlocked": key is not None})
-    reset_request: DataResetService | None = None
+    if restart_requested or not window.isVisible():
+        return _RESTART_OOBE if restart_requested else 0
+    if key is not None and (force_oobe or _configuration_needs_onboarding(context.paths)):
+        from limbowave.ui.oobe_live import run_onboarding
+
+        run_onboarding(window, context.paths, key)
+    if restart_requested or not window.isVisible():
+        return _RESTART_OOBE if restart_requested else 0
 
     def _request_reset(service: DataResetService) -> None:
         nonlocal reset_request
-        if reset_request is not None:
+        if reset_request is not None or restart_requested:
             return
         reset_request = service
         window.setEnabled(False)
@@ -3940,9 +4499,17 @@ def _run_gui(
         loop.stop()
 
     controller, _tool_ipc, _warm_settings, finish_startup, shutdown = _wire(
-        window, context.paths, key, on_reset=_request_reset, diagnostics_available=True,
+        window,
+        context.paths,
+        key,
+        on_reset=_request_reset,
+        diagnostics_available=True,
         appearance_prepared=True,
     )
+    if restart_requested or not window.isVisible():
+        with loop:
+            loop.run_until_complete(shutdown())
+        return _RESTART_OOBE if restart_requested else 0
     window.show_workspace()
 
     async def _startup() -> None:
@@ -3961,7 +4528,7 @@ def _run_gui(
                 )
             else:
                 window.chat.set_available(
-                    False, "未配置模型：先用 python -m limbowave secret set 配置密钥后重启"
+                    False, "还暂时不能发送消息呢。准备好了的话，从左下角「设置」进来就可以啦。"
                 )
         except Exception as exc:
             _LOG.exception("kernel.start_failed")
@@ -4008,7 +4575,7 @@ def _run_gui(
             _show_startup_alert(window, "重置未完成", reset_error + NL + "应用将退出。")
         window.close()
         return 1 if reset_error is not None else 0
-    return 0
+    return _RESTART_OOBE if restart_requested else 0
 
 
 if __name__ == "__main__":

@@ -7,7 +7,7 @@
 
 内置工具（§9.1）：
 
-- 附件：``read_document``（按 ``file_id`` 精确读取用户登记的 TXT/MD/剪贴板文档，§8.2）
+- 附件：``read_document``（按 ``file_id`` 精确读取用户登记的 TXT/MD/Word/剪贴板文档，§8.2）
 - 文件：``list_directory`` / ``stat_file`` / ``search_text`` / ``create_file`` / ``modify_file``
 - 联网：``read_url``（``web_search`` 需要搜索服务凭据——未配置时**如实返回
   「未配置」结构化错误，不伪造结果**）
@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -83,6 +84,7 @@ class ToolResult:
 
 # 每个工具的参数签名：(参数名, 必填, 类型)
 _SCHEMAS: dict[str, tuple[tuple[str, bool, type], ...]] = {
+    "get_current_datetime": (),
     "add_session_memory": (("content", True, str), ("call_id", True, str), ("run_id", True, str)),
     "read_document": (("file_id", True, str), ("start_line", False, int), ("end_line", False, int)),
     "list_directory": (("path", False, str),),
@@ -97,6 +99,7 @@ _SCHEMAS: dict[str, tuple[tuple[str, bool, type], ...]] = {
 }
 
 _CAPABILITY: dict[str, Capability] = {
+    "get_current_datetime": Capability.CLOCK_READ,
     "add_session_memory": Capability.MEMORY_WRITE,
     "read_document": Capability.FILE_READ,
     "list_directory": Capability.FILE_READ,
@@ -490,6 +493,19 @@ class ToolGateway:
 
     def _execute(self, tool_name: str, params: dict[str, Any]) -> ToolResult:
         _require_local_origin(self.origin_provider)
+        if tool_name == "get_current_datetime":
+            now = datetime.now().astimezone()
+            return ToolResult(ok=True, data={
+                "datetime": now.isoformat(timespec="seconds"),
+                "date": now.date().isoformat(),
+                "time": now.strftime("%H:%M:%S"),
+                "timezone": now.tzname(),
+                "utc_offset": now.strftime("%z"),
+                "weekday": ("星期一", "星期二", "星期三", "星期四",
+                            "星期五", "星期六", "星期日")[now.weekday()],
+                "unix_timestamp": now.timestamp(),
+                "source": "device_local_clock",
+            })
         if tool_name == "read_document":
             return self._read_document(params)
         handler = getattr(self._files, tool_name, None)
@@ -527,7 +543,7 @@ class ToolGateway:
     def _read_document(self, params: dict[str, Any]) -> ToolResult:
         """精确读取附件文档（设计计划 §八.2，透传 :meth:`FileService.read`）。
 
-        可读集合是**用户主动登记的附件文档**（磁盘 TXT/MD 或剪贴板文档），
+        可读集合是**用户主动登记的附件文档**（磁盘 TXT/MD/Word 或剪贴板文档），
         不在路径守卫的工作区内——这里的边界是登记表成员资格，不是路径。
         资源范围沿用文件读取的默认解析（工作区根），与其他读取工具同档授权。
         """

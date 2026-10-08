@@ -139,3 +139,62 @@ def test_normalize_title_rejects_empty_and_limits_length() -> None:
     assert normalize_title("\n\n") is None
     assert normalize_title("会话标题：《测试标题！》") == "测试标题"
     assert normalize_title("甲" * 60) == "甲" * 40
+
+
+async def test_suggest_for_messages_includes_all_turns_without_truncating() -> None:
+    from datetime import UTC, datetime
+
+    from limbowave.domain.conversation import Message, MessageRole
+
+    contents = ["最初讨论部署", "先配置 CI", "后来改聊数据库" + "细节" * 5000, "最终确定备份方案"]
+    messages = [
+        Message(
+            id=str(i), conversation_id="c", branch_id="b",
+            role=MessageRole.USER if i % 2 == 0 else MessageRole.ASSISTANT,
+            content=text, created_at=datetime.now(UTC), thinking="不应发送的思考过程",
+        )
+        for i, text in enumerate(contents)
+    ]
+    isolated = _TitleKernel("数据库备份方案")
+    owner = _OwnerKernel(isolated)
+    result = await ConversationTitleService().suggest_for_messages(
+        owner, messages, provider="relay-a", model_id="deepseek-chat",
+    )
+    assert result == "数据库备份方案"
+    positions = [isolated.sent.index(text) for text in contents]
+    assert positions == sorted(positions)
+    assert "不应发送的思考过程" not in isolated.sent
+    assert isolated.model == ("relay-a", "deepseek-chat")
+    assert isolated.started and isolated.stopped
+    assert owner.sent == ""
+
+
+async def test_suggest_for_empty_history_does_not_start_kernel() -> None:
+    isolated = _TitleKernel()
+    result = await ConversationTitleService().suggest_for_messages(
+        _OwnerKernel(isolated), [], provider="p", model_id="m",
+    )
+    assert result is None
+    assert not isolated.started
+
+
+async def test_cancelling_title_request_shuts_down_isolated_kernel() -> None:
+    import asyncio
+
+    class WaitingKernel(_TitleKernel):
+        async def send_message(self, text, *, images=None):
+            self.sent = text
+
+    isolated = WaitingKernel()
+    task = asyncio.create_task(ConversationTitleService().suggest(
+        _OwnerKernel(isolated), "用户", "助手", provider="p", model_id="m",
+    ))
+    await asyncio.sleep(0)
+    assert isolated.sent
+    task.cancel()
+    import pytest
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert isolated.stopped
+    assert isolated.handlers == []

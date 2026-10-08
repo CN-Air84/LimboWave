@@ -73,6 +73,8 @@ class DiscoveredModel:
 class DiscoveryResult:
     models: tuple[DiscoveredModel, ...]
     detail: str
+    # ok / auth / timeout / empty / network。旧调用不传时按成功处理。
+    kind: str = "ok"
 
 
 @dataclass(frozen=True, slots=True)
@@ -213,16 +215,26 @@ def discover_models(
 ) -> DiscoveryResult:
     """拉取端点模型清单，不记录密钥，也不把响应正文放进错误消息。"""
     if endpoint.credential_ref and not secret:
-        return DiscoveryResult((), "找不到端点密钥")
+        return DiscoveryResult((), "找不到端点密钥", kind="network")
     try:
         with _limited_client(endpoint, limiter, cancelled) as client:
             response = client.get(_model_url(endpoint), headers=_auth_headers(endpoint, secret))
+        if response.status_code in (401, 403):
+            return DiscoveryResult(
+                (), f"模型清单请求失败（HTTP {response.status_code}）", kind="auth"
+            )
         if response.status_code != 200:
-            return DiscoveryResult((), f"模型清单请求失败（HTTP {response.status_code}）")
+            return DiscoveryResult(
+                (), f"模型清单请求失败（HTTP {response.status_code}）", kind="network"
+            )
         models = _parse_models(endpoint, response.json())
-        return DiscoveryResult(models, f"已发现 {len(models)} 个模型")
+        if not models:
+            return DiscoveryResult((), "已发现 0 个模型", kind="empty")
+        return DiscoveryResult(models, f"已发现 {len(models)} 个模型", kind="ok")
+    except httpx.TimeoutException:
+        return DiscoveryResult((), "模型清单请求超时", kind="timeout")
     except (httpx.HTTPError, ValueError, json.JSONDecodeError):
-        return DiscoveryResult((), "模型清单请求失败，请检查 URL、密钥与协议")
+        return DiscoveryResult((), "模型清单请求失败，请检查 URL、密钥与协议", kind="network")
 
 
 # 工具探测：让模型用 read_file 读一个虚拟文件，再在回答里复述文件内容。

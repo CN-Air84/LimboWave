@@ -21,7 +21,8 @@ API 约定（本模块的三个助手函数是全部调用入口）：
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+import asyncio
+from collections.abc import Awaitable, Callable, Sequence
 
 from PySide6.QtCore import (
     QEasingCurve,
@@ -404,14 +405,18 @@ def ask_prompt(
     placeholder: str = "",
     confirm_label: str = "确定",
     multiline: bool = False,
+    on_suggest: Callable[[], Awaitable[str | None]] | None = None,
+    suggest_label: str = "AI 重命名",
 ) -> FloatingPanel:
     """输入框（回调式）。提交空串或点 ✕/外部/Esc 都不回调。
 
     ``multiline=True`` 用多行编辑器（编辑消息用），``password=True`` 用密码框。
     ``animated_password=True`` 在密码框中复用登录页的输入动效。
+    ``on_suggest`` 可选异步候选生成：只填入草稿，确认后才提交；关闭时取消。
     """
     panel = FloatingPanel(parent, title, width=380)
     caption = QLabel(label)
+    caption.setTextFormat(Qt.TextFormat.PlainText)
     caption.setWordWrap(True)
     caption.setStyleSheet(f"color: {theme.TEXT_PRIMARY};")
     panel.content_layout.addWidget(caption)
@@ -437,6 +442,9 @@ def ask_prompt(
     panel.content_layout.addWidget(edit)
 
     row = QHBoxLayout()
+    suggest = QPushButton(suggest_label) if on_suggest is not None else None
+    if suggest is not None:
+        row.addWidget(suggest)
     row.addStretch(1)
     cancel = QPushButton("取消")
     cancel.clicked.connect(panel.close_panel)
@@ -446,7 +454,72 @@ def ask_prompt(
     row.addWidget(submit)
     panel.content_layout.addLayout(row)
 
+    suggestion_task: asyncio.Task[None] | None = None
+    closed = False
+
+    def _set_pending(pending: bool) -> None:
+        edit.setReadOnly(pending)
+        submit.setEnabled(not pending)
+        if suggest is not None:
+            suggest.setEnabled(not pending)
+            suggest.setText("生成中…" if pending else suggest_label)
+
+    async def _generate_suggestion() -> None:
+        nonlocal suggestion_task
+        assert on_suggest is not None
+        try:
+            value = await on_suggest()
+            if closed:
+                return
+            if value and value.strip():
+                if isinstance(edit, QPlainTextEdit):
+                    edit.setPlainText(value.strip())
+                else:
+                    edit.setText(value.strip())
+                    edit.selectAll()
+                caption.setText(label)
+                edit.setFocus()
+            else:
+                caption.setText("AI 命名失败，请重试或手动输入。")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if not closed:
+                # ValueError is reserved for actionable local validation failures.
+                caption.setText(
+                    str(exc) if isinstance(exc, ValueError)
+                    else "AI 命名失败，请重试或手动输入。"
+                )
+        finally:
+            suggestion_task = None
+            if not closed:
+                _set_pending(False)
+                panel.adjustSize()
+
+    def _request_suggestion() -> None:
+        nonlocal suggestion_task
+        if closed or suggestion_task is not None:
+            return
+        caption.setText("正在根据会话内容生成名称…")
+        _set_pending(True)
+        suggestion_task = asyncio.ensure_future(_generate_suggestion())
+
+    def _cancel_suggestion() -> None:
+        nonlocal closed
+        if closed:
+            return
+        closed = True
+        if suggestion_task is not None and not suggestion_task.cancelling():
+            suggestion_task.cancel()
+
+    if suggest is not None:
+        suggest.clicked.connect(_request_suggestion)
+        panel.closed.connect(_cancel_suggestion)
+        panel.destroyed.connect(_cancel_suggestion)
+
     def _submit() -> None:
+        if closed or suggestion_task is not None:
+            return
         value = edit.toPlainText() if isinstance(edit, QPlainTextEdit) else edit.text()
         value = value.strip()
         if not value:

@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import cast
 
 from PySide6.QtCore import (
@@ -60,6 +61,7 @@ from limbowave.ui.backdrop import BackdropEngine
 
 # 列表项 data 角色
 ROLE_CONVERSATION_ID = Qt.ItemDataRole.UserRole
+ROLE_SEARCH_TARGET = Qt.ItemDataRole.UserRole + 20
 ROLE_HIT_KIND = Qt.ItemDataRole.UserRole + 1  # "conversation" | "hit" | "branch"
 ROLE_TITLE = Qt.ItemDataRole.UserRole + 2
 ROLE_SUBTITLE = Qt.ItemDataRole.UserRole + 3
@@ -182,6 +184,7 @@ def _search_icon() -> QIcon:
 class Sidebar(QWidget):
     """会话导航栏。搜索框有内容时列表显示搜索结果，否则显示会话列表。"""
 
+    search_hit_selected = Signal(object)
     conversation_selected = Signal(str)  # conversation_id
     new_conversation_requested = Signal()
     search_requested = Signal()  # 搜索按钮被点：上层呼出搜索悬浮窗
@@ -342,7 +345,9 @@ class Sidebar(QWidget):
         self._list.blockSignals(False)
         self._sync_active_indicator(animated=False)
 
-    def show_search_results(self, rows: list[tuple[str, str]]) -> None:
+    def show_search_results(
+        self, rows: list[tuple[str, str]], *, targets: Sequence[object] | None = None
+    ) -> None:
         """显示搜索结果。每行 (conversation_id, 摘要文本)。"""
         self._searching = True
         self._stop_branch_animations()
@@ -354,10 +359,12 @@ class Sidebar(QWidget):
             item.setFlags(Qt.ItemFlag.NoItemFlags)
             self._list.addItem(item)
             return
-        for conversation_id, snippet in rows:
+        for index, (conversation_id, snippet) in enumerate(rows):
             item = QListWidgetItem()
             item.setData(ROLE_CONVERSATION_ID, conversation_id)
             item.setData(ROLE_HIT_KIND, "hit")
+            if targets is not None:
+                item.setData(ROLE_SEARCH_TARGET, targets[index])
             item.setData(ROLE_TITLE, snippet)
             item.setData(ROLE_SUBTITLE, "搜索命中")
             item.setSizeHint(QSize(-1, ROW_HEIGHT))
@@ -657,6 +664,11 @@ class Sidebar(QWidget):
             if not is_active:
                 self.branch_switch_requested.emit(conversation_id, branch_id)
             return
+        if current.data(ROLE_HIT_KIND) == "hit":
+            target = current.data(ROLE_SEARCH_TARGET)
+            if target is not None:
+                self.search_hit_selected.emit(target)
+                return
         # 已经在显示的会话不重复打开（双击的第一击也会走到这里）
         if conversation_id != self._active_conversation_id:
             self.conversation_selected.emit(conversation_id)

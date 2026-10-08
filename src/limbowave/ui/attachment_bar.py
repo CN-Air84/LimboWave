@@ -9,6 +9,8 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from PySide6.QtCore import QPoint, Qt, Signal
 from PySide6.QtGui import QMouseEvent, QPixmap
 from PySide6.QtWidgets import (
@@ -23,9 +25,20 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from limbowave.domain.files import SUPPORTED_ATTACHMENTS_HINT
 from limbowave.ui import theme
 from limbowave.ui.popup_material import install_popup_material
 from limbowave.ui.popup_motion import PopupMotion
+
+
+@dataclass(frozen=True)
+class DraftAttachment:
+    """In-memory presentation only; the attachment service still owns the file."""
+
+    attachment_id: str
+    title: str
+    subtitle: str
+    thumbnail: QPixmap | None = None
 
 
 class _AttachmentChip(QFrame):
@@ -44,6 +57,7 @@ class _AttachmentChip(QFrame):
     ) -> None:
         super().__init__(parent)
         self._attachment_id = attachment_id
+        self.draft = DraftAttachment(attachment_id, title, subtitle, thumbnail)
         self.setStyleSheet(
             f"QFrame {{ background: {theme.card_surface()}; border: 1px solid {theme.BORDER};"
             f" border-radius: {theme.RADIUS_MD}px; }}"
@@ -115,7 +129,9 @@ class AttachmentMenu(QMenu):
             f"QMenu::item:selected {{ background: {theme.BG_SURFACE_HOVER}; }}"
         )
         self.addAction("图片", self.images_requested.emit)
-        self.addAction("文档", self.documents_requested.emit)
+        document_action = self.addAction("文档", self.documents_requested.emit)
+        document_action.setToolTip(SUPPORTED_ATTACHMENTS_HINT)
+        self.setToolTipsVisible(True)
         self.addAction("文件夹", self.folder_requested.emit)
         self.addSeparator()
         self.addAction("其他会话片段", self.snippet_requested.emit)
@@ -168,6 +184,7 @@ class AttachmentBar(QWidget):
     attach_folder_requested = Signal()
     attach_snippet_requested = Signal()
     attachment_removed = Signal(str)  # attachment_id
+    changed = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -208,6 +225,7 @@ class AttachmentBar(QWidget):
         add_row = QHBoxLayout()
         add_row.setSpacing(6)
         add_files_btn = QPushButton("📎 添加附件")
+        add_files_btn.setToolTip(SUPPORTED_ATTACHMENTS_HINT)
         add_files_btn.setProperty("flat", True)
         add_files_btn.hide()
         add_files_btn.clicked.connect(self.attach_files_requested.emit)
@@ -242,6 +260,7 @@ class AttachmentBar(QWidget):
         self._chips_layout.insertWidget(self._chips_layout.count() - 1, chip)
         self._resize_chips_host()
         self.setVisible(True)
+        self.changed.emit()
 
     def remove_attachment(self, attachment_id: str) -> None:
         chip = self._chips.pop(attachment_id, None)
@@ -251,6 +270,7 @@ class AttachmentBar(QWidget):
             self._resize_chips_host()
         if not self._chips:
             self.setVisible(False)
+        self.changed.emit()
 
     @property
     def generation(self) -> int:
@@ -261,6 +281,16 @@ class AttachmentBar(QWidget):
         self._generation = self.generation + 1
         for attachment_id in list(self._chips):
             self.remove_attachment(attachment_id)
+
+    def snapshot(self) -> tuple[DraftAttachment, ...]:
+        return tuple(chip.draft for chip in self._chips.values())
+
+    def restore(self, items: tuple[DraftAttachment, ...]) -> None:
+        self.clear()
+        for item in items:
+            self.add_attachment(
+                item.attachment_id, item.title, item.subtitle, thumbnail=item.thumbnail
+            )
 
     def attachment_ids(self) -> list[str]:
         return list(self._chips)

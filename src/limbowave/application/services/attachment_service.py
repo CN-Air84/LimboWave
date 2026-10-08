@@ -17,10 +17,11 @@ from __future__ import annotations
 
 import base64
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from limbowave.application.services.file_service import FileService
 from limbowave.application.services.image_service import ImageService
-from limbowave.domain.files import ImageFormat
+from limbowave.domain.files import WORD_SUFFIXES, ImageFormat
 
 _MIME = {ImageFormat.JPEG: "image/jpeg", ImageFormat.PNG: "image/png"}
 
@@ -71,9 +72,15 @@ class AttachmentService:
                 names[attachment_id] = document.display_name
                 valid_ids.append(attachment_id)
                 location = f"路径 {document.path} · " if document.path else ""
+                word_note = (
+                    " · Word 正文与表格的提取文本（不含图片识别；行号不是页码）"
+                    if document.path and document.blob_id is None
+                    and Path(document.path).suffix.lower() in WORD_SUFFIXES
+                    else ""
+                )
                 documents.append(
                     f"- file_id: {document.id} · 名称: {document.display_name}"
-                    f" · {location}{document.line_count} 行"
+                    f" · {location}{document.line_count} 行{word_note}"
                 )
         return AttachmentPayload(
             attachment_ids=valid_ids,

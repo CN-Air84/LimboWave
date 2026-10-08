@@ -155,8 +155,11 @@ class MainWindow(QMainWindow):
     command_requested = Signal(str)
     stop_requested = Signal()
     diagnostics_requested = Signal()
+    oobe_restart_requested = Signal()
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(
+        self, parent: QWidget | None = None, *, enable_oobe_debug: bool = False
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle(APP_DISPLAY_NAME)
         self.resize(1280, 800)
@@ -164,6 +167,12 @@ class MainWindow(QMainWindow):
         self._diagnostics_action.setShortcut("Ctrl+Shift+L")
         self._diagnostics_action.triggered.connect(self.diagnostics_requested.emit)
         self.addAction(self._diagnostics_action)
+        if enable_oobe_debug:
+            self._oobe_restart_action = QAction("重启并进入首次引导", self)
+            self._oobe_restart_action.setShortcut("Ctrl+Shift+O")
+            self._oobe_restart_action.setAutoRepeat(False)
+            self._oobe_restart_action.triggered.connect(self.oobe_restart_requested.emit)
+            self.addAction(self._oobe_restart_action)
 
         self._sidebar = Sidebar()
         self._chat_view = ChatView()
@@ -426,12 +435,12 @@ class MainWindow(QMainWindow):
 
     @property
     def history_preview(self) -> ChatView | None:
-        """Read-only navigation surface; the live chat keeps receiving its own events."""
+        """Draft-only history surface; the live chat keeps receiving its own events."""
         return self._history_preview
 
     def prepare_history_preview(self) -> ChatView:
         if self._history_preview is None:
-            self._history_preview = ChatView(read_only=True)
+            self._history_preview = ChatView(draft_only=True)
             self._chat_stack.addWidget(self._history_preview)
             self._on_backdrop_changed()
         return self._history_preview

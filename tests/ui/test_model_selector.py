@@ -273,3 +273,23 @@ def test_reopen_after_animation_setting_changes_does_not_keep_deleted_menu(selec
         combo.hidePopup()
     finally:
         QApplication.setEffectEnabled(effect, old)
+
+
+@pytest.mark.parametrize("remaining", [[("gemini", "Gemini Flash")], []])
+def test_removed_current_model_is_not_silently_replaced(selector, remaining):
+    view, combo = selector
+    view.set_logical_models(remaining, "removed-grok")
+    assert combo.currentData() is None
+    assert "不可用" in combo.currentText()
+    assert "removed-grok" in combo.currentText()
+    assert combo.isEnabled() == bool(remaining)
+    if remaining:
+        assert combo.findData("gemini") >= 0
+
+
+def test_reselect_first_model_after_removal_emits_change(selector, qtbot):
+    view, combo = selector
+    view.set_logical_models([("gemini", "Gemini Flash")], "removed-grok")
+    with qtbot.waitSignal(view.logical_model_changed) as signal:
+        combo.setCurrentIndex(combo.findData("gemini"))
+    assert signal.args == ["gemini"]

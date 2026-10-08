@@ -226,7 +226,9 @@ class _EndpointWorkspace(QWidget):
     """共享站点列表与右侧二级选项卡并列，配置和实际模型共用当前站点。"""
 
     def __init__(
-        self, configuration: _EndpointsTab, actual_models: ActualModelsPage,
+        self,
+        configuration: _EndpointsTab,
+        actual_models: ActualModelsPage,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -385,9 +387,13 @@ class SettingsPage(QWidget):
         self.actual_models.discovery_requested.connect(self.model_discovery_requested.emit)
         self.actual_models.probe_requested.connect(self._request_model_probe)
         self.actual_models.manual_save_requested.connect(self.manual_model_save_requested.emit)
-        self.actual_models.capability_save_requested.connect(self.model_capability_save_requested.emit)
+        self.actual_models.capability_save_requested.connect(
+            self.model_capability_save_requested.emit
+        )
         self.endpoint_workspace = _EndpointWorkspace(self.endpoints_tab, self.actual_models, self)
-        self.endpoints_tab.endpoint_selecting.connect(self.endpoint_workspace._stack.capture_refresh)
+        self.endpoints_tab.endpoint_selecting.connect(
+            self.endpoint_workspace._stack.capture_refresh
+        )
         self.endpoints_tab.endpoint_selected.connect(self._on_endpoint_selected)
         self._add_page("站点端点", self.endpoint_workspace)
         self.appearance_tab = None
@@ -400,6 +406,7 @@ class SettingsPage(QWidget):
         self.memory_tab = None
         if memories is not None:
             from limbowave.ui.session_memory_panel import MemoryPanel
+
             self.memory_tab = MemoryPanel(memories, self)
             self._add_page("记忆", self.memory_tab)
         data_tab = _DataSecurityTab(vault, self)
@@ -414,9 +421,7 @@ class SettingsPage(QWidget):
             lan_scroll.setWidget(lan_panel)
             self._add_page("局域网访问", lan_scroll)
         # The log viewer can query and lay out many rows. Build it only when selected.
-        self._request_log_index = self._add_page(
-            "请求日志", _RequestLogTab(None, None, self)
-        )
+        self._request_log_index = self._add_page("请求日志", _RequestLogTab(None, None, self))
         self.about_tab = AboutPage(self)
         self._add_page("关于", self.about_tab)
         self._rail.tab_selected.connect(self._on_tab_selected)
@@ -480,7 +485,9 @@ class SettingsPage(QWidget):
             return
         cached = self._discovery_cache.get(endpoint.id)
         self.actual_models.activate_endpoint(
-            endpoint, discover=True, actual_models=tuple(self._settings.load().actual_models),
+            endpoint,
+            discover=True,
+            actual_models=tuple(self._settings.load().actual_models),
         )
         if cached is not None and cached[0] == endpoint:
             self.actual_models.apply_discovery(endpoint.id, cached[1])
@@ -517,11 +524,16 @@ class SettingsPage(QWidget):
                 progress = self._probe_progress.get((task.endpoint.id, task.model_id))
                 if progress is not None:
                     self.actual_models.apply_probe_progress(
-                        task.endpoint.id, task.model_id, progress,
+                        task.endpoint.id,
+                        task.model_id,
+                        progress,
                     )
 
     def apply_model_probe_progress(
-        self, endpoint_id: str, model_id: str, progress: ModelProbeProgress,
+        self,
+        endpoint_id: str,
+        model_id: str,
+        progress: ModelProbeProgress,
     ) -> None:
         key = (endpoint_id, model_id)
         if key not in self._probe_tasks:
@@ -542,7 +554,9 @@ class SettingsPage(QWidget):
         self.actual_models.apply_manual_save(endpoint_id, model_id)
 
     def apply_model_capability_save(
-        self, change: ModelCapabilityChange, actual: ActualModel,
+        self,
+        change: ModelCapabilityChange,
+        actual: ActualModel,
     ) -> None:
         self.models_tab.reload()
         self.actual_models.apply_capability_save(change, actual)

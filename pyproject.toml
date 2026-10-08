@@ -20,6 +20,8 @@ dependencies = [
     "fastapi>=0.115",
     "uvicorn>=0.34",
     "qrcode>=8",
+    "olefile>=0.47",
+    "defusedxml>=0.7.1",
 ]
 
 [dependency-groups]
@@ -32,6 +34,8 @@ dev = [
     "types-Pygments>=2.21",
     "pyinstaller>=6.10",
     "types-qrcode>=8.2.0.20260518",
+    "types-olefile>=0.47.0.20260508",
+    "types-defusedxml>=0.7.0.20260504",
 ]
 
 [build-system]

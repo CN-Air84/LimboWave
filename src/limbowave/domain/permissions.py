@@ -33,6 +33,7 @@ class Capability(enum.StrEnum):
     TERMINAL = "terminal"
     NETWORK = "network"
     MEMORY_WRITE = "memory_write"
+    CLOCK_READ = "clock_read"
 
 
 class PermissionPreset(enum.StrEnum):
@@ -234,6 +235,14 @@ def evaluate(
     3. 有匹配授权且在范围内：放行。
     4. 无匹配授权：要求确认（用户可授予本次或本会话）。
     """
+    if request.capability is Capability.CLOCK_READ:
+        return PermissionDecision(
+            decision=Decision.ALLOW,
+            risk=RiskLevel.NORMAL,
+            reason="读取设备当前时间，无需资源授权",
+            matched_rule="clock.read",
+        )
+
     risk, risk_reason = classify_risk(request)
 
     if mode is ExecutionMode.DIRECT_TERMINAL and request.capability is not Capability.TERMINAL:
