@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from limbowave.application.kernel import AgentKernel, KernelSetup
@@ -23,6 +23,8 @@ from limbowave.infrastructure.crypto.vault import VaultKey
 from limbowave.infrastructure.database.sqlite_repositories import SqliteUnitOfWorkFactory
 from limbowave.runtime_composition import RuntimeModelCatalog
 
+from .tool_policy import ServerToolPolicy
+
 
 @dataclass(slots=True)
 class ServerRuntime:
@@ -34,6 +36,7 @@ class ServerRuntime:
     controller: SessionController
     facade: RuntimeFacade
     model_catalog: RuntimeModelCatalog | None = None
+    tool_policy: ServerToolPolicy = field(default_factory=ServerToolPolicy)
 
     async def start(self) -> None:
         await self.controller.start()
