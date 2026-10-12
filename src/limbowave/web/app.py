@@ -16,10 +16,12 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import TypeAdapter, ValidationError
 from starlette.exceptions import HTTPException
 
+from limbowave.application.services.command_receipts import RuntimeConflict
+
 from .auth import AuthError, AuthStore, Device
 from .dto import page, project, safe_error
 from .password_gate import PasswordError, PasswordGate
-from .schemas import Command, PairRequest, PasswordEnvelope
+from .schemas import Command, MemoryMutation, PairRequest, PasswordEnvelope, SessionMemoryMutation
 from .security import SecurityMiddleware, WebConfig, error_response
 from .stream import RevocableEventResponse, event_stream
 
@@ -243,6 +245,168 @@ def create_app(
         return page(
             await facade.messages(conversation_id, branch, limit=limit, cursor=cursor), "message"
         )
+
+    def memory_service() -> Any:
+        service = getattr(facade, "memory_service", None)
+        if service is None:
+            raise HTTPException(503)
+        return service
+
+    def memory_revision() -> int:
+        return int(getattr(facade, "revision", 0))
+
+    def check_memory_revision(expected: int) -> None:
+        if expected != memory_revision():
+            raise RuntimeConflict("memory_conflict", 409)
+
+    def memory_item(value: Any) -> dict[str, Any]:
+        return project(value, "memory")
+
+    @app.get("/api/v1/memories")
+    async def memories(request: Request) -> dict[str, Any]:
+        device(request)
+        conversation_id = request.query_params.get("conversation_id")
+        branch_id = request.query_params.get("branch_id")
+        if not conversation_id or not branch_id:
+            raise HTTPException(400)
+        service = memory_service()
+        try:
+            session = service.list_session_global(conversation_id)
+            branch = service.list(conversation_id, branch_id)
+            return {
+                "revision": memory_revision(),
+                "global": [memory_item(item) for item in service.list()],
+                "session_global": [
+                    {"memory": memory_item(item.memory), "state": item.state} for item in session
+                ],
+                "branch": [memory_item(item) for item in branch],
+                "policy": service.policy(conversation_id).value,
+                "settings": service.settings().model_dump(),
+            }
+        except ValueError:
+            raise HTTPException(404) from None
+
+    @app.post("/api/v1/memories")
+    async def save_memory(request: Request, body: MemoryMutation) -> JSONResponse:
+        device(request, write=True)
+        check_memory_revision(body.expected_revision)
+        service = memory_service()
+        try:
+            if body.policy is not None:
+                if not body.conversation_id:
+                    raise ValueError("conversation required")
+                service.set_policy(body.conversation_id, body.policy)
+                result: dict[str, Any] = {"policy": body.policy}
+            elif (
+                body.conversation_id
+                and body.branch_id
+                and body.item_id
+                and body.content is not None
+            ):
+                result = memory_item(
+                    service.save(
+                        body.content,
+                        body.conversation_id,
+                        body.branch_id,
+                        item_id=body.item_id,
+                    )
+                )
+            elif (
+                body.conversation_id is None
+                and body.branch_id is None
+                and body.content is not None
+            ):
+                result = memory_item(service.save(body.content))
+            elif body.conversation_id and body.branch_id and body.content is not None:
+                result = memory_item(
+                    service.save(body.content, body.conversation_id, body.branch_id)
+                )
+            else:
+                raise ValueError("invalid memory scope")
+            facade.bump_revision()
+            return JSONResponse({"revision": memory_revision(), "item": result})
+        except ValueError as exc:
+            code = (
+                "memory_invalid_scope"
+                if "scope" in str(exc) or "会话" in str(exc)
+                else "memory_not_found"
+            )
+            return error_response(400 if code == "memory_invalid_scope" else 404, code)
+
+    @app.post("/api/v1/memories/session")
+    async def save_session_memory(request: Request, body: SessionMemoryMutation) -> JSONResponse:
+        device(request, write=True)
+        check_memory_revision(body.expected_revision)
+        try:
+            service = memory_service()
+            if body.content is None:
+                raise ValueError("content required")
+            # Session-global writes must reference a real global ID.
+            conversations = await facade.conversations(limit=100)
+            if body.conversation_id not in {c["id"] for c in conversations["items"]}:
+                raise ValueError("conversation not found")
+            if body.content is not None:
+                service.save_session_global(body.item_id, body.content, body.conversation_id)
+            facade.bump_revision()
+            return JSONResponse({"revision": memory_revision()})
+        except ValueError:
+            return error_response(404, "memory_not_found")
+
+    @app.post("/api/v1/memories/{item_id}/delete")
+    async def delete_memory(request: Request, item_id: str) -> JSONResponse:
+        device(request, write=True)
+        try:
+            payload = MemoryMutation.model_validate(await request.json())
+            check_memory_revision(payload.expected_revision)
+            if not payload.conversation_id or not payload.branch_id:
+                raise ValueError("scope")
+            memory_service().delete(item_id, payload.conversation_id, payload.branch_id)
+            facade.bump_revision()
+            return JSONResponse({"revision": memory_revision()})
+        except ValueError:
+            return error_response(404, "memory_not_found")
+
+    @app.post("/api/v1/memories/{item_id}/promote")
+    async def promote_memory(request: Request, item_id: str) -> JSONResponse:
+        device(request, write=True)
+        try:
+            payload = MemoryMutation.model_validate(await request.json())
+            check_memory_revision(payload.expected_revision)
+            if not payload.conversation_id or not payload.branch_id:
+                raise ValueError("scope")
+            item = memory_service().promote(item_id, payload.conversation_id, payload.branch_id)
+            facade.bump_revision()
+            return JSONResponse({"revision": memory_revision(), "item": memory_item(item)})
+        except ValueError:
+            return error_response(404, "memory_not_found")
+
+    @app.post("/api/v1/memories/session/{item_id}/delete")
+    async def delete_session_memory(request: Request, item_id: str) -> JSONResponse:
+        device(request, write=True)
+        try:
+            payload = MemoryMutation.model_validate(await request.json())
+            check_memory_revision(payload.expected_revision)
+            if not payload.conversation_id:
+                raise ValueError("conversation")
+            memory_service().delete_session_global(item_id, payload.conversation_id)
+            facade.bump_revision()
+            return JSONResponse({"revision": memory_revision()})
+        except ValueError:
+            return error_response(404, "memory_not_found")
+
+    @app.post("/api/v1/memories/session/{item_id}/restore")
+    async def restore_session_memory(request: Request, item_id: str) -> JSONResponse:
+        device(request, write=True)
+        try:
+            payload = MemoryMutation.model_validate(await request.json())
+            check_memory_revision(payload.expected_revision)
+            if not payload.conversation_id:
+                raise ValueError("conversation")
+            memory_service().restore_session_global(item_id, payload.conversation_id)
+            facade.bump_revision()
+            return JSONResponse({"revision": memory_revision()})
+        except ValueError:
+            return error_response(404, "memory_not_found")
 
     @app.post("/api/v1/commands")
     async def commands(request: Request) -> JSONResponse:

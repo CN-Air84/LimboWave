@@ -66,6 +66,8 @@ FIELDS = {
     },
     "segment": {"content", "thinking"},
     "tool": {"tool_id", "name", "status"},
+    "memory": {"id", "content", "source", "created_at", "state"},
+    "session_memory": {"memory", "state"},
     "payload": {
         "tools",
         "segments",
@@ -116,6 +118,13 @@ def project(value: Any, kind: str) -> dict[str, Any]:
             result[key] = [project(tool, "tool") for tool in item]
         elif key == "segments" and isinstance(item, list):
             result[key] = [project(segment, "segment") for segment in item[:100]]
+        elif key == "memory" and isinstance(item, dict):
+            result[key] = project(item, "memory")
+        elif key == "session_memory" and isinstance(item, dict):
+            result[key] = {
+                "memory": project(item.get("memory", {}), "memory"),
+                "state": item.get("state"),
+            }
         elif key == "branches" and isinstance(item, list):
             result[key] = [project(branch, "branch") for branch in item[:100]]
         elif key == "error":
@@ -154,6 +163,10 @@ SAFE_CODES = frozenset(
         "receipt_capacity",
         "invalid_cursor",
         "branch_not_found",
+        "memory_conflict",
+        "memory_not_found",
+        "memory_invalid_scope",
+        "server_tool_denied",
     }
 )
 

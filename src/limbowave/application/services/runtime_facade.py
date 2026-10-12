@@ -20,6 +20,7 @@ from limbowave.application.services.command_receipts import CommandReceipts, Run
 from limbowave.application.services.event_broker import EventBroker
 from limbowave.application.services.history_reader import HistoryReader
 from limbowave.application.services.history_service import HistoryService
+from limbowave.application.services.memory_service import MemoryService
 from limbowave.application.services.run_coordinator import CommandBusy
 from limbowave.application.services.session_controller import SessionController
 from limbowave.domain.conversation import Branch, Conversation
@@ -56,6 +57,7 @@ class RuntimeFacade:
         ready: Callable[[], bool] | None = None,
         broker: EventBroker | None = None,
         receipts: CommandReceipts | None = None,
+        memory_service: MemoryService | None = None,
     ) -> None:
         self.session = session
         self._coordinator = session.coordinator()
@@ -67,6 +69,7 @@ class RuntimeFacade:
             raise ValueError("receipt/broker epoch mismatch")
         self._models_provider = models_provider or (lambda: [])
         self._select_model = select_model
+        self.memory_service = memory_service
         self._ready = ready or (lambda: True)
         self._reader = HistoryReader()
         history = HistoryService(uow_factory)
@@ -79,6 +82,10 @@ class RuntimeFacade:
     @property
     def revision(self) -> int:
         return self._coordinator.revision
+
+    def bump_revision(self) -> None:
+        """Record an authenticated durable mutation outside the run coordinator."""
+        self._coordinator.bump_revision()
 
     async def state(self) -> dict[str, Any]:
         # No await between snapshot and cursor: replay bridges state -> subscribe.

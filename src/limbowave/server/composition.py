@@ -139,5 +139,6 @@ def build_server_runtime(
         select_model=catalog.select_model if catalog is not None else None,
         broker=broker,
         receipts=PersistentCommandStore(paths.data_root / "limbowave.db", broker.epoch),
+        memory_service=memories,
     )
     return ServerRuntime(paths, key, storage, controller, facade, catalog)

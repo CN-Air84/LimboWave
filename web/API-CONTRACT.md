@@ -37,3 +37,8 @@ The implemented history endpoint returns an explicit `branch_id` with each conve
 RSA-OAEP SHA256 with MGF1 SHA256 wraps a random 32-byte AES key. AES-GCM uses a random 12-byte IV, UTF-8 password plaintext and UTF-8 `challenge_id` AAD. Ciphertext includes the trailing 16-byte authentication tag. Fresh challenge each attempt; no extra request ID or reusable verifier. Forge randomness must use crypto.getRandomValues and fail closed if absent.
 
 HTTP is not protected by this envelope: chat remains plaintext and an active attacker can replace the webpage/public key. The frontend displays this warning and requires explicit acknowledgement; trusted HTTPS is recommended. Passwords never enter storage, logs or controller state and the input clears immediately on submit.
+
+
+### Server memory API
+
+The server exposes explicit memory scopes under `/api/v1/memories`. Reads require both `conversation_id` and `branch_id`; mutations carry `expected_revision` and return `409 memory_conflict` when stale. Global memory omits both scope IDs, branch memory supplies both, and session-global overrides supply `conversation_id` plus `item_id`. The server never accepts a client-written historical round snapshot.
