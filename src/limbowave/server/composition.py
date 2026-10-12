@@ -9,6 +9,7 @@ from typing import Any
 from limbowave.application.kernel import AgentKernel, KernelSetup
 from limbowave.application.services.configuration_service import ConfigurationService
 from limbowave.application.services.credential_service import CredentialService
+from limbowave.application.services.event_broker import EventBroker
 from limbowave.application.services.memory_service import MemoryService
 from limbowave.application.services.routing_service import RoutingService
 from limbowave.application.services.run_coordinator import RunContext
@@ -23,6 +24,7 @@ from limbowave.infrastructure.crypto.vault import VaultKey
 from limbowave.infrastructure.database.sqlite_repositories import SqliteUnitOfWorkFactory
 from limbowave.runtime_composition import RuntimeModelCatalog
 
+from .command_store import PersistentCommandStore
 from .tool_policy import ServerToolPolicy
 
 
@@ -129,10 +131,13 @@ def build_server_runtime(
     def model_provider() -> list[dict[str, Any]]:
         return catalog.models() if catalog is not None else _models(paths)
 
+    broker = EventBroker()
     facade = RuntimeFacade(
         controller,
         storage,
         models_provider=model_provider,
         select_model=catalog.select_model if catalog is not None else None,
+        broker=broker,
+        receipts=PersistentCommandStore(paths.data_root / "limbowave.db", broker.epoch),
     )
     return ServerRuntime(paths, key, storage, controller, facade, catalog)

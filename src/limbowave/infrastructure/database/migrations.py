@@ -18,7 +18,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 # 当前 schema 版本。新增迁移时递增。
-CURRENT_VERSION = 14
+CURRENT_VERSION = 15
 
 
 @dataclass(frozen=True, slots=True)
@@ -377,6 +377,31 @@ def _migration_014(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migration_015(conn: sqlite3.Connection) -> None:
+    """Persist idempotency receipts independently from the SSE replay buffer."""
+    conn.executescript(
+        """
+        CREATE TABLE server_commands (
+            device_id       TEXT NOT NULL,
+            operation_id    TEXT NOT NULL,
+            server_epoch    TEXT NOT NULL,
+            fingerprint     TEXT NOT NULL,
+            status          TEXT NOT NULL,
+            revision        INTEGER,
+            run_id          TEXT,
+            conversation_id TEXT,
+            branch_id       TEXT,
+            error_code      TEXT,
+            error_status    INTEGER,
+            created_at      REAL NOT NULL,
+            updated_at      REAL NOT NULL,
+            PRIMARY KEY (device_id, operation_id)
+        );
+        CREATE INDEX idx_server_commands_status ON server_commands(status, updated_at);
+        """
+    )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(
         from_version=0,
@@ -424,6 +449,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(from_version=11, description="助手分段与工具步骤顺序", apply=_migration_012),
     Migration(from_version=12, description="修复旧分支缺失的压缩继承", apply=_migration_013),
     Migration(from_version=13, description="服务端持久设备授权", apply=_migration_014),
+    Migration(from_version=14, description="服务端持久命令回执", apply=_migration_015),
 )
 
 

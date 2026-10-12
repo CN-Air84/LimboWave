@@ -327,7 +327,7 @@ class RuntimeFacade:
         if self._closed or not self._valid:
             raise RuntimeConflict("runtime_unavailable", 503)
         self.epoch = self.events.rotate_epoch()
-        self._receipts = CommandReceipts(self.epoch, capacity=self._receipts.capacity)
+        self._receipts = self._receipts.rotated(self.epoch)
         return self.epoch
 
     def revoke_device(self, device_id: str) -> None:
