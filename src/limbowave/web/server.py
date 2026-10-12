@@ -47,11 +47,12 @@ class WebServer:
         config: WebConfig | None = None,
         *,
         password_gate: PasswordGate | None = None,
+        auth: AuthStore | None = None,
     ) -> None:
         self.facade = facade
         self.password_gate = password_gate
         self.config = config or WebConfig()
-        self.auth = AuthStore()
+        self.auth = auth or AuthStore()
         self.app: Any = None
         self._server: EmbeddedServer | None = None
         self._task: asyncio.Task[None] | None = None

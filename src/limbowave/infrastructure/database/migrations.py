@@ -18,7 +18,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 # 当前 schema 版本。新增迁移时递增。
-CURRENT_VERSION = 13
+CURRENT_VERSION = 14
 
 
 @dataclass(frozen=True, slots=True)
@@ -357,6 +357,26 @@ def _migration_013(conn: sqlite3.Connection) -> None:
     repair_missing_branch_compressions(conn)
 
 
+def _migration_014(conn: sqlite3.Connection) -> None:
+    """Persist server device authorization without storing bearer tokens."""
+    conn.executescript(
+        """
+        CREATE TABLE server_devices (
+            id                  TEXT PRIMARY KEY,
+            name                TEXT NOT NULL,
+            token_hash          TEXT NOT NULL UNIQUE,
+            csrf_hash           TEXT NOT NULL,
+            created_at          REAL NOT NULL,
+            touched_at          REAL NOT NULL,
+            absolute_expires_at REAL NOT NULL,
+            revoked_at          REAL
+        );
+        CREATE INDEX idx_server_devices_active
+            ON server_devices(revoked_at, absolute_expires_at);
+        """
+    )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(
         from_version=0,
@@ -403,6 +423,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(from_version=10, description="Fork 保留起点消息", apply=_migration_011),
     Migration(from_version=11, description="助手分段与工具步骤顺序", apply=_migration_012),
     Migration(from_version=12, description="修复旧分支缺失的压缩继承", apply=_migration_013),
+    Migration(from_version=13, description="服务端持久设备授权", apply=_migration_014),
 )
 
 

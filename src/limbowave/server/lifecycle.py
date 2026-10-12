@@ -17,6 +17,7 @@ from limbowave.infrastructure.crypto.vault import InvalidPassword, Vault, VaultE
 from limbowave.web.security import WebConfig
 from limbowave.web.server import WebServer
 
+from .auth import PersistentAuthStore
 from .composition import ServerRuntime, build_server_runtime
 from .control import ControlServer
 
@@ -129,7 +130,8 @@ class ServerLifecycle:
             await self._stop_web()
             self._runtime = runtime
             self._epoch = runtime.facade.epoch
-            web = WebServer(runtime.facade, self.web_config)
+            auth = PersistentAuthStore(self.paths.data_root / "limbowave.db")
+            web = WebServer(runtime.facade, self.web_config, auth=auth)
             await web.start()
             self._web = web
             self._state = ServerState.UNLOCKED
@@ -184,12 +186,19 @@ class ServerLifecycle:
     async def _handle_control(self, command: str, payload: str | None) -> str:
         if command == "status":
             return self.state.value
-        if command == "pair":
+        if command in {"pair", "devices", "revoke"}:
             if self._state is not ServerState.UNLOCKED or self._web is None:
                 return "failed"
             import json
 
-            return json.dumps(self._web.open_pairing(), ensure_ascii=False)
+            if command == "pair":
+                return json.dumps(self._web.open_pairing(), ensure_ascii=False)
+            if command == "devices":
+                return json.dumps(self._web.list_devices(), ensure_ascii=False)
+            if not payload:
+                return "failed"
+            self._web.revoke(payload)
+            return "ok"
         if command == "unlock":
             return "ok" if await self.unlock(payload or "") else "failed"
         if command == "lock":

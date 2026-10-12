@@ -30,7 +30,7 @@ class ControlServer:
         try:
             command = (await reader.readline()).decode("utf-8").strip()
             payload: str | None = None
-            if command == "unlock":
+            if command in {"unlock", "revoke"}:
                 raw_length = await reader.readline()
                 length = int(raw_length.decode("ascii").strip())
                 if not 0 < length <= 4096:
@@ -61,8 +61,8 @@ async def send_control(path: Path, command: str, payload: str | None = None) -> 
     reader, writer = await asyncio.open_unix_connection(str(path))  # type: ignore[attr-defined]
     try:
         writer.write((command + "\n").encode("utf-8"))
-        if command == "unlock":
-            value = (payload or "").encode("utf-8")
+        if payload is not None:
+            value = payload.encode("utf-8")
             writer.write((str(len(value)) + "\n").encode("ascii") + value)
         await writer.drain()
         result = await reader.readline()
