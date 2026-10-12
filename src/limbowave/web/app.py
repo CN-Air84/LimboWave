@@ -57,7 +57,13 @@ def create_app(
 
     def cookie(response: JSONResponse, name: str, value: str, age: int) -> None:
         response.set_cookie(
-            name, value, max_age=age, httponly=True, secure=config.tls, samesite="strict", path="/"
+            name,
+            value,
+            max_age=age,
+            httponly=True,
+            secure=config.transport_secure,
+            samesite="strict",
+            path="/",
         )
 
     def paired(result: dict[str, Any]) -> JSONResponse:
@@ -173,7 +179,7 @@ def create_app(
             "server_epoch": facade.epoch,
             "csrf_token": csrf,
             "password_required": password_gate is not None and not d.password_verified,
-            "transport_secure": config.tls,
+            "transport_secure": config.transport_secure,
             "permissions": {"chat": password_gate is None or d.password_verified, "tools": False},
         }
 
