@@ -35,7 +35,7 @@ from PySide6.QtCore import (
     Qt,
     Signal,
 )
-from PySide6.QtGui import QColor, QKeyEvent, QPainter, QPaintEvent, QPen
+from PySide6.QtGui import QColor, QKeyEvent, QMouseEvent, QPainter, QPaintEvent, QPen
 from PySide6.QtWidgets import (
     QApplication,
     QFrame,
@@ -243,7 +243,7 @@ class FloatingPanel(QFrame):
             return
         self._closing = True
         focus = QApplication.focusWidget()
-        if focus is not None and (focus is self or self.isAncestorOf(focus)):
+        if focus is not None and self._owns_widget(focus):
             focus.clearFocus()
         if self._outside_filter_installed:
             QApplication.instance().removeEventFilter(self)  # type: ignore[union-attr]
@@ -264,14 +264,28 @@ class FloatingPanel(QFrame):
         # 结果回调仍即时交付；视觉退场在后台完成。
         self.closed.emit()
 
+    def _owns_widget(self, widget: QWidget) -> bool:
+        # QWidget.isAncestorOf 不跨 Qt.Popup 窗口边界；下拉列表/菜单虽是独立窗口，
+        # 仍通过 parentWidget 归属于面板。必须检查整条父链，不能误当成外部点击。
+        owner: QWidget | None = widget
+        while owner is not None:
+            if owner is self:
+                return True
+            owner = owner.parentWidget()
+        return False
+
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
-        """点击面板外部即关闭；Esc 关闭。"""
+        """点击面板及其弹出菜单之外才关闭；Esc 由当前焦点控件处理。"""
         if event.type() == QEvent.Type.MouseButtonPress:
             widget = watched
-            if isinstance(widget, QWidget) and not self.isAncestorOf(widget) and widget is not self:
+            if isinstance(widget, QWidget) and not self._owns_widget(widget):
                 self.close_panel()
                 return False
         return super().eventFilter(watched, event)
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        # 卡片空白处的点击属于内部操作；不要继续冒泡到父窗口再被判为外部点击。
+        event.accept()
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
         if event.key() == Qt.Key.Key_Escape:

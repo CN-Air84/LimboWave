@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QHBoxLayout,
     QLabel,
+    QLayout,
     QListWidgetItem,
     QPlainTextEdit,
     QPushButton,
@@ -45,6 +46,7 @@ class MemoryPanel(QWidget):
         self.conversation_id = conversation_id
         self.branch_id = branch_id
         self._selected_id: str | None = None
+        self._global_states: dict[str, str] = {}
         self._editor_panel: FloatingPanel | None = None
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -98,8 +100,11 @@ class MemoryPanel(QWidget):
         layout.addWidget(description)
         self._subtabs.addTab(title)
         if scrollable:
+            layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
             scroll = QScrollArea()
-            scroll.setObjectName("memoryPageScroll")
+            scroll.setObjectName(
+                "memoryEditorScroll" if title == "记忆编辑" else "memoryPageScroll"
+            )
             scroll.setWidgetResizable(True)
             scroll.setFrameShape(QScrollArea.Shape.NoFrame)
             scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -147,7 +152,22 @@ class MemoryPanel(QWidget):
         layout = self._add_page(
             "记忆编辑",
             "双栏滚动浏览记忆，首行为标题；双击卡片或按 Enter 编辑正文。",
+            scrollable=True,
         )
+        # 先绑定父级再设置可见性，避免加入布局前短暂弹成独立窗口。
+        self.scope = QComboBox(self)
+        self.scope.setObjectName("memoryScope")
+        self.scope.setAccessibleName("记忆范围")
+        self.scope.addItem("会话记忆 · 当前分支", "session")
+        self.scope.addItem("全局记忆 · 仅本会话定制", "global")
+        self.scope.setVisible(self.conversation_id is not None)
+        layout.addWidget(self.scope)
+        self.scope_hint = QLabel(self)
+        self.scope_hint.setObjectName("memoryPageHint")
+        self.scope_hint.setWordWrap(True)
+        self.scope_hint.setTextFormat(Qt.TextFormat.PlainText)
+        self.scope_hint.setVisible(self.conversation_id is not None)
+        layout.addWidget(self.scope_hint)
         self.items = MemoryCardList()
         self.items.setMinimumHeight(120)
         self.items.currentItemChanged.connect(self._select)
@@ -160,12 +180,43 @@ class MemoryPanel(QWidget):
         self.delete_button.clicked.connect(self._delete)
         row.addWidget(self.new_button)
         row.addWidget(self.delete_button)
-        self.promote_button = QPushButton("升格为全局")
+        self.promote_button = QPushButton("升格为全局", self)
         self.promote_button.setVisible(self.branch_id is not None)
         self.promote_button.clicked.connect(self._promote)
         row.addWidget(self.promote_button)
+        self.restore_button = QPushButton("恢复全局版本")
+        self.restore_button.clicked.connect(self._restore_global)
+        row.addWidget(self.restore_button)
         row.addStretch(1)
         layout.addLayout(row)
+        self.scope.currentIndexChanged.connect(self._scope_changed)
+        self._sync_scope_controls()
+
+    @property
+    def _customizing_global(self) -> bool:
+        return self.conversation_id is not None and self.scope.currentData() == "global"
+
+    def _sync_scope_controls(self) -> None:
+        customizing = self._customizing_global
+        self.new_button.setVisible(not customizing)
+        self.promote_button.setVisible(self.branch_id is not None and not customizing)
+        self.restore_button.setVisible(customizing)
+        self.delete_button.setText("仅本会话删除" if customizing else "删除")
+        self.scope_hint.setText(
+            "仅本会话生效，所有分支共用；不影响全局原文或其他会话。"
+            "未定制的条目继续跟随全局更新，已删除的条目不用于对话，可恢复全局版本。"
+            if customizing else "当前分支的独立记忆；切换上方范围可为本会话定制全局记忆。"
+        )
+        self.items.empty_state.setText(
+            "暂无全局记忆\n可在“设置 → 记忆”中添加，再为本会话单独定制。"
+            if customizing else "暂无记忆\n点击“添加记忆”创建第一条记忆。"
+        )
+
+    def _scope_changed(self, _index: int) -> None:
+        self._close_editor()
+        self.status.clear()
+        self._sync_scope_controls()
+        self.reload()
 
     @property
     def is_editing(self) -> bool:
@@ -185,25 +236,38 @@ class MemoryPanel(QWidget):
         generation = self._reload_generation
         conversation_id, branch_id = self.conversation_id, self.branch_id
         service = self.service
+        customizing = self._customizing_global
 
-        def read() -> tuple[list[MemoryItem], MemorySettings, str]:
+        def read() -> tuple[list[MemoryItem], MemorySettings, str, dict[str, str]]:
             settings = service.settings()
             policy = (
                 service.policy(conversation_id).value
                 if conversation_id else settings.default_policy
             )
-            return service.list(conversation_id, branch_id), settings, policy
+            if customizing and conversation_id is not None:
+                entries = service.list_session_global(conversation_id)
+                return (
+                    [entry.memory for entry in entries], settings, policy,
+                    {entry.memory.id: entry.state for entry in entries},
+                )
+            return service.list(conversation_id, branch_id), settings, policy, {}
 
-        def apply(data: tuple[list[MemoryItem], MemorySettings, str]) -> None:
+        def apply(data: tuple[list[MemoryItem], MemorySettings, str, dict[str, str]]) -> None:
             if generation != self._reload_generation:
                 return
             self.setEnabled(True)
-            memories, settings, policy = data
+            memories, settings, policy, self._global_states = data
             self.items.clear()
             for memory in memories:
-                item = QListWidgetItem(memory.content.splitlines()[0])
+                title = memory.content.splitlines()[0]
+                state = self._global_states.get(memory.id)
+                label = {
+                    "inherited": "继承全局", "modified": "本会话已修改", "deleted": "本会话已删除",
+                }.get(state or "", "")
+                item = QListWidgetItem(f"[{label}] {title}" if label else title)
                 item.setData(Qt.ItemDataRole.UserRole, memory)
-                item.setToolTip(memory.content)
+                item.setData(Qt.ItemDataRole.AccessibleDescriptionRole, label)
+                item.setToolTip(f"{label}\n{memory.content}" if label else memory.content)
                 self.items.addItem(item)
             self._select(None, None)
             self.global_interval.setValue(settings.global_interval)
@@ -216,22 +280,35 @@ class MemoryPanel(QWidget):
             )
 
         def failed(exc: Exception) -> None:
+            if generation != self._reload_generation:
+                return
             self.setEnabled(True)
+            self.items.clear()
+            self._global_states.clear()
+            self._select(None, None)
             self.status.setText(str(exc))
 
         self._jobs.submit(read, apply, failed)
 
     def _new(self) -> None:
+        if self._customizing_global:
+            return
         self.items.setCurrentRow(-1)
         self._open_editor()
 
     def _select(self, item: QListWidgetItem | None, _previous: QListWidgetItem | None) -> None:
         self._selected_id = item.data(Qt.ItemDataRole.UserRole).id if item is not None else None
-        self.delete_button.setEnabled(item is not None)
-        self.promote_button.setEnabled(item is not None)
+        state = self._global_states.get(self._selected_id or "")
+        self.delete_button.setEnabled(item is not None and state != "deleted")
+        self.promote_button.setEnabled(item is not None and not self._customizing_global)
+        self.restore_button.setEnabled(state in ("modified", "deleted"))
 
     def _edit(self, item: QListWidgetItem) -> None:
-        self._open_editor(item.data(Qt.ItemDataRole.UserRole))
+        memory = item.data(Qt.ItemDataRole.UserRole)
+        if self._global_states.get(memory.id) == "deleted":
+            self.status.setText("此条目已在本会话删除；请先恢复全局版本，再进行编辑。")
+            return
+        self._open_editor(memory)
 
     def _floating_parent(self) -> QWidget:
         parent = self.parentWidget()
@@ -243,8 +320,13 @@ class MemoryPanel(QWidget):
 
     def _open_editor(self, memory: MemoryItem | None = None) -> None:
         self._close_editor()
+        customizing = self._customizing_global
         content = QWidget()
         layout = QVBoxLayout(content)
+        if customizing:
+            hint = QLabel("修改仅对本会话生效，不会更改全局原文或其他会话。")
+            hint.setWordWrap(True)
+            layout.addWidget(hint)
         editor = QPlainTextEdit()
         editor.setPlaceholderText("输入需要长期保留的信息（1–4000字）")
         editor.setMinimumHeight(160)
@@ -268,7 +350,9 @@ class MemoryPanel(QWidget):
         layout.addLayout(row)
         parent = self._floating_parent()
         panel = open_panel(
-            parent, "编辑记忆" if memory else "添加记忆", content,
+            parent,
+            "定制全局记忆 · 仅本会话" if customizing else "编辑记忆" if memory else "添加记忆",
+            content,
             width=min(560, max(280, parent.width() - 28)),
         )
         self._editor_panel = panel
@@ -291,7 +375,9 @@ class MemoryPanel(QWidget):
                 if self._editor_panel is panel:
                     panel.close_panel()
                 self.reload()
-                self.status.setText("已保存")
+                self.status.setText(
+                    "已保存，仅本会话生效；下一轮对话使用新内容。" if customizing else "已保存"
+                )
 
             def failed(exc: Exception) -> None:
                 if self._editor_panel is panel:
@@ -299,10 +385,15 @@ class MemoryPanel(QWidget):
                     error.setText(str(exc))
                     editor.setFocus()
 
-            self._jobs.submit(
-                lambda: service.save(text, conversation_id, branch_id, item_id=item_id),
-                ready, failed,
-            )
+            def write() -> None:
+                if customizing:
+                    if conversation_id is None or item_id is None:
+                        raise ValueError("请选择需要定制的全局记忆")
+                    service.save_session_global(item_id, text, conversation_id)
+                else:
+                    service.save(text, conversation_id, branch_id, item_id=item_id)
+
+            self._jobs.submit(write, ready, failed)
 
         save.clicked.connect(submit)
         editor.setFocus()
@@ -314,13 +405,13 @@ class MemoryPanel(QWidget):
         if self._editor_panel is not None:
             self._editor_panel.close_panel()
 
-    def _perform(self, action: Callable[[], object]) -> None:
+    def _perform(self, action: Callable[[], object], message: str = "已保存") -> None:
         self.setEnabled(False)
 
         def ready(_value: object) -> None:
             self.setEnabled(True)
             self.reload()
-            self.status.setText("已保存")
+            self.status.setText(message)
 
         def failed(exc: Exception) -> None:
             self.setEnabled(True)
@@ -346,6 +437,19 @@ class MemoryPanel(QWidget):
         item_id = self._selected_id
         if item_id is None:
             return
+        if self._customizing_global and conversation_id is not None:
+            service = self.service
+            ask_confirm(
+                self._floating_parent(),
+                "仅在本会话删除这条全局记忆？",
+                "此会话的所有分支将不再使用这条记忆。全局原文与其他会话不受影响，"
+                "之后可通过“恢复全局版本”重新启用。",
+                lambda yes: self._perform(
+                    lambda: service.delete_session_global(item_id, conversation_id),
+                    "已在本会话删除；下一轮对话生效，可随时恢复。",
+                ) if yes else None,
+            )
+            return
         ask_confirm(
             self._floating_parent(),
             "删除记忆？",
@@ -359,7 +463,19 @@ class MemoryPanel(QWidget):
             ),
         )
 
+    def _restore_global(self) -> None:
+        item_id, conversation_id = self._selected_id, self.conversation_id
+        if not self._customizing_global or item_id is None or conversation_id is None:
+            return
+        service = self.service
+        self._perform(
+            lambda: service.restore_session_global(item_id, conversation_id),
+            "已恢复当前全局版本；下一轮对话生效。",
+        )
+
     def _promote(self) -> None:
+        if self._customizing_global:
+            return
         item_id, conversation_id, branch_id = (
             self._selected_id,
             self.conversation_id,

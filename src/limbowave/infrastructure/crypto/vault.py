@@ -402,3 +402,20 @@ def _b64(raw: bytes) -> str:
 
 def _unb64(text: str) -> bytes:
     return base64.b64decode(text)
+
+
+def backup_key_document(key: VaultKey, password: str, params: KdfParams | None = None) -> bytes:
+    """Portable vault document: wrap the same key with the independent backup password."""
+    if not password:
+        raise VaultError("备份密码不得为空")
+    kdf = params or KdfParams()
+    salt = secrets.token_bytes(SALT_BYTES)
+    wrap = KeyWrap(
+        method="password",
+        blob=wrap_key(derive_kek(password, salt, kdf), key.key_bytes()),
+        salt=_b64(salt),
+        kdf=kdf,
+        created_at=datetime.now(UTC).isoformat(),
+    )
+    # Machine-bound recovery wraps must not travel to another device.
+    return json.dumps({"version": VAULT_VERSION, "wraps": [wrap.to_json()]}).encode("utf-8")

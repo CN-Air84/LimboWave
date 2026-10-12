@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -34,6 +35,14 @@ class MemoryItem:
     content: str
     source: str
     created_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class SessionGlobalMemory:
+    """用于管理界面的全局记忆视图；已删除条目保留原文以便恢复。"""
+
+    memory: MemoryItem
+    state: Literal["inherited", "modified", "deleted"]
 
 
 @dataclass(frozen=True, slots=True)

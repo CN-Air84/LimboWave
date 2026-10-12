@@ -19,6 +19,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
+import tempfile
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -32,7 +35,7 @@ from limbowave.domain.backup import (
     check_compatibility,
 )
 from limbowave.infrastructure.backup.archive import read_archive, read_header, write_archive
-from limbowave.infrastructure.crypto.vault import KdfParams
+from limbowave.infrastructure.crypto.vault import KdfParams, VaultKey, backup_key_document
 
 MANIFEST_NAME = "manifest.json"
 DATABASE_NAME = "limbowave.db"
@@ -62,12 +65,14 @@ class BackupService:
         app_version: str,
         schema_version: int,
         kdf_params: KdfParams | None = None,
+        vault_key: VaultKey | None = None,
     ) -> None:
-        self._root = data_root
+        self._root = data_root.resolve()
         self._app_version = app_version
         self._schema_version = schema_version
         # 备份 KDF 参数可独立于资料库（备份可能在别的机器上解开）
         self._kdf = kdf_params
+        self._vault_key = vault_key
 
     # ---------- 创建 ----------
 
@@ -76,6 +81,10 @@ class BackupService:
         if not password:
             raise BackupError("备份密码不得为空")
         files = self._collect()
+        if self._vault_key is not None:
+            files["vault.json"] = backup_key_document(self._vault_key, password, self._kdf)
+        elif (self._root / "vault.json").exists():
+            raise BackupError("资料库未解锁，无法创建包含恢复密钥的备份")
         manifest = self._build_manifest(files)
         payload = {MANIFEST_NAME: _dump_manifest(manifest), **files}
         write_archive(target, payload, password, params=self._kdf)
@@ -86,10 +95,21 @@ class BackupService:
         files: dict[str, bytes] = {}
         database = self._root / DATABASE_NAME
         if database.is_file():
-            files[ARCHIVE_DATABASE] = database.read_bytes()
+            # A raw file copy loses committed pages still in the live WAL.
+            with tempfile.TemporaryDirectory() as tmp:
+                snapshot = Path(tmp) / DATABASE_NAME
+                with (
+                    closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)) as conn,
+                    closing(sqlite3.connect(snapshot)) as target,
+                ):
+                    conn.backup(target)
+                files[ARCHIVE_DATABASE] = snapshot.read_bytes()
         config = self._root / CONFIG_NAME
         if config.is_file():
             files[ARCHIVE_CONFIG] = config.read_bytes()
+        secrets = self._root / "vault" / "secrets.json"
+        if secrets.is_file():
+            files["vault/secrets.json"] = secrets.read_bytes()
         blobs_dir = self._root / "blobs"
         if blobs_dir.is_dir():
             for blob in sorted(blobs_dir.glob("*.bin")):
@@ -147,7 +167,10 @@ class BackupService:
 
     def inspect(self, source: Path, password: str) -> BackupInspection:
         """解密、校验完整性、检查兼容性。**不落任何文件**。"""
-        _, files = read_archive(source, password)  # 密码错/被篡改在这里抛
+        _, files = read_archive(source, password)
+        return self._inspect_files(files)
+
+    def _inspect_files(self, files: dict[str, bytes]) -> BackupInspection:
         raw_manifest = files.get(MANIFEST_NAME)
         if raw_manifest is None:
             raise BackupError("备份包缺少清单文件")
@@ -179,13 +202,15 @@ class BackupService:
         切换资料库是调用方的事（第 5 步）——那要动用户的真实目录，
         不该由服务悄悄做。
         """
-        inspection = self.inspect(source, password)
+        _, files = read_archive(source, password)
+        inspection = self._inspect_files(files)
         if not inspection.integrity_ok:
             raise IntegrityError("备份完整性校验失败：" + "; ".join(inspection.integrity_problems))
         if not inspection.compatible:
             raise BackupError("备份与当前应用不兼容：" + "; ".join(inspection.notes))
 
-        _, files = read_archive(source, password)
+        if destination.exists() and (destination.is_symlink() or any(destination.iterdir())):
+            raise BackupError("恢复目标必须是空的临时目录")
         destination.mkdir(parents=True, exist_ok=True)
         for name, content in files.items():
             if name == MANIFEST_NAME:
@@ -243,6 +268,19 @@ def _load_manifest(raw: bytes) -> BackupManifest:
 def _verify_entries(manifest: BackupManifest, files: dict[str, bytes]) -> list[str]:
     """逐文件校验哈希。返回问题列表（空 = 通过）。"""
     problems: list[str] = []
+    names = [entry.path for entry in manifest.entries]
+    if len(set(names)) != len(names):
+        problems.append("清单含重复路径")
+    if set(names) != set(files) - {MANIFEST_NAME}:
+        problems.append("清单与归档文件不一致")
+    for name in names:
+        parts = name.split("/")
+        allowed = name in {DATABASE_NAME, CONFIG_NAME, "vault.json", "vault/secrets.json"}
+        allowed = allowed or (
+            len(parts) == 2 and parts[0] == "blobs" and parts[1].endswith(".bin")
+        )
+        if not allowed:
+            problems.append(f"不支持的备份路径：{name}")
     for entry in manifest.entries:
         content = files.get(entry.path)
         if content is None:

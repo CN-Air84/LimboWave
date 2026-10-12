@@ -690,6 +690,39 @@ class RunCoordinator:
             self._emit(ERROR, message=f"新建会话失败：{redact_text(str(exc))}")
             return False
 
+    @_arbitrated
+    async def ensure_session(self) -> bool:
+        """为发送前的会话设置准备持久化定位，不创建消息或调用内核。"""
+        if self.conversation_id is not None and self.branch_id is not None:
+            return True
+        if self.busy or not self._runtime_valid:
+            self._emit(ERROR, message="会话正在切换或上下文无效，请稍后重试或重新新建会话")
+            return False
+        try:
+            with self.runtime_transition():
+                await self.wait_idle()
+                conversation_id, branch_id = await self._storage_call(
+                    "_persist_empty_session", self._tick(), self._context().logical_model_id,
+                )
+                self._active_conversation_id = conversation_id
+                self._active_branch_id = branch_id
+            return True
+        except Exception as exc:
+            self._emit(ERROR, message=f"准备会话失败（存储不可用）：{redact_text(str(exc))}")
+            return False
+
+    def _persist_empty_session(self, now: datetime, logical_model_id: str) -> tuple[str, str]:
+        # 成功提交后才由调用方切换定位；失败不能留下指向不存在记录的会话 ID。
+        conversation_id, branch_id = self._new_id("conv"), self._new_id("branch")
+        with self._uow_factory() as uow:
+            uow.conversations.add(Conversation(
+                id=conversation_id, title=DEFAULT_CONVERSATION_TITLE, created_at=now,
+                default_logical_model_id=logical_model_id,
+            ))
+            uow.branches.add(Branch(id=branch_id, conversation_id=conversation_id, created_at=now))
+            uow.commit()
+        return conversation_id, branch_id
+
     def _prepare_switch(
         self,
         conversation_id: str,
@@ -1690,6 +1723,9 @@ class RunCoordinator:
             conversation_id, branch_id, first_turn = self._ensure_session(uow, now)
             # 意图快照记录的是**实际上下文**：分叉分支要带上继承的前缀
             prior_ids = tuple(m.id for m in branch_path.branch_messages(uow, branch_id))
+            if not first_turn and not prior_ids:
+                # 记忆设置可能提前创建空会话；其真正的第一轮仍应触发标题建议。
+                first_turn = not uow.runs.list_for_conversation(conversation_id)
             capture_memory(uow, user_message_id, conversation_id, branch_id)
             uow.messages.add(
                 Message(

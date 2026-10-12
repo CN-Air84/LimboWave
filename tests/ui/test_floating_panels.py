@@ -438,3 +438,51 @@ def test_export_panel_model_info_only_applies_to_html(qtbot: QtBot, fmt: str) ->
     panel._fmt[fmt].click()
     panel._go.click()
     assert captured[0][-1] is False
+
+
+
+def test_owned_menu_and_nested_panel_keep_outer_panel_open(qtbot: QtBot) -> None:
+    from PySide6.QtCore import QPoint, Qt
+    from PySide6.QtWidgets import QMenu
+
+    host = _host(qtbot)
+    outer = FloatingPanel(host, "outer", width=600)
+    outer.resize(600, 400)
+    outer.popup()
+    qtbot.waitUntil(lambda: outer._motion is None)
+    inner = FloatingPanel(outer, "inner", width=300)
+    inner.popup()
+    qtbot.waitUntil(lambda: inner._motion is None)
+    menu = QMenu(inner)
+    action = menu.addAction("choose")
+    selected = []
+    action.triggered.connect(lambda: selected.append(True))
+    menu.popup(inner.mapToGlobal(QPoint(20, 30)))
+    qtbot.waitUntil(menu.isVisible)
+    qtbot.mouseClick(
+        menu, Qt.MouseButton.LeftButton, pos=menu.actionGeometry(action).center(), delay=30,
+    )
+    assert selected == [True]
+    assert not inner._closing and not outer._closing
+    qtbot.mouseClick(outer, Qt.MouseButton.LeftButton, pos=QPoint(4, 4))
+    assert inner._closing and not outer._closing
+    qtbot.mouseClick(host, Qt.MouseButton.LeftButton, pos=QPoint(2, 2))
+    assert outer._closing
+
+
+def test_unrelated_popup_still_counts_as_outside_click(qtbot: QtBot) -> None:
+    from PySide6.QtCore import Qt
+
+    host = _host(qtbot)
+    panel = FloatingPanel(host, "memory")
+    panel.popup()
+    qtbot.waitUntil(lambda: panel._motion is None)
+    # A popup owned by another control must not bypass outside-dismissal globally.
+    unrelated = QWidget(host, Qt.WindowType.Popup)
+    unrelated.resize(120, 80)
+    button = QPushButton("other", unrelated)
+    unrelated.show()
+    qtbot.waitExposed(unrelated)
+    qtbot.mouseClick(button, Qt.MouseButton.LeftButton, delay=30)
+    assert panel._closing
+    unrelated.close()

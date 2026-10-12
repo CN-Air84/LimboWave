@@ -135,15 +135,66 @@ async def test_coordinator_fork_restores_memory_at_original_user_message(memory_
     coordinator.memory_service = service
     await coordinator.resume("c", "b")
     original = service.save("before turn", "c", "b")
+    global_item = service.save("global before turn")
     _seed_one_turn(kernel)
     await _one_turn(kernel, coordinator)
     with factory() as uow:
         source = next(m for m in uow.messages.list_for_branch("b") if m.role.value == "user")
     service.save("after turn", "c", "b", item_id=original.id)
+    service.save_session_global(global_item.id, "conversation-wide override", "c")
     kernel.entries = []
     assert await coordinator.edit_user_message(source.id, "edited") is not None
     assert service.list("c", coordinator.branch_id) == [original]
     assert kernel.last_context["session"] == ["before turn"]
+    assert kernel.last_context["global"] == ["conversation-wide override"]
     assert kernel.last_context["round"] == 1
     kernel.emit("run.settled", {})
     await coordinator.wait_idle()
+
+
+
+async def test_coordinator_session_global_snapshot_and_conversation_switch(memory_stack):
+    from tests.unit.test_memory_service import _second_conversation
+
+    service, factory = memory_stack
+    _second_conversation(factory)
+
+    class MemoryKernel(FakeKernel):
+        def __init__(self):
+            super().__init__()
+            self.contexts = []
+
+        async def set_memory_context(self, context):
+            self.contexts.append(context)
+
+    kernel = MemoryKernel()
+    coordinator = RunCoordinator(kernel, factory, context=lambda: RunContext("m", "e", "test"))
+    coordinator.memory_service = service
+    first = service.save("first global")
+    second = service.save("second global")
+    local = service.save("branch only", "c", "b")
+    await coordinator.resume("c", "b")
+    await coordinator.send("first run")
+    before = kernel.contexts[-1]
+    assert before["global"] == [first.content, second.content]
+    service.save_session_global(first.id, "only c", "c")
+    service.delete_session_global(second.id, "c")
+    # 更改持久化配置不能修改已交给运行内核的快照。
+    assert before["global"] == [first.content, second.content]
+    kernel.say("reply")
+    kernel.emit("run.settled", {})
+    await coordinator.wait_idle()
+    await coordinator.send("next run")
+    assert kernel.contexts[-1]["global"] == ["only c"]
+    assert kernel.contexts[-1]["session"] == [local.content]
+    kernel.say("reply")
+    kernel.emit("run.settled", {})
+    await coordinator.wait_idle()
+    await coordinator.resume("second", "second-branch")
+    await coordinator.send("another conversation")
+    assert kernel.contexts[-1]["global"] == [first.content, second.content]
+    assert kernel.contexts[-1]["session"] == []
+    kernel.say("reply")
+    kernel.emit("run.settled", {})
+    await coordinator.wait_idle()
+    assert service.list() == [first, second]

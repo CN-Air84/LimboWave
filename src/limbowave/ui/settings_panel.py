@@ -166,7 +166,8 @@ class _DataSecurityTab(QScrollArea):
         layout.addWidget(heading)
         note = QLabel(
             "备份使用独立密码（与主密码无关），生成 .lwb 加密包；\n"
-            "恢复会在临时目录校验完整后整体替换当前资料库。"
+            "恢复前会自动校验并保留当前资料库，完成后自动重启，失败自动回退。\n"
+            "重启后使用备份密码解锁，无需手动操作文件夹。"
         )
         note.setWordWrap(True)
         note.setStyleSheet(_HINT_STYLE)

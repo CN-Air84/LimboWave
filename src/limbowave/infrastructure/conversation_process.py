@@ -37,7 +37,7 @@ _memories: MemoryService | None = None
 _OPERATIONS = frozenset({
     "_prepare_regeneration", "_prepare_branch", "_persist_branch", "_persist_run_start",
     "_attachment_prompt", "_memory_prompt", "_finalize_storage", "_prepare_switch",
-    "_prepare_retry", "_prepare_fork",
+    "_prepare_retry", "_prepare_fork", "_persist_empty_session",
 })
 
 

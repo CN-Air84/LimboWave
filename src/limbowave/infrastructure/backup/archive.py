@@ -20,7 +20,7 @@ import io
 import struct
 import tarfile
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
@@ -67,10 +67,19 @@ def unpack_archive(data: bytes) -> dict[str, bytes]:
     with tarfile.open(fileobj=io.BytesIO(data), mode="r") as tar:
         for member in tar.getmembers():
             if not member.isfile():
-                continue
+                raise WrongPassword("归档中含非普通文件")
             name = member.name
             # 防归档穿越：备份包也可能是恶意构造的
-            if name.startswith("/") or ".." in Path(name).parts or ":" in name:
+            parts = name.split("/")
+            if (
+                PurePosixPath(name).is_absolute() or "\\" in name or ":" in name
+                or any(part in {"", ".", ".."} or part.endswith((" ", ".")) for part in parts)
+                or any(part.split(".")[0].upper() in {
+                    "CON", "PRN", "AUX", "NUL", *[f"COM{i}" for i in range(10)],
+                    *[f"LPT{i}" for i in range(10)],
+                } for part in parts)
+                or name.casefold() in {entry.casefold() for entry in files}
+            ):
                 raise WrongPassword(f"归档内含非法路径：{name}")
             extracted = tar.extractfile(member)
             files[name] = extracted.read() if extracted is not None else b""

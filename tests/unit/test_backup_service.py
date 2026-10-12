@@ -266,3 +266,51 @@ def test_restore_verifies_integrity_before_writing(service: BackupService, tmp_p
         service.restore_to(source, PASSWORD, destination)
     assert not destination.exists() or not any(destination.iterdir())
     assert result.manifest.entries  # 备份本身是完整的
+
+
+def test_backup_snapshot_includes_live_wal(service, data_root, tmp_path):
+    conn = sqlite3.connect(data_root / ARCHIVE_DATABASE)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA wal_autocheckpoint=0")
+        conn.execute(
+            "INSERT INTO conversations (id, title_enc, created_at) VALUES ('wal', 'x', 'now')"
+        )
+        conn.commit()
+        archive = tmp_path / "wal.lwb"
+        result = service.create(archive, PASSWORD)
+        assert result.manifest.conversation_count == 2
+        destination = tmp_path / "restored-wal"
+        service.restore_to(archive, PASSWORD, destination)
+        restored = sqlite3.connect(destination / ARCHIVE_DATABASE)
+        try:
+            assert restored.execute("SELECT COUNT(*) FROM conversations").fetchone()[0] == 2
+        finally:
+            restored.close()
+    finally:
+        conn.close()
+
+
+def test_unlisted_files_rejected_before_writing(service, tmp_path):
+    source = tmp_path / "extra.lwb"
+    service.create(source, PASSWORD)
+    _, files = read_archive(source, PASSWORD)
+    files["config-extra.json"] = b"{}"
+    write_archive(source, files, PASSWORD, params=FAST_KDF)
+    with pytest.raises(IntegrityError, match="不一致"):
+        service.restore_to(source, PASSWORD, tmp_path / "destination")
+    assert not (tmp_path / "destination").exists()
+
+
+@pytest.mark.parametrize("name", [
+    r"\rooted.bin", r"blobs\..\escape.bin", "blobs/../escape.bin", "C:/escape.bin",
+    "blobs/CON.bin", "blobs/./a.bin", "blobs/a.bin.", "blobs//a.bin",
+])
+def test_archive_rejects_windows_unsafe_paths(name):
+    with pytest.raises(WrongPassword):
+        unpack_archive(build_archive({name: b"x"}))
+
+
+def test_archive_rejects_case_collisions():
+    with pytest.raises(WrongPassword):
+        unpack_archive(build_archive({"blobs/a.bin": b"x", "blobs/A.bin": b"y"}))

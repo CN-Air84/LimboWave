@@ -408,3 +408,198 @@ def test_memory_cards_empty_state_and_themed_layout(qtbot, memory_stack, palette
     finally:
         theme.set_palette(old_palette)
         theme.set_font_scale(old_scale)
+
+
+
+def _show_session_global(qtbot, service):
+    panel = _show_editor_page(qtbot, service, ("c", "b"))
+    panel.scope.setCurrentIndex(panel.scope.findData("global"))
+    qtbot.waitUntil(panel.isEnabled)
+    return panel
+
+
+def test_session_global_scope_edit_and_restore(qtbot, memory_stack):
+    service, _ = memory_stack
+    original = service.save("全局标题\n原始正文")
+    local = service.save("分支内容", "c", "b")
+    panel = _show_session_global(qtbot, service)
+    assert panel.items.count() == 1
+    assert "继承全局" in panel.items.item(0).text()
+    assert not panel.new_button.isVisible() and not panel.promote_button.isVisible()
+    assert panel.restore_button.isVisible() and not panel.restore_button.isEnabled()
+    assert "仅本会话" in panel.scope_hint.text()
+    _double_click(qtbot, panel)
+    _popup, editor, save = _editor_parts(qtbot, panel)
+    editor.setPlainText("定制标题\n定制正文")
+    qtbot.mouseClick(save, Qt.MouseButton.LeftButton)
+    qtbot.waitUntil(lambda: not panel.is_editing)
+    qtbot.waitUntil(panel.isEnabled)
+    assert service.list() == [original]
+    assert service.effective_global("c")[0].content == "定制标题\n定制正文"
+    assert "本会话已修改" in panel.items.item(0).text()
+    panel.items.setCurrentRow(0)
+    assert panel.restore_button.isEnabled()
+    panel._restore_global()
+    qtbot.waitUntil(panel.isEnabled)
+    assert service.effective_global("c") == [original]
+    panel.scope.setCurrentIndex(panel.scope.findData("session"))
+    qtbot.waitUntil(panel.isEnabled)
+    assert panel.items.item(0).data(Qt.ItemDataRole.UserRole) == local
+    assert panel.new_button.isVisible() and panel.promote_button.isVisible()
+    assert not panel.restore_button.isVisible()
+
+
+def test_session_global_delete_confirmation_is_local_and_recoverable(
+    qtbot, memory_stack, monkeypatch,
+):
+    service, _ = memory_stack
+    original = service.save("保留全局原文")
+    panel = _show_session_global(qtbot, service)
+    panel.items.setCurrentRow(0)
+    confirmations = []
+
+    def confirm(_parent, title, message, callback):
+        confirmations.append((title, message, callback))
+
+    monkeypatch.setattr("limbowave.ui.session_memory_panel.ask_confirm", confirm)
+    panel._delete()
+    title, message, answer = confirmations.pop()
+    assert "本会话" in title and "其他会话" in message
+    answer(False)
+    assert service.effective_global("c") == [original]
+    panel._delete()
+    confirmations.pop()[2](True)
+    qtbot.waitUntil(panel.isEnabled)
+    assert service.effective_global("c") == [] and service.list() == [original]
+    assert "本会话已删除" in panel.items.item(0).text()
+    panel.items.setCurrentRow(0)
+    assert not panel.delete_button.isEnabled() and panel.restore_button.isEnabled()
+    panel._restore_global()
+    qtbot.waitUntil(panel.isEnabled)
+    assert service.effective_global("c") == [original]
+
+
+def test_switching_memory_scope_discards_draft_without_global_write(qtbot, memory_stack):
+    service, _ = memory_stack
+    original = service.save("global")
+    local = service.save("local", "c", "b")
+    panel = _show_session_global(qtbot, service)
+    _double_click(qtbot, panel)
+    _popup, editor, _save = _editor_parts(qtbot, panel)
+    editor.setPlainText("unsaved")
+    panel.scope.setCurrentIndex(panel.scope.findData("session"))
+    qtbot.waitUntil(panel.isEnabled)
+    assert not panel.is_editing
+    assert service.list() == [original] and service.effective_global("c") == [original]
+    assert service.list("c", "b") == [local]
+
+
+def test_session_global_pending_confirmation_captures_scope(qtbot, memory_stack, monkeypatch):
+    service, _ = memory_stack
+    original = service.save("global")
+    local = service.save("local", "c", "b")
+    panel = _show_session_global(qtbot, service)
+    panel.items.setCurrentRow(0)
+    callbacks = []
+    monkeypatch.setattr(
+        "limbowave.ui.session_memory_panel.ask_confirm",
+        lambda _parent, _title, _message, callback: callbacks.append(callback),
+    )
+    panel._delete()
+    panel.scope.setCurrentIndex(panel.scope.findData("session"))
+    qtbot.waitUntil(panel.isEnabled)
+    callbacks.pop()(True)
+    qtbot.waitUntil(panel.isEnabled)
+    assert service.list() == [original] and service.effective_global("c") == []
+    assert service.list("c", "b") == [local]
+
+
+def test_session_global_empty_state_and_stale_original_error(qtbot, memory_stack):
+    service, _ = memory_stack
+    panel = _show_session_global(qtbot, service)
+    assert panel.items.empty_state.isVisible()
+    assert "设置" in panel.items.empty_state.text()
+    assert not panel.delete_button.isEnabled() and not panel.restore_button.isEnabled()
+    original = service.save("global")
+    panel.reload()
+    qtbot.waitUntil(panel.isEnabled)
+    _double_click(qtbot, panel)
+    popup, editor, save = _editor_parts(qtbot, panel)
+    editor.setPlainText("本会话编辑")
+    service.delete(original.id)
+    qtbot.mouseClick(save, Qt.MouseButton.LeftButton)
+    qtbot.waitUntil(save.isEnabled)
+    assert panel.is_editing
+    assert "不存在" in popup.findChild(QLabel, "memoryEditorError").text()
+    assert service.list() == [] and service.effective_global("c") == []
+
+
+
+def test_memory_scope_ignores_outdated_background_reload(qtbot, memory_stack, monkeypatch):
+    service, _ = memory_stack
+    service.save("global")
+    local = service.save("local", "c", "b")
+    panel = _show_editor_page(qtbot, service, ("c", "b"))
+    jobs = []
+    monkeypatch.setattr(panel._jobs, "submit", lambda *job: jobs.append(job))
+    panel.scope.setCurrentIndex(panel.scope.findData("global"))
+    panel.scope.setCurrentIndex(panel.scope.findData("session"))
+    old_read, old_apply, old_fail = jobs[0]
+    read, apply, _fail = jobs[1]
+    apply(read())
+    old_apply(old_read())
+    old_fail(ValueError("outdated read failed"))
+    assert panel.isEnabled()
+    assert panel.items.count() == 1
+    assert panel.items.item(0).data(Qt.ItemDataRole.UserRole) == local
+    assert panel.items.item(0).text() == local.content
+    assert not panel.restore_button.isVisible()
+    assert panel.status.text() == ""
+
+
+@pytest.mark.parametrize("scale", [1.0, 1.5])
+def test_session_global_editor_actions_do_not_overlap_cards_in_short_window(
+    qtbot, memory_stack, scale,
+):
+    from PySide6.QtGui import QFontDatabase
+    from PySide6.QtWidgets import QScrollArea, QWidget
+
+    from limbowave.ui import theme
+
+    service, _ = memory_stack
+    for i in range(4):
+        service.save(f"综合记忆文档 {i}\n" + "基础身份定义 Name: Air84/写字与阅读时请保持" * 10)
+    old_scale, old_font = theme.current_font_scale(), theme.FONT_FAMILY
+    font_id = QFontDatabase.addApplicationFont("C:/Windows/Fonts/msyh.ttc")
+    families = QFontDatabase.applicationFontFamilies(font_id) if font_id >= 0 else []
+    try:
+        theme.set_font_scale(scale)
+        if families:
+            theme.set_font_family(families[0])
+        host = QWidget()
+        host.resize(696, 425)
+        qtbot.addWidget(host)
+        host.setStyleSheet(theme.app_stylesheet())
+        host.show()
+        outer = FloatingPanel(host, "会话记忆", width=620)
+        panel = MemoryPanel(service, outer, conversation_id="c", branch_id="b")
+        outer.content_layout.addWidget(panel, 1)
+        outer.popup()
+        qtbot.waitUntil(lambda: outer._motion is None and panel.isEnabled())
+        panel._subtabs.setCurrentIndex(1)
+        qtbot.waitUntil(lambda: panel._stack.current_index == 1 and panel._stack._animation is None)
+        panel.scope.setCurrentIndex(panel.scope.findData("global"))
+        qtbot.waitUntil(panel.isEnabled)
+        page = panel.delete_button.parentWidget()
+        assert page is panel.items.parentWidget()
+        assert panel.items.geometry().bottom() < panel.delete_button.geometry().top()
+        scroll = panel._stack.findChild(QScrollArea, "memoryEditorScroll")
+        assert scroll is not None and scroll.verticalScrollBar().maximum() > 0
+        scroll.verticalScrollBar().setValue(scroll.verticalScrollBar().maximum())
+        qtbot.waitUntil(lambda: scroll.viewport().rect().contains(
+            panel.delete_button.mapTo(scroll.viewport(), panel.delete_button.rect().center())
+        ))
+        assert not outer._closing
+    finally:
+        theme.set_font_scale(old_scale)
+        theme.FONT_FAMILY = old_font

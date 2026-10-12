@@ -43,3 +43,15 @@ def test_release_cannot_launch_oobe_debug_restart(monkeypatch, frozen, developme
     with pytest.raises(PermissionError, match="仅限开发环境"):
         restart.restart_into_oobe(["limbowave", "--oobe"], frozen=frozen)
     launch.assert_not_called()
+
+
+@pytest.mark.parametrize("frozen", [False, True])
+def test_normal_restart_supports_packaged_build_and_drops_debug_options(monkeypatch, frozen):
+    launch = Mock()
+    monkeypatch.setattr(restart.subprocess, "Popen", launch)
+    restart.restart_application(
+        ["entry", "--log-dir", "C:/Logs Here", "--oobe", "--smoke"], frozen=frozen
+    )
+    prefix = [sys.executable] if frozen else [sys.executable, "-m", "limbowave"]
+    assert launch.call_args.args[0] == [*prefix, "--log-dir", "C:/Logs Here"]
+    assert launch.call_args.kwargs.get("shell", False) is False

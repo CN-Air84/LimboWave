@@ -3,10 +3,12 @@
 import json
 import urllib.request
 
+from limbowave.domain.memory import MemoryRunContext
 from limbowave.infrastructure.pi_adapter import PiKernelAdapter, build_spawn_spec
 from limbowave.infrastructure.tools.ipc_server import IPC_ENV, ToolIpcServer
 from tests.integration.test_pi_adapter import _wait_settled
 from tests.integration.test_pi_adapter import mock_models as mock_models
+from tests.unit.test_memory_service import memory_stack as memory_stack
 
 
 def _context(n, **changes):
@@ -145,3 +147,50 @@ async def test_memory_branch_switch_and_compaction(mock_models, mock_provider, t
     assert "CHILD_ONLY" in last
     assert "GLOBAL_MEMORY_TEST" in last
     assert "BRANCH_MEMORY_TEST" not in last
+
+
+
+async def test_actual_pi_session_global_override_isolation(
+    mock_models, mock_provider, tmp_path, memory_stack,
+):
+    from tests.unit.test_memory_service import _second_conversation
+
+    service, factory = memory_stack
+    _second_conversation(factory)
+    _, log = mock_provider
+    first = service.save("ORIGINAL_GLOBAL_UNIQUE")
+    second = service.save("REMOVED_GLOBAL_UNIQUE")
+    adapter = PiKernelAdapter(
+        build_spawn_spec(provider="mock", model_id="mock-model", cwd=tmp_path)
+    )
+    try:
+        await adapter.start()
+        for n, conversation, branch in ((1, "c", "b"), (2, "c", "b"),
+                                         (3, "second", "second-branch"), (4, "c", "b")):
+            if n == 2:
+                service.save_session_global(first.id, "LOCAL_OVERRIDE_UNIQUE", "c")
+                service.delete_session_global(second.id, "c")
+            elif n == 4:
+                service.restore_session_global(first.id, "c")
+                service.restore_session_global(second.id, "c")
+            context = MemoryRunContext(f"r{n}", conversation, branch, f"msg{n}")
+            await adapter.set_memory_context(service.prompt_context(context, n))
+            await adapter.send_message(f"USER_{n}")
+            await _wait_settled(adapter)
+    finally:
+        await adapter.shutdown()
+    requests = [
+        json.loads(line)["body"] for line in log.read_text(encoding="utf-8").splitlines()
+        if "body" in json.loads(line)
+    ]
+    assert len(requests) == 4
+    for index, body in enumerate(requests):
+        text = json.dumps(body["messages"])
+        if index == 1:
+            assert text.count("LOCAL_OVERRIDE_UNIQUE") == 1
+            assert "ORIGINAL_GLOBAL_UNIQUE" not in text and "REMOVED_GLOBAL_UNIQUE" not in text
+        else:
+            assert "LOCAL_OVERRIDE_UNIQUE" not in text
+            assert text.count("ORIGINAL_GLOBAL_UNIQUE") == 1
+            assert text.count("REMOVED_GLOBAL_UNIQUE") == 1
+    assert service.list() == [first, second]

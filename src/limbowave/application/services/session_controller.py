@@ -142,6 +142,10 @@ class SessionController:
         """新建空内核会话，成功后清空应用定位。运行中拒绝。"""
         return await self._coordinator.new_session()
 
+    async def ensure_session(self) -> bool:
+        """准备发送前的会话设置作用域，不发送消息。"""
+        return await self._coordinator.ensure_session()
+
     # ---------- 分支（Task 3.2） ----------
 
     async def edit_user_message(

@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import shiboken6
-from PySide6.QtCore import QObject, Qt, QTimer, Signal, qVersion
+from PySide6.QtCore import QLockFile, QObject, Qt, QTimer, Signal, qVersion
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import QApplication, QLineEdit, QWidget
 
@@ -59,7 +59,7 @@ from limbowave.infrastructure.database.sqlite_repositories import sqlite_uow_fac
 from limbowave.infrastructure.diagnostics import LogConfig, LogLevel
 from limbowave.infrastructure.diagnostics.runtime import DiagnosticRuntime
 from limbowave.infrastructure.memory_repositories import in_memory_uow_factory
-from limbowave.infrastructure.restart import restart_into_oobe
+from limbowave.infrastructure.restart import restart_application, restart_into_oobe
 from limbowave.infrastructure.tools.ipc_server import IPC_ENV, RATE_LIMIT_IPC_ENV, ToolIpcServer
 from limbowave.ui import markdown_render
 from limbowave.ui.chat_view import HISTORY_PAGE, ChatView, ComposerDraft, HistoryEntry
@@ -77,6 +77,7 @@ from limbowave.ui.session_toolbar import RouteCandidate
 if TYPE_CHECKING:
     from limbowave.application.repositories import UnitOfWorkFactory
     from limbowave.application.services.data_reset_service import DataResetService, ResetScope
+    from limbowave.application.services.restore_service import PreparedRestore
     from limbowave.application.services.tool_gateway import ToolGateway
     from limbowave.domain.permissions import GrantScope, ToolRequest
     from limbowave.ui.data_reset_panel import DataResetPanel
@@ -744,6 +745,7 @@ def _wire(
     key: VaultKey | None,
     *,
     on_reset: Callable[[DataResetService], None] | None = None,
+    on_restore: Callable[[PreparedRestore], bool] | None = None,
     diagnostics_available: bool = False,
     appearance_prepared: bool = False,
 ) -> tuple[
@@ -760,6 +762,7 @@ def _wire(
             key,
             rollback=rollback,
             on_reset=on_reset,
+            on_restore=on_restore,
             diagnostics_available=diagnostics_available,
             appearance_prepared=appearance_prepared,
         )
@@ -774,6 +777,7 @@ def _wire_impl(
     *,
     rollback: ExitStack,
     on_reset: Callable[[DataResetService], None] | None = None,
+    on_restore: Callable[[PreparedRestore], bool] | None = None,
     diagnostics_available: bool = False,
     appearance_prepared: bool = False,
 ) -> tuple[
@@ -804,6 +808,8 @@ def _wire_impl(
     uow_factory = storage if storage is not None else in_memory_uow_factory()
     shutting_down = False
     resetting = False
+    restoring = False
+    prepared_restore: PreparedRestore | None = None
     chat = window.chat
     sidebar = window.sidebar
     # Display navigation must not move the single kernel away from an active run.
@@ -2946,7 +2952,7 @@ def _wire_impl(
             return
 
         service = BackupService(
-            paths.data_root, app_version=__version__, schema_version=CURRENT_VERSION
+            paths.data_root, app_version=__version__, schema_version=CURRENT_VERSION, vault_key=key
         )
         state: dict[str, str] = {}
 
@@ -2995,81 +3001,83 @@ def _wire_impl(
         )
 
     def _restore() -> None:
-        """恢复：选文件 → 输密码 → 悬浮窗确认 → 校验后停在临时目录等重启。"""
+        """Select → validate → confirm → stop writers → reversible switch → restart."""
+        from PySide6.QtWidgets import QFileDialog
+
         from limbowave import __version__
         from limbowave.application.services.backup_service import BackupService
+        from limbowave.application.services.restore_service import RestoreService
         from limbowave.infrastructure.database.migrations import CURRENT_VERSION
 
-        service = BackupService(
-            paths.data_root, app_version=__version__, schema_version=CURRENT_VERSION
+        if restoring or resetting or shutting_down or on_restore is None:
+            return
+        if settings_page is not None and not settings_page.resolve_pending_changes():
+            return
+        if reset_panel is not None and shiboken6.isValid(reset_panel) and not reset_panel._closing:
+            chat.set_status("请先完成或取消数据重置，再恢复备份")
+            return
+        source, _ = QFileDialog.getOpenFileName(
+            window, "选择备份", "", "LimboWave 备份 (*.lwb)"
+        )
+        if not source:
+            return
+        service = RestoreService(
+            paths.data_root,
+            BackupService(paths.data_root, app_version=__version__, schema_version=CURRENT_VERSION),
+            legacy_key=key,
         )
 
-        def _run(password: str, source: Path) -> None:
-            _spawn(_inspect_backup(password, source))
-
-        async def _inspect_backup(password: str, source: Path) -> None:
-            chat.set_status("正在校验备份…")
+        async def _prepare(password: str) -> None:
+            nonlocal restoring, prepared_restore
+            if restoring or resetting or shutting_down:
+                return
+            restoring = True
+            chat.set_status("正在校验备份、检查加密数据并准备恢复…")
             try:
-                inspection = await _maintenance(service.inspect, source, password)
+                # Worker assignment lets shutdown discard staging even if this await is cancelled.
+                def prepare() -> PreparedRestore:
+                    nonlocal prepared_restore
+                    prepared_restore = service.prepare(Path(source), password)
+                    return prepared_restore
+
+                prepared = await _maintenance(prepare)
             except Exception as exc:
-                chat.add_error(f"无法读取备份：{exc}")
+                restoring = False
+                chat.add_error(f"恢复未完成（当前资料库未改动）：{redact_text(str(exc))}")
                 return
 
-            def _do_restore(ok: bool) -> None:
-                _spawn(_restore_backup(ok))
-
-            async def _restore_backup(ok: bool) -> None:
-                if not ok:
+            def _confirm(ok: bool) -> None:
+                nonlocal restoring, prepared_restore
+                if not ok or resetting or shutting_down:
+                    prepared.cancel()
+                    restoring = False
+                    chat.set_status("已取消恢复，当前资料库未改动")
                     return
-                import tempfile
-
-                staging = Path(tempfile.mkdtemp(prefix="limbowave-restore-"))
-                try:
-                    await _maintenance(service.restore_to, source, password, staging)
-                except Exception as exc:
-                    chat.add_error(f"恢复未完成（当前资料库未改动）：{exc}")
-                    return
-                chat.set_status(
-                    f"备份已校验并解到临时目录：{staging}"
-                    + NL
-                    + "切换资料库需要重启应用——请先关闭应用，用该目录内容替换数据目录。"
-                )
+                if on_restore is None or not on_restore(prepared):
+                    prepared.cancel()
+                    restoring = False
+                else:
+                    prepared_restore = None
 
             ask_confirm(
                 window,
-                "确认恢复",
-                inspection.summary()
-                + NL
-                + NL
-                + "恢复会覆盖当前资料库。备份已通过完整性校验，"
-                + "但请确认当前内容不再需要（或已另行备份）。"
-                + NL
-                + NL
-                + "继续恢复？",
-                _do_restore,
-                confirm_text="恢复",
+                "确认恢复并重启",
+                prepared.inspection.summary() + NL + NL
+                + (NL.join(prepared.inspection.notes) + NL if prepared.inspection.notes else "")
+                + "完整性、版本兼容性和加密内容已校验。" + NL
+                + "应用将停止当前任务，自动保留现有资料库，再恢复备份并重启；"
+                + "失败会自动回退，无需手动替换文件夹。" + NL + NL
+                + f"恢复前数据保留位置：{prepared.previous}" + NL
+                + "重启后请使用本次备份密码解锁；系统保护恢复需重新启用。",
+                _confirm,
+                confirm_text="恢复并重启",
                 danger=True,
             )
 
-        def _ask_password_for(source: Path) -> None:
-            ask_prompt(
-                window,
-                "备份密码",
-                "输入该备份的密码：",
-                lambda password: _run(password, source),
-                password=True,
-            )
-
-        def _pick_file() -> None:
-            from PySide6.QtWidgets import QFileDialog
-
-            source, _ = QFileDialog.getOpenFileName(
-                window, "选择备份文件", "", "LimboWave 备份 (*.lwb)"
-            )
-            if source:
-                _ask_password_for(Path(source))
-
-        _pick_file()
+        ask_prompt(
+            window, "备份密码", "请输入该备份的独立密码：",
+            lambda password: _spawn(_prepare(password)), password=True,
+        )
 
     reset_panel: DataResetPanel | None = None
 
@@ -3077,7 +3085,7 @@ def _wire_impl(
         nonlocal reset_panel
         from shiboken6 import isValid
 
-        if key is None or on_reset is None or resetting or shutting_down:
+        if key is None or on_reset is None or resetting or restoring or shutting_down:
             return
         if reset_panel is not None and isValid(reset_panel) and not reset_panel._closing:
             reset_panel.raise_()
@@ -3278,14 +3286,39 @@ def _wire_impl(
         )
         toolbar.set_tool_steps_hidden(chat._tool_steps_hidden)
 
-    def _open_memory() -> None:
+    memory_opening = False
+    memory_panel: FloatingPanel | None = None
+    memory_panel_scope: tuple[str, str] | None = None
+
+    async def _open_memory() -> None:
+        nonlocal memory_opening, memory_panel, memory_panel_scope
         from limbowave.ui.session_memory_panel import MemoryPanel
 
-        conversation_id, branch_id = controller.conversation_id, controller.branch_id
-        if conversation_id is None or branch_id is None:
-            chat.set_status("请先开始一个会话；全局记忆可在设置中管理")
+        if memory_opening or chat.history_loading or shutting_down:
             return
+        conversation_id, branch_id = controller.conversation_id, controller.branch_id
+        if memory_panel is not None:
+            if memory_panel_scope == (conversation_id, branch_id):
+                memory_panel.raise_()
+                return
+            memory_panel.close_panel()
+        if conversation_id is None or branch_id is None:
+            memory_opening = True
+            try:
+                if not await controller.ensure_session():
+                    return
+            finally:
+                memory_opening = False
+            if shutting_down:
+                return
+            conversation_id, branch_id = controller.conversation_id, controller.branch_id
+            if conversation_id is None or branch_id is None:
+                return
+            drafts.pop((None, None), None)
+            _refresh_conversations()
+            _refresh_branches()
         panel = FloatingPanel(window, "会话记忆", width=620)
+        panel.setMinimumHeight(min(560, max(0, window.height() - 28)))
         viewer = MemoryPanel(memories, panel, conversation_id=conversation_id, branch_id=branch_id)
         panel.content_layout.addWidget(viewer, 1)
 
@@ -3297,6 +3330,16 @@ def _wire_impl(
 
         unsubscribe = controller.subscribe(_scope_changed)
         panel.closed.connect(unsubscribe)
+        memory_panel = panel
+        memory_panel_scope = (conversation_id, branch_id)
+
+        def _forget_memory_panel() -> None:
+            nonlocal memory_panel, memory_panel_scope
+            if memory_panel is panel:
+                memory_panel = None
+                memory_panel_scope = None
+
+        panel.closed.connect(_forget_memory_panel)
         panel.popup()
 
     def _open_permissions() -> None:
@@ -3979,7 +4022,7 @@ def _wire_impl(
     # Agent 会话级操作（按会话隔离：模式与工具步骤显隐随会话/分支恢复）
     toolbar.mode_toggle_requested.connect(_toggle_execution_mode)
     toolbar.permissions_requested.connect(_open_permissions)
-    toolbar.memory_requested.connect(_open_memory)
+    toolbar.memory_requested.connect(lambda: _spawn(_open_memory()))
     toolbar.tool_steps_toggle_requested.connect(_on_toggle_tool_steps)
     toolbar.export_requested.connect(_export_branch)
     _refresh_toolbar()
@@ -4243,10 +4286,10 @@ def _wire_impl(
             task.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
         try:
-            if resetting:
+            if resetting or restoring:
                 if controller.busy:
                     await controller.abort()
-                await controller.mark_interrupted("用户重置数据，运行已停止")
+                await controller.mark_interrupted("用户恢复或重置数据，运行已停止")
             await controller.shutdown()
             # 内核退出也可能产生最后一轮事件，必须等其收尾事务结束。
             await controller.wait_idle()
@@ -4263,6 +4306,11 @@ def _wire_impl(
 
                 await drain_background_tasks()
                 await drain_blocking()
+                if prepared_restore is not None:
+                    try:
+                        prepared_restore.cancel()
+                    except OSError:
+                        _LOG.warning("backup.staging_cleanup_failed", exc_info=True)
                 await history_reader.close()
                 await asyncio.to_thread(request_logs.close)
                 if storage is not None:
@@ -4295,6 +4343,7 @@ def _report(context: AppContext, window: MainWindow) -> None:
 
 
 _RESTART_OOBE = 23
+_RESTART_RESTORED = 24
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -4344,10 +4393,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         finally:
             _LOG.info("application.shutdown", extra={"exit_code": exit_code})
 
-    if exit_code == _RESTART_OOBE:
+    if exit_code in {_RESTART_OOBE, _RESTART_RESTORED}:
         # Storage, IPC, event loop and the diagnostics directory lock are now released.
         try:
-            restart_into_oobe(restart_args, frozen=context.frozen)
+            if exit_code == _RESTART_OOBE:
+                restart_into_oobe(restart_args, frozen=context.frozen)
+            else:
+                restart_application(restart_args, frozen=context.frozen)
         except OSError as exc:
             host = QWidget()
             host.setWindowTitle(APP_DISPLAY_NAME)
@@ -4390,6 +4442,34 @@ def _run_gui(
     force_oobe: bool = False,
 ) -> int:
     app = build_application(args)
+    from limbowave.application.services.restore_service import RestoreService
+
+    # Hold across startup recovery, normal work and shutdown to exclude another GUI writer.
+    context.paths.data_root.mkdir(parents=True, exist_ok=True)
+    library_lock = QLockFile(str(context.paths.data_root / ".library.lock"))
+    library_lock.setStaleLockTime(0)
+    if not library_lock.tryLock(0):
+        host = QWidget()
+        host.show()
+        try:
+            _show_startup_alert(host, "资料库正在使用", "无法独占打开资料库，请关闭其他灵波窗口后重试。")
+        finally:
+            host.close()
+        return 1
+    cleanup.callback(library_lock.unlock)
+    try:
+        recovered = RestoreService.recover_pending(context.paths.data_root)
+    except Exception as exc:
+        host = QWidget()
+        host.show()
+        try:
+            _show_startup_alert(
+                host, "恢复回退未完成", redact_text(str(exc)) + NL
+                + "请关闭占用数据文件的程序后重试。为保护数据，本次不会打开资料库。",
+            )
+        finally:
+            host.close()
+        return 1
     oobe_debug_enabled = context.development
     if force_oobe and not oobe_debug_enabled:
         _LOG.warning("application.oobe_debug_denied")
@@ -4429,10 +4509,12 @@ def _run_gui(
     cleanup.callback(window.close)
     restart_requested = False
     reset_request: DataResetService | None = None
+    restore_request: PreparedRestore | None = None
 
     def _request_oobe_restart() -> None:
         nonlocal restart_requested
-        if not oobe_debug_enabled or smoke or restart_requested or reset_request is not None:
+        if (not oobe_debug_enabled or smoke or restart_requested
+                or reset_request is not None or restore_request is not None):
             return
         restart_requested = True
         # Honor a settings page's unsaved-change guard instead of discarding its edits.
@@ -4491,18 +4573,32 @@ def _run_gui(
 
     def _request_reset(service: DataResetService) -> None:
         nonlocal reset_request
-        if reset_request is not None or restart_requested:
+        if reset_request is not None or restart_requested or restore_request is not None:
             return
         reset_request = service
         window.setEnabled(False)
         window.chat.set_status("正在停止后台任务并重置数据，完成后退出…")
         loop.stop()
 
+    def _request_restore(prepared: PreparedRestore) -> bool:
+        nonlocal restore_request
+        if reset_request is not None or restart_requested or restore_request is not None:
+            return False
+        restore_request = prepared
+        window.setEnabled(False)
+        window.chat.set_status("正在停止后台任务，保留当前资料库并恢复，完成后自动重启…")
+        loop.stop()
+        return True
+
+    if recovered:
+        _show_startup_alert(window, "已自动回退", "检测到上次恢复中断，已恢复原资料库。")
+
     controller, _tool_ipc, _warm_settings, finish_startup, shutdown = _wire(
         window,
         context.paths,
         key,
         on_reset=_request_reset,
+        on_restore=_request_restore,
         diagnostics_available=True,
         appearance_prepared=True,
     )
@@ -4551,9 +4647,31 @@ def _run_gui(
                 loop.run_until_complete(shutdown())
             except Exception:
                 _LOG.exception("application.shutdown_failed")
-                if reset_request is None:
+                if reset_request is None and restore_request is None:
                     raise
-                reset_error = "后台任务或数据库未能安全关闭，未执行删除。"
+                reset_error = "后台任务或数据库未能安全关闭，未执行数据替换或删除。"
+
+    if restore_request is not None:
+        error = reset_error
+        if error is None:
+            try:
+                previous = restore_request.execute()
+                _LOG.info("backup.restore_completed", extra={"previous": str(previous)})
+            except Exception as exc:
+                _LOG.exception("backup.restore_failed")
+                error = redact_text(str(exc))
+        if error is not None:
+            restore_request.cancel()
+            window.setEnabled(True)
+            for child in window.findChildren(
+                QWidget, options=Qt.FindChildOption.FindDirectChildrenOnly
+            ):
+                child.setEnabled(False)
+            _show_startup_alert(window, "恢复未完成", error + NL + "应用将退出，请重新打开。")
+            window.close()
+            return 1
+        window.close()
+        return _RESTART_RESTORED
 
     # 已退出运行循环、停止任务并释放连接；不会删完又被旧回调创建一个空库。
     if reset_request is not None:

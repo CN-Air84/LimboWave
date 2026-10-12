@@ -309,3 +309,56 @@ async def test_first_call_lazily_starts_and_reuses_worker(process_stack):
     child = await worker.call("pid", (None, None))
     assert child != os.getpid()
     assert await worker.call("pid", (None, None)) == child
+
+
+
+async def test_empty_memory_session_is_persisted_in_worker_and_first_turn_reuses_it(
+    process_stack, monkeypatch,
+):
+    coord, kernel, factory, _worker, _ = process_stack
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("empty-session persistence ran on caller loop")
+
+    monkeypatch.setattr(coord, "_persist_empty_session", forbidden)
+    assert await coord.ensure_session()
+    conversation_id, branch_id = coord.conversation_id, coord.branch_id
+    with factory() as uow:
+        assert uow.conversations.get(conversation_id).default_logical_model_id == (
+            _resume_context().logical_model_id
+        )
+        assert not uow.messages.list_for_branch(branch_id)
+    assert kernel.sent == []
+    original = coord.memory_service.save("global")
+    coord.memory_service.save_session_global(original.id, "before first send", conversation_id)
+    contexts, events = [], []
+
+    async def remember(context):
+        contexts.append(context)
+
+    monkeypatch.setattr(kernel, "set_memory_context", remember)
+    coord.subscribe(events.append)
+    await _turn(kernel, coord, "first question", "first answer")
+    assert (coord.conversation_id, coord.branch_id) == (conversation_id, branch_id)
+    assert contexts[0]["global"] == ["before first send"]
+    assert any(event.kind == "first_response_completed" for event in events)
+
+
+async def test_pending_empty_session_arbitrates_duplicate_open_send_and_new(process_stack):
+    coord, kernel, _factory, worker, database = process_stack
+    await worker.warm()
+    lock = open_connection(database)
+    lock.execute("BEGIN IMMEDIATE")
+    task = asyncio.create_task(coord.ensure_session())
+    try:
+        await asyncio.sleep(0.1)
+        assert coord.busy and coord.conversation_id is None
+        assert not await coord.ensure_session()
+        assert not await coord.new_session()
+        assert await coord.send("must not race") is None
+        assert kernel.sent == []
+    finally:
+        lock.rollback()
+        lock.close()
+    assert await task
+    assert coord.conversation_id is not None

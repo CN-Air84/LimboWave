@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import builtins
 import json
 from collections.abc import Callable
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import UTC, datetime
 from threading import Lock
 from uuid import uuid4
@@ -17,6 +18,7 @@ from limbowave.domain.memory import (
     MemoryPolicy,
     MemoryRunContext,
     MemorySettings,
+    SessionGlobalMemory,
 )
 from limbowave.domain.permissions import Capability, Decision, PermissionAudit, RiskLevel
 
@@ -43,6 +45,40 @@ def _validate_scope(uow: UnitOfWork, conversation_id: str | None, branch_id: str
         raise ValueError("会话或分支已失效")
 
 
+def _validate_items(items: list[MemoryItem]) -> None:
+    if len(items) > MAX_MEMORIES or sum(len(i.content) for i in items) > MAX_SCOPE_CHARS:
+        raise ValueError("记忆空间已满（最多100条、32000字），请先整理记忆")
+
+
+def _global_overrides(uow: UnitOfWork, conversation_id: str) -> dict[str, str | None]:
+    if uow.conversations.get(conversation_id) is None:
+        raise ValueError("会话不存在")
+    document = uow.memories.get(f"global-overrides:{conversation_id}")
+    overrides: dict[str, str | None] = json.loads(document.payload) if document else {}
+    return overrides
+
+
+def _session_global_items(
+    items: list[MemoryItem], overrides: dict[str, str | None],
+) -> list[SessionGlobalMemory]:
+    result = []
+    for item in items:
+        if item.id not in overrides:
+            result.append(SessionGlobalMemory(item, "inherited"))
+        elif (content := overrides[item.id]) is None:
+            result.append(SessionGlobalMemory(item, "deleted"))
+        else:
+            result.append(SessionGlobalMemory(replace(item, content=content), "modified"))
+    return result
+
+
+def _effective_global(uow: UnitOfWork, conversation_id: str) -> list[MemoryItem]:
+    entries = _session_global_items(
+        _items(uow.memories.get("global")), _global_overrides(uow, conversation_id),
+    )
+    return [entry.memory for entry in entries if entry.state != "deleted"]
+
+
 def _put_items(
     uow: UnitOfWork,
     items: list[MemoryItem],
@@ -51,8 +87,7 @@ def _put_items(
     *,
     document_id: str | None = None,
 ) -> None:
-    if len(items) > MAX_MEMORIES or sum(len(i.content) for i in items) > MAX_SCOPE_CHARS:
-        raise ValueError("记忆空间已满（最多100条、32000字），请先整理记忆")
+    _validate_items(items)
     uow.memories.put(
         MemoryDocument(
             document_id or _key(branch_id),
@@ -102,6 +137,53 @@ class MemoryService:
         with self._uow_factory() as uow:
             _validate_scope(uow, conversation_id, branch_id)
             return _items(uow.memories.get(_key(branch_id)))
+
+    def list_session_global(self, conversation_id: str) -> builtins.list[SessionGlobalMemory]:
+        """列出全局记忆在此会话的状态，包含可恢复的删除项。"""
+        with self._uow_factory() as uow:
+            return _session_global_items(
+                _items(uow.memories.get("global")), _global_overrides(uow, conversation_id),
+            )
+
+    def effective_global(self, conversation_id: str) -> builtins.list[MemoryItem]:
+        with self._uow_factory() as uow:
+            return _effective_global(uow, conversation_id)
+
+    def save_session_global(self, item_id: str, content: str, conversation_id: str) -> None:
+        self._set_session_global(item_id, self.validate_content(content), conversation_id)
+
+    def delete_session_global(self, item_id: str, conversation_id: str) -> None:
+        self._set_session_global(item_id, None, conversation_id)
+
+    def restore_session_global(self, item_id: str, conversation_id: str) -> None:
+        self._set_session_global(item_id, None, conversation_id, restore=True)
+
+    def _set_session_global(
+        self, item_id: str, content: str | None, conversation_id: str, *, restore: bool = False,
+    ) -> None:
+        with self._uow_factory() as uow:
+            overrides = _global_overrides(uow, conversation_id)
+            originals = _items(uow.memories.get("global"))
+            live_ids = {item.id for item in originals}
+            if item_id not in live_ids:
+                raise ValueError("全局记忆不存在，请刷新后重试")
+            # 不保留全局原文已删除的孤立覆盖；它们不能成为新的会话记忆。
+            overrides = {key: value for key, value in overrides.items() if key in live_ids}
+            if restore:
+                overrides.pop(item_id, None)
+            else:
+                overrides[item_id] = content
+            if content is not None:
+                _validate_items([
+                    entry.memory for entry in _session_global_items(originals, overrides)
+                    if entry.state != "deleted"
+                ])
+            uow.memories.put(MemoryDocument(
+                f"global-overrides:{conversation_id}",
+                json.dumps(overrides, ensure_ascii=False),
+                conversation_id,
+            ))
+            uow.commit()
 
     @staticmethod
     def validate_content(content: str) -> str:
@@ -268,12 +350,16 @@ class MemoryService:
 
     def prompt_context(self, context: MemoryRunContext, round_number: int) -> dict[str, object]:
         settings = self.settings()
+        with self._uow_factory() as uow:
+            _validate_scope(uow, context.conversation_id, context.branch_id)
+            global_items = _effective_global(uow, context.conversation_id)
+            session_items = _items(uow.memories.get(_key(context.branch_id)))
         return {
             "run_id": context.run_id,
             "branch_id": context.branch_id,
             "round": round_number,
-            "global": [i.content for i in self.list()],
-            "session": [i.content for i in self.list(context.conversation_id, context.branch_id)],
+            "global": [i.content for i in global_items],
+            "session": [i.content for i in session_items],
             "global_interval": settings.global_interval,
             "session_interval": settings.session_interval,
         }

@@ -34,6 +34,7 @@ from PySide6.QtGui import (
     QResizeEvent,
 )
 from PySide6.QtWidgets import (
+    QApplication,
     QHBoxLayout,
     QMainWindow,
     QSplitter,
@@ -59,6 +60,8 @@ from limbowave.ui.sidebar import Sidebar
 
 _MAX_TRANSITION_PIXELS = 1_400_000
 _FRAME_INTERVAL = 1 / 60
+_SETTINGS_ENTER_MS = 280
+_SETTINGS_EXIT_MS = 210
 _ADVANCED_GAP = 16  # 高级栏与输入框之间的间距（与输入框行的左右边距一致）
 
 
@@ -75,7 +78,7 @@ def _page_snapshot(page: QWidget) -> QPixmap:
 
 
 class _PageTransition(QWidget):
-    """Fade one outgoing snapshot over the already-live incoming page."""
+    """Animate bounded page snapshots without moving or relaying out live controls."""
 
     def __init__(
         self,
@@ -85,6 +88,7 @@ class _PageTransition(QWidget):
         direction: int,
         *,
         scroll_down: bool = False,
+        layered: bool = False,
     ) -> None:
         super().__init__(parent)
         self._outgoing = outgoing
@@ -92,18 +96,35 @@ class _PageTransition(QWidget):
         self._incoming_pixmap = incoming if isinstance(incoming, QPixmap) else None
         self._direction = direction
         self._scroll_down = scroll_down
+        self._layered = layered and not scroll_down
+        self._surface = QColor(theme.BG_APP)
+        if self._layered and self._incoming_widget is not None:
+            self._incoming_pixmap = _page_snapshot(self._incoming_widget)
         self._progress = 0.0
         self._last_update = 0.0
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
+        if self._layered:
+            # Paint above the page without stealing its clicks. On input, the
+            # transition is dismissed so nested tab motion stays visible.
+            self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent)
+            self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+            app = QApplication.instance()
+            if app is not None:
+                app.installEventFilter(self)
+        else:
+            self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+            self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
         self._position_incoming(0.0)
 
     def _get_progress(self) -> float:
         return self._progress
 
     def _set_progress(self, value: float) -> None:
-        self._progress = value
-        self._position_incoming(value)
+        self._progress = max(0.0, min(1.0, value))
+        if self._layered:
+            # Qt already coalesces updates. A second 1/60s gate drops alternate
+            # 16ms animation ticks, making this short transition visibly judder.
+            self.update()
+            return
         now = time.monotonic()
         if value >= 1.0 or now - self._last_update >= _FRAME_INTERVAL:
             self._last_update = now
@@ -115,16 +136,71 @@ class _PageTransition(QWidget):
         incoming = self._incoming_widget
         if incoming is None:
             return
-        # Keep the complex live page stationary. Only the lightweight outgoing
-        # snapshot moves, avoiding relayout and repaint work on every tick.
+        # Keep the complex live page stationary. Only lightweight snapshots move,
+        # avoiding relayout and repaint work on every tick.
         incoming.move(0, 0)
 
     def normalize_incoming(self) -> None:
         if self._incoming_widget is not None:
             self._incoming_widget.move(0, 0)
 
+    @staticmethod
+    def _fade(progress: float) -> float:
+        value = max(0.0, min(1.0, progress))
+        return value * value * (3.0 - 2.0 * value)
+
+    def _paint_layered(self, painter: QPainter) -> None:
+        incoming = self._incoming_pixmap
+        if incoming is None:
+            return
+        progress = self._progress
+        painter.fillRect(self.rect(), self._surface)
+        # Stagger text visibility rather than displaying two full-strength pages
+        # at once. Smoothstep gives both fades a soft start and finish.
+        outgoing_opacity = 1.0 - self._fade(progress / 0.48)
+        incoming_opacity = self._fade((progress - 0.24) / 0.76)
+        outgoing_distance, incoming_distance = (10, 24) if self._direction > 0 else (24, 10)
+        if outgoing_opacity > 0.0:
+            painter.setOpacity(outgoing_opacity)
+            painter.drawPixmap(
+                round(-self._direction * outgoing_distance * progress), 0, self._outgoing
+            )
+        if incoming_opacity > 0.0:
+            painter.setOpacity(incoming_opacity)
+            painter.drawPixmap(
+                round(self._direction * incoming_distance * (1.0 - progress) ** 3),
+                0,
+                incoming,
+            )
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if (
+            self._layered
+            and self._incoming_widget is not None
+            and event.type() in (
+                QEvent.Type.MouseButtonPress,
+                QEvent.Type.KeyPress,
+                QEvent.Type.Wheel,
+            )
+            and isinstance(watched, QWidget)
+            and (
+                watched is self._incoming_widget
+                or self._incoming_widget.isAncestorOf(watched)
+            )
+        ):
+            # This executes before the target widget processes the input.
+            # Uncover the live page so its own switch animation can play.
+            parent = self.parentWidget()
+            window = parent.window() if parent is not None else None
+            if isinstance(window, MainWindow) and window._transition is self:
+                window._stop_transition()
+        return False
+
     def paintEvent(self, event: QPaintEvent) -> None:
         painter = QPainter(self)
+        if self._layered:
+            self._paint_layered(painter)
+            return
         incoming = self._incoming_pixmap
         if incoming is not None:
             painter.setOpacity(self._progress)
@@ -302,11 +378,13 @@ class MainWindow(QMainWindow):
 
     def show_full_page(self, page: QWidget) -> None:
         """让页面占满整个主窗口，暂时替换聊天工作区。"""
-        self._stop_transition()
+        interrupted_frame = self._interrupt_transition()
         self._clear_login_exit()
         outgoing = self._root_stack.currentWidget()
         animate = self.isVisible() and outgoing is not page
-        old_frame = _page_snapshot(outgoing) if animate and outgoing is not None else None
+        old_frame = interrupted_frame if animate else None
+        if old_frame is None and animate and outgoing is not None:
+            old_frame = _page_snapshot(outgoing)
         if self._full_page is not None and self._full_page is not page:
             self._root_stack.removeWidget(self._full_page)
             self._full_page.deleteLater()
@@ -321,7 +399,7 @@ class MainWindow(QMainWindow):
         self, *, scroll_down: bool = False, release_page: bool = True
     ) -> None:
         """返回工作区；登录必须完整播放 Logo 绘制/消失，不使用页面滑动。"""
-        self._stop_transition()
+        old_frame = self._interrupt_transition()
         page = self._full_page
         if isinstance(page, LoginPage):
             if self._login_exit_page is not page:
@@ -334,7 +412,8 @@ class MainWindow(QMainWindow):
             prepare_snapshot = getattr(page, "prepare_exit_snapshot", None)
             if callable(prepare_snapshot):
                 prepare_snapshot()
-        old_frame = _page_snapshot(page) if page is not None and self.isVisible() else None
+        if old_frame is None and page is not None and self.isVisible():
+            old_frame = _page_snapshot(page)
         self._root_stack.setCurrentWidget(self._workspace)
         self._full_page = None
         if page is not None and release_page:
@@ -387,26 +466,39 @@ class MainWindow(QMainWindow):
         direction: int,
         scroll_down: bool = False,
     ) -> None:
+        layered = not scroll_down and not isinstance(incoming, LoginPage)
         overlay = _PageTransition(
             self._root_stack,
             outgoing,
             incoming,
             direction,
             scroll_down=scroll_down,
+            layered=layered,
         )
         overlay.setGeometry(self._root_stack.rect())
         overlay._position_incoming(0.0)
         overlay.show()
         overlay.raise_()
         animation = QPropertyAnimation(overlay, b"progress", self)
-        animation.setDuration(680 if scroll_down else 200)
+        duration = _SETTINGS_ENTER_MS if direction > 0 else _SETTINGS_EXIT_MS
+        animation.setDuration(duration if layered else (680 if scroll_down else 200))
         animation.setStartValue(0.0)
         animation.setEndValue(1.0)
-        animation.setEasingCurve(QEasingCurve.Type.InOutCubic)
+        # Layered painting owns separate fade/movement curves on a linear clock.
+        animation.setEasingCurve(
+            QEasingCurve.Type.Linear if layered else QEasingCurve.Type.InOutCubic
+        )
         self._transition = overlay
         self._transition_animation = animation
         animation.finished.connect(self._stop_transition)
         animation.start()
+
+    def _interrupt_transition(self) -> QPixmap | None:
+        """Continue navigation from the visible composite, never a hidden endpoint."""
+        overlay = self._transition
+        frame = _page_snapshot(overlay) if overlay is not None and overlay._layered else None
+        self._stop_transition()
+        return frame
 
     def _stop_transition(self) -> None:
         if self._transition is not None:
@@ -416,6 +508,9 @@ class MainWindow(QMainWindow):
             self._transition_animation.deleteLater()
             self._transition_animation = None
         if self._transition is not None:
+            app = QApplication.instance()
+            if app is not None:
+                app.removeEventFilter(self._transition)
             self._transition.hide()
             self._transition.deleteLater()
             self._transition = None

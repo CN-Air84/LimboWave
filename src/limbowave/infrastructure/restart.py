@@ -27,3 +27,18 @@ def restart_into_oobe(argv: Sequence[str], *, frozen: bool) -> None:
         close_fds=True,
         creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
     )
+
+
+def restart_application(argv: Sequence[str], *, frozen: bool) -> None:
+    """Normal relaunch for restored data, supported in packaged and source builds."""
+    command = [sys.executable] if frozen else [sys.executable, "-m", "limbowave"]
+    command.extend(argument for argument in argv[1:] if argument not in {"--oobe", "--smoke"})
+    subprocess.Popen(
+        command,
+        env=os.environ.copy(),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+    )
