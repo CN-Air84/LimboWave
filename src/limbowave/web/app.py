@@ -6,6 +6,7 @@ import hmac
 import ipaddress
 import re
 import secrets
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -32,10 +33,13 @@ def create_app(
     config: WebConfig,
     auth: AuthStore | None = None,
     password_gate: PasswordGate | None = None,
+    *,
+    locked: Callable[[], bool] | None = None,
 ) -> FastAPI:
     if not ipaddress.ip_address(config.host).is_loopback and password_gate is None:
         raise ValueError("局域网访问必须配置资料库密码核验")
     auth = auth or AuthStore()
+    is_locked = locked or (lambda: False)
 
     def on_revoke(device_id: str) -> None:
         if password_gate is not None:
@@ -70,6 +74,8 @@ def create_app(
 
     def device(request: Request, *, write: bool = False, unverified: bool = False) -> Device:
         if not app.state.accepting:
+            raise HTTPException(503)
+        if is_locked():
             raise HTTPException(503)
         try:
             d = auth.authenticate(request.cookies.get(COOKIE, ""))
@@ -119,12 +125,14 @@ def create_app(
 
     @app.get("/healthz")
     async def health() -> dict[str, bool]:
-        return {"ok": True}
+        return {"ok": True, "locked": is_locked()}
 
     @app.get("/api/v1/pair/status")
     async def pair_status(request: Request) -> JSONResponse:
         if not app.state.accepting:
             raise HTTPException(503)
+        if is_locked():
+            return JSONResponse({"status": "locked"})
         proof = request.cookies.get(PENDING)
         if proof:
             return paired(auth.status(proof))
@@ -136,6 +144,8 @@ def create_app(
     @app.post("/api/v1/pair")
     async def pair(request: Request, body: PairRequest) -> JSONResponse:
         if not app.state.accepting:
+            raise HTTPException(503)
+        if is_locked():
             raise HTTPException(503)
         csrf = request.cookies.get(BOOTSTRAP, "")
         if not csrf or not hmac.compare_digest(

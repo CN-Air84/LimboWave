@@ -29,6 +29,7 @@ USAGE = """用法：
   python -m limbowave secret set <引用名>      从标准输入读取密钥并加密存入
   python -m limbowave secret list              列出已存的引用名
   python -m limbowave secret delete <引用名>   删除一个引用
+  python -m limbowave server <命令>            管理 headless 服务器
 """
 
 
@@ -210,10 +211,14 @@ def secret_main(argv: list[str]) -> int:
 
 def main() -> int:
     argv = sys.argv[1:]
-    if argv and argv[0] in ("secret", "vault"):
+    if argv and argv[0] in ("secret", "vault", "server"):
         try:
             if argv[0] == "secret":
                 return secret_main(argv[1:])
+            if argv[0] == "server":
+                from limbowave.server.__main__ import main as server_main
+
+                return server_main(argv[1:])
             return vault_main(argv[1:])
         except SystemExit as exc:  # argparse 的 --help / 参数错误
             return int(exc.code or 0)
