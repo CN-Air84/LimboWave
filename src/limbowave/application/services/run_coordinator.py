@@ -285,6 +285,8 @@ class RouteMismatchError(RuntimeError):
 
 def _arbitrated[**CommandArgs, CommandResult: (bool, str | None)](
     method: Callable[Concatenate[RunCoordinator, CommandArgs], Awaitable[CommandResult]],
+    *,
+    bump_revision: bool = True,
 ) -> Callable[Concatenate[RunCoordinator, CommandArgs], Awaitable[CommandResult]]:
     """Reserve state transitions, preserving the controller's typed return contract."""
 
@@ -295,7 +297,7 @@ def _arbitrated[**CommandArgs, CommandResult: (bool, str | None)](
         try:
             with self.command_scope():
                 result = await method(self, *args, **kwargs)
-                if result:
+                if result and bump_revision:
                     self._revision += 1
                 return result
         except CommandBusy:
@@ -303,6 +305,12 @@ def _arbitrated[**CommandArgs, CommandResult: (bool, str | None)](
             return cast(CommandResult, rejected)
 
     return wrapped
+
+
+def _arbitrated_navigation[**CommandArgs, CommandResult: (bool, str | None)](
+    method: Callable[Concatenate[RunCoordinator, CommandArgs], Awaitable[CommandResult]],
+) -> Callable[Concatenate[RunCoordinator, CommandArgs], Awaitable[CommandResult]]:
+    return _arbitrated(method, bump_revision=False)
 
 
 class CommandBusy(RuntimeError):
@@ -492,7 +500,7 @@ class RunCoordinator:
                 self._command_owner = None
 
     @contextlib.contextmanager
-    def runtime_transition(self) -> Iterator[None]:
+    def runtime_transition(self, *, bump_revision: bool = True) -> Iterator[None]:
         """保留内核变更窗口；跨 await 阻止发送、切模型和恢复相互穿插。"""
         if self.busy:
             raise RuntimeError("内核正在处理请求或切换会话，请稍后重试")
@@ -501,7 +509,8 @@ class RunCoordinator:
             yield
         finally:
             self._transitioning = False
-            self._revision += 1
+            if bump_revision:
+                self._revision += 1
 
     @property
     def run_id(self) -> str | None:
@@ -774,7 +783,7 @@ class RunCoordinator:
             snapshot=snapshot,
         )
 
-    @_arbitrated
+    @_arbitrated_navigation
     async def switch_conversation(
         self,
         conversation_id: str,
@@ -786,7 +795,7 @@ class RunCoordinator:
         if self.busy:
             return False
         try:
-            with self.runtime_transition():
+            with self.runtime_transition(bump_revision=False):
                 await self.wait_idle()
                 prepared = await asyncio.to_thread(
                     self._prepare_switch,

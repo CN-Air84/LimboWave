@@ -28,6 +28,7 @@ from limbowave.application.services.attachment_service import AttachmentPayload
 from limbowave.application.services.run_coordinator import RunContext, RunCoordinator
 from limbowave.domain.conversation import MessageRole, MessageStatus
 from limbowave.domain.run import RunStatus
+from limbowave.domain.runtime_state import RuntimeRestoreResult
 from limbowave.domain.tool_step import ToolStatus
 from limbowave.infrastructure.memory_repositories import InMemoryStore, in_memory_uow_factory
 
@@ -361,6 +362,28 @@ async def test_abort_timeout_clears_busy_and_marks_run_interrupted(
     assert not coordinator.busy
     await coordinator.wait_idle()
     assert _only_run(store).status is RunStatus.INTERRUPTED
+
+
+async def test_navigation_does_not_bump_execution_revision(
+    coordinator: RunCoordinator, kernel: FakeKernel
+) -> None:
+    _seed_one_turn(kernel)
+    await coordinator.send("第一轮")
+    kernel.emit("run.settled", {})
+    await coordinator.wait_idle()
+
+    async def restore(snapshot: Any) -> RuntimeRestoreResult:
+        return RuntimeRestoreResult(success=True)
+
+    kernel.capabilities = lambda: KernelCapabilities(  # type: ignore[method-assign]
+        frozenset({KernelCapability.RUNTIME_RESTORE})
+    )
+    kernel.restore_runtime_state = restore  # type: ignore[method-assign]
+    target = coordinator.conversation_id, coordinator.branch_id
+    before = coordinator.revision
+
+    assert await coordinator.switch_conversation(*target)
+    assert coordinator.revision == before
 
 
 # ---------------------------------------------------------------- 门禁 4
