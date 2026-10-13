@@ -4452,7 +4452,9 @@ def _run_gui(
         host = QWidget()
         host.show()
         try:
-            _show_startup_alert(host, "资料库正在使用", "无法独占打开资料库，请关闭其他灵波窗口后重试。")
+            _show_startup_alert(
+                host, "资料库正在使用", "无法独占打开资料库，请关闭其他灵波窗口后重试。"
+            )
         finally:
             host.close()
         return 1

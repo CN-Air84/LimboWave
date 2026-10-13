@@ -25,9 +25,19 @@ from limbowave.domain.providers import EndpointConfig, ProviderProtocol
 from limbowave.infrastructure.configuration.json_config_repository import JsonConfigRepository
 from limbowave.infrastructure.crypto.secret_store import SecretStore
 from limbowave.infrastructure.crypto.vault import VaultKey
+from limbowave.infrastructure.pi_rpc import resolve_pi_argv
+
+
+def _pi_available() -> bool:
+    try:
+        resolve_pi_argv()
+    except RuntimeError:
+        return False
+    return True
+
 
 pytestmark = pytest.mark.skipif(
-    __import__("shutil").which("node") is None,
+    not _pi_available(),
     reason="需要 node 与已安装的 Pi",
 )
 

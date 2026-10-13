@@ -100,11 +100,11 @@ class PersistentAuthStore(AuthStore):
         with closing(open_connection(self._database)) as conn, conn:
             conn.execute(
                 "UPDATE server_devices SET revoked_at = ? WHERE revoked_at IS NULL "
-                "AND (absolute_expires_at <= ? OR touched_at <= ?)",
-                (now, now, now - self.idle_ttl),
+                "AND absolute_expires_at <= ?",
+                (now, now),
             )
         for device_id, device in list(self.devices.items()):
-            if now - device.created >= self.absolute_ttl or now - device.touched >= self.idle_ttl:
+            if now - device.created >= self.absolute_ttl:
                 device.revoked.set()
                 self.devices.pop(device_id, None)
 
@@ -117,7 +117,7 @@ class PersistentAuthStore(AuthStore):
                 "WHERE token_hash = ? AND revoked_at IS NULL",
                 (token_hash,),
             ).fetchone()
-        if row is None or float(row[6]) <= now or now - float(row[5]) >= self.idle_ttl:
+        if row is None or float(row[6]) <= now:
             return None
         return Device(row[0], row[1], row[2], row[3], float(row[4]), float(row[5]))
 
@@ -125,7 +125,7 @@ class PersistentAuthStore(AuthStore):
         if device.revoked.is_set():
             return False
         now = self.clock()
-        if now - device.created >= self.absolute_ttl or now - device.touched >= self.idle_ttl:
+        if now - device.created >= self.absolute_ttl:
             self.revoke(device.id)
             return False
         with closing(open_connection(self._database)) as conn:
@@ -167,8 +167,7 @@ class PersistentAuthStore(AuthStore):
         now = self.clock()
         with closing(open_connection(self._database)) as conn, conn:
             changed = conn.execute(
-                "UPDATE server_devices SET revoked_at = ? "
-                "WHERE id = ? AND revoked_at IS NULL",
+                "UPDATE server_devices SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL",
                 (now, device_id),
             ).rowcount
         device = self.devices.pop(device_id, None)

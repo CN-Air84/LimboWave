@@ -19,6 +19,10 @@ from limbowave.application.services.settings_service import SettingsService
 from limbowave.bootstrap import AppPaths
 from limbowave.composition import build_kernel
 from limbowave.infrastructure.configuration.json_config_repository import JsonConfigRepository
+from limbowave.infrastructure.conversation_process import (
+    ConversationProcess,
+    ConversationProcessConfig,
+)
 from limbowave.infrastructure.crypto.secret_store import SecretStore
 from limbowave.infrastructure.crypto.vault import VaultKey
 from limbowave.infrastructure.database.change_log import ChangeLogStore
@@ -36,6 +40,7 @@ class ServerRuntime:
     paths: AppPaths
     key: VaultKey
     storage: SqliteUnitOfWorkFactory
+    storage_process: ConversationProcess
     controller: SessionController
     facade: RuntimeFacade
     model_catalog: RuntimeModelCatalog | None = None
@@ -50,6 +55,7 @@ class ServerRuntime:
             await self.controller.shutdown()
         finally:
             await self.facade.close()
+            await self.storage_process.close()
             self.storage.close()
 
 
@@ -78,9 +84,9 @@ def _models(paths: AppPaths) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     routing = RoutingService(settings.load())
     for model in routing.list_models():
-        result.append({
-            "id": model.id, "name": model.name, "supports_images": model.supports_images
-        })
+        result.append(
+            {"id": model.id, "name": model.name, "supports_images": model.supports_images}
+        )
     return result
 
 
@@ -96,16 +102,28 @@ def build_server_runtime(
     ``None`` and reuse the existing composition root to construct Pi.
     """
     paths.data_root.mkdir(parents=True, exist_ok=True)
+    tool_policy = ServerToolPolicy()
     storage = SqliteUnitOfWorkFactory(paths.data_root / "limbowave.db", key)
     setup = (
         None
         if kernel is not None
-        else build_kernel(paths, key, extra_env={"LIMBOWAVE_SERVER": "1"})
+        else build_kernel(
+            paths,
+            key,
+            extra_env={"LIMBOWAVE_SERVER": "1"},
+            allowed_tools=("add_session_memory",) if tool_policy.allow_memory_write else (),
+        )
     )
     active_kernel = kernel or (setup.kernel if setup is not None else None)
     setup_state: dict[str, KernelSetup | None] = {"value": setup}
     context = _setup_context(setup_state)
     controller = SessionController(active_kernel, uow_factory=storage, context=context)
+    storage_process = ConversationProcess(
+        ConversationProcessConfig(
+            paths.data_root / "limbowave.db", paths.data_root, key.key_bytes()
+        )
+    )
+    controller.coordinator().storage_worker = storage_process
     memories = MemoryService(
         storage,
         ConfigurationService(JsonConfigRepository(paths.data_root / "config.json")),
@@ -117,6 +135,7 @@ def build_server_runtime(
     )
     credentials = CredentialService(SecretStore(key, paths.data_root / "vault" / "secrets.json"))
     catalog: RuntimeModelCatalog | None = None
+
     def on_selected(selected: KernelSetup) -> None:
         setup_state["value"] = selected
 
@@ -141,8 +160,8 @@ def build_server_runtime(
         broker=broker,
         receipts=PersistentCommandStore(paths.data_root / "limbowave.db", broker.epoch),
         memory_service=memories,
-        sync_store=ChangeLogStore(
-            paths.data_root / "limbowave.db", uow_factory=storage, key=key
-        ),
+        sync_store=ChangeLogStore(paths.data_root / "limbowave.db", uow_factory=storage, key=key),
     )
-    return ServerRuntime(paths, key, storage, controller, facade, catalog)
+    return ServerRuntime(
+        paths, key, storage, storage_process, controller, facade, catalog, tool_policy
+    )

@@ -55,7 +55,9 @@ async def test_locked_server_health_does_not_open_pairing(tmp_path: Path, fake_k
         await server.close()
 
 
-@pytest.mark.skipif(not hasattr(asyncio, "start_unix_server"), reason="Unix control socket requires Linux")
+@pytest.mark.skipif(
+    not hasattr(asyncio, "start_unix_server"), reason="Unix control socket requires Linux"
+)
 @pytest.mark.asyncio
 async def test_unlock_lock_and_control_socket(tmp_path: Path, fake_kernel) -> None:
     paths = _paths(tmp_path)
@@ -90,10 +92,25 @@ async def test_unlock_lock_and_control_socket(tmp_path: Path, fake_kernel) -> No
 
 
 @pytest.mark.asyncio
-async def test_headless_runtime_can_complete_one_streaming_turn(tmp_path: Path, fake_kernel) -> None:
+async def test_server_runtime_uses_process_isolated_storage(tmp_path: Path, fake_kernel) -> None:
     paths = _paths(tmp_path)
     Vault(paths.data_root / "vault.json", params=KdfParams(1, 8192, 1)).create("password")
-    runtime: ServerRuntime = build_server_runtime(paths, Vault(paths.data_root / "vault.json").unlock("password"), kernel=fake_kernel)
+    runtime = build_server_runtime(
+        paths, Vault(paths.data_root / "vault.json").unlock("password"), kernel=fake_kernel
+    )
+    assert runtime.controller.coordinator().storage_worker is runtime.storage_process
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_headless_runtime_can_complete_one_streaming_turn(
+    tmp_path: Path, fake_kernel
+) -> None:
+    paths = _paths(tmp_path)
+    Vault(paths.data_root / "vault.json", params=KdfParams(1, 8192, 1)).create("password")
+    runtime: ServerRuntime = build_server_runtime(
+        paths, Vault(paths.data_root / "vault.json").unlock("password"), kernel=fake_kernel
+    )
     await runtime.start()
     try:
         run_id = await runtime.controller.send("hello from linux")
@@ -106,4 +123,3 @@ async def test_headless_runtime_can_complete_one_streaming_turn(tmp_path: Path, 
         assert state["busy"] is False
     finally:
         await runtime.close()
-

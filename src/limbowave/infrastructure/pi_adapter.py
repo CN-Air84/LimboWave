@@ -72,10 +72,13 @@ def _materialize_restore_file(
         "timestamp": datetime.now(UTC).isoformat(),
         "cwd": cwd,
     }
-    content = "\n".join(
-        [json.dumps(header, ensure_ascii=False)]
-        + [json.dumps(entry, ensure_ascii=False) for entry in entries]
-    ) + "\n"
+    content = (
+        "\n".join(
+            [json.dumps(header, ensure_ascii=False)]
+            + [json.dumps(entry, ensure_ascii=False) for entry in entries]
+        )
+        + "\n"
+    )
     session_dir.mkdir(parents=True, exist_ok=True)
     restore_file = session_dir / f"pi-restore-{uuid4().hex[:8]}.jsonl"
     restore_file.write_text(content, encoding="utf-8")
@@ -149,7 +152,7 @@ class PiKernelAdapter(AgentKernel):
     def __init__(self, spec: SpawnSpec, *, capabilities: KernelCapabilities | None = None) -> None:
         self._capabilities = capabilities or _default_capabilities()
         self._handlers: list[EventHandler] = []
-        self._event_queue: asyncio.Queue[KernelEvent] = asyncio.Queue()
+        self._event_queue: asyncio.Queue[KernelEvent] = asyncio.Queue(maxsize=1024)
         self._ui_handler: Callable[[dict[str, Any]], Any] | None = None
         self._memory_ack: asyncio.Future[None] | None = None
         self._memory_run_id: str | None = None
@@ -332,8 +335,10 @@ class PiKernelAdapter(AgentKernel):
                 {"type": "switch_session", "sessionPath": str(restore_file)},
                 timeout=30,
             )
-            if (response.get("success") is not True
-                    or (response.get("data") or {}).get("cancelled") is not False):
+            if (
+                response.get("success") is not True
+                or (response.get("data") or {}).get("cancelled") is not False
+            ):
                 return RuntimeRestoreResult(
                     success=False,
                     failure_reason=RestoreFailureReason.SESSION_SWITCH_FAILED,
@@ -396,8 +401,12 @@ class PiKernelAdapter(AgentKernel):
             raise RuntimeError("Pi 未确认新建空会话，不能继续发送")
         state = await self.get_state()
         entries = await self.get_entries()
-        if (state.message_count or state.pending_message_count
-                or state.is_streaming or state.is_compacting) or any(
+        if (
+            state.message_count
+            or state.pending_message_count
+            or state.is_streaming
+            or state.is_compacting
+        ) or any(
             entry.get("type") in {"message", "custom_message", "compaction", "branch_summary"}
             for entry in entries
         ):
@@ -625,7 +634,11 @@ class PiKernelAdapter(AgentKernel):
         self._publish(KernelEvent(kind=kind, payload=raw))
 
     def _publish(self, event: KernelEvent) -> None:
-        # 事件进入队列（供异步迭代）与同步回调（供订阅）双通道
+        # 事件进入队列（供异步迭代）与同步回调（供订阅）双通道。
+        # 当前运行时没有异步消费者；丢弃最旧事件而不是无限累积长流式回复。
+        if self._event_queue.full():
+            with contextlib.suppress(asyncio.QueueEmpty):
+                self._event_queue.get_nowait()
         self._event_queue.put_nowait(event)
         for handler in list(self._handlers):
             # 订阅者异常不得拖垮事件泵
@@ -641,20 +654,39 @@ class PiKernelAdapter(AgentKernel):
             status = payload.get("status")
             if isinstance(status, int) and status >= 400:
                 level = logging.WARNING
-            _LOG.log(level, "pi.observation", extra={
-                "observation_kind": kind,
-                **{key: payload[key] for key in (
-                    "status", "run_id", "toolName", "provider", "model", "endpoint_id",
-                ) if isinstance(payload.get(key), (str, int, bool))},
-            })
+            _LOG.log(
+                level,
+                "pi.observation",
+                extra={
+                    "observation_kind": kind,
+                    **{
+                        key: payload[key]
+                        for key in (
+                            "status",
+                            "run_id",
+                            "toolName",
+                            "provider",
+                            "model",
+                            "endpoint_id",
+                        )
+                        if isinstance(payload.get(key), (str, int, bool))
+                    },
+                },
+            )
         if payload.get("kind") == "attachments.ready":
-            if (payload.get("run_id") == self._attachment_run_id
-                    and self._attachment_ack is not None and not self._attachment_ack.done()):
+            if (
+                payload.get("run_id") == self._attachment_run_id
+                and self._attachment_ack is not None
+                and not self._attachment_ack.done()
+            ):
                 self._attachment_ack.set_result(None)
             return
         if payload.get("kind") == "memory.ready":
-            if (payload.get("run_id") == self._memory_run_id
-                    and self._memory_ack is not None and not self._memory_ack.done()):
+            if (
+                payload.get("run_id") == self._memory_run_id
+                and self._memory_ack is not None
+                and not self._memory_ack.done()
+            ):
                 self._memory_ack.set_result(None)
             return
         if self._observation_handler is not None:

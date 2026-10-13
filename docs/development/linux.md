@@ -7,7 +7,7 @@ Install uv and Node first. On Debian/Ubuntu, Qt may require libegl1, libopengl0,
 
 ```bash
 bash scripts/linux.sh bootstrap
-npm install -g --ignore-scripts @earendil-works/pi-coding-agent
+npm install -g --ignore-scripts @earendil-works/pi-coding-agent@0.86.0
 bash scripts/linux.sh run
 QT_QPA_PLATFORM=offscreen bash scripts/linux.sh verify
 bash scripts/linux.sh package --console

@@ -36,18 +36,19 @@ def test_revocation_survives_restart(tmp_path: Path) -> None:
     assert restarted.list_devices() == []
 
 
-def test_idle_and_absolute_expiry_are_persistent(tmp_path: Path) -> None:
+def test_idle_expiry_does_not_revoke_durable_authorization(tmp_path: Path) -> None:
     now = [100.0]
     database = tmp_path / "server.db"
-    auth = PersistentAuthStore(
-        database, clock=lambda: now[0], idle_ttl=5, absolute_ttl=10
-    )
+    auth = PersistentAuthStore(database, clock=lambda: now[0], idle_ttl=5, absolute_ttl=10)
     issued = auth.issue("browser")
     now[0] = 106.0
+    restarted = PersistentAuthStore(database, clock=lambda: now[0], idle_ttl=5, absolute_ttl=10)
+    assert restarted.authenticate(str(issued["token"])).id == issued["device_id"]
+
+    now[0] = 111.0
+    expired = PersistentAuthStore(database, clock=lambda: now[0], idle_ttl=5, absolute_ttl=10)
     with pytest.raises(AuthError):
-        PersistentAuthStore(
-            database, clock=lambda: now[0], idle_ttl=5, absolute_ttl=10
-        ).authenticate(str(issued["token"]))
+        expired.authenticate(str(issued["token"]))
 
 
 def test_invalidate_does_not_revoke_durable_authorization(tmp_path: Path) -> None:
