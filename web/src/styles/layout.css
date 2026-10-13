@@ -575,6 +575,11 @@ body,
   color: var(--muted);
   font-size: 13px;
 }
+.loading button {
+  border: 0;
+  font-size: 12px;
+  padding: 10px 18px;
+}
 @keyframes arrive {
   from {
     opacity: 0.5;

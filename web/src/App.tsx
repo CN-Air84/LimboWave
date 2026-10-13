@@ -83,6 +83,14 @@ export function App({
           <BrandLogo variant="panel" />
           <p>正在建立安全连接…</p>
         </main>
+      ) : state.phase === "locked" ? (
+        <main className="loading">
+          <BrandLogo variant="panel" />
+          <p>服务器已锁定。请在服务器上完成解锁后重试。</p>
+          <button type="button" onClick={() => void controller.initialize()}>
+            重新检查
+          </button>
+        </main>
       ) : state.phase === "pairing" ? (
         <PairingPage
           busy={state.busy}

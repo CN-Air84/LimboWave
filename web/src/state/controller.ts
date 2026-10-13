@@ -20,7 +20,7 @@ import {
 } from "./chat";
 type AuthSession = Extract<Session, { authenticated: true }>;
 export type ViewState = {
-  phase: "loading" | "pairing" | "password" | "ready";
+  phase: "loading" | "pairing" | "password" | "locked" | "ready";
   session: AuthSession | null;
   chat: ChatState;
   conversations: Conversation[];
@@ -147,6 +147,18 @@ export class ChatController {
         }
       }
     } catch (error) {
+      if (
+        error instanceof ApiError &&
+        error.status === 503 &&
+        ["unavailable", "runtime_unavailable"].includes(error.code)
+      ) {
+        this.patch({
+          phase: "locked",
+          connection: "offline",
+          error: "服务器已锁定。请在服务器上完成解锁后重试。",
+        });
+        return;
+      }
       this.patch({ phase: "pairing" });
       this.fail(error);
     }

@@ -32,6 +32,10 @@ Runtime event names are normalized at the adapter: `assistant_delta`, `thinking_
 
 The implemented history endpoint returns an explicit `branch_id` with each conversation, and each message page is ordered oldest → newest; `next_cursor` selects older messages. The adapter prefers the explicit branch ID. History projects persisted `status`, `run_id`, and `tools`. `complete` maps to completed, `partial` maps to aborted (已停止生成), and `failed` remains failed; missing/unknown history status fails DTO validation rather than silently displaying success. Both history and state.stream restore `tools` through a default-empty array of whitelisted metadata. `Tool` is exactly `{tool_id,name,status:"running"|"completed"|"failed"}`; args/result/error (and any other server fields) are stripped. Snapshot tool metadata is authoritative and replaces stale incremental states, including an empty array. Cold reload and stream reconnect no longer depend on previous-page tool memory.
 
+## Locked server state
+
+When the headless server is locked, authenticated API calls return `503 unavailable` without exposing pairing, data, or runtime state. The web client renders a locked state and offers a manual retry; it never treats lock as a pairing failure or automatically retries a command.
+
 ## Mandatory password gate
 
 `password_required` means this paired device still needs verification. Pair cookies only preauthorize; state/models/events/conversations/history/commands return 403 until verified. Both HTTP and HTTPS require password verification. After `{ok:true}`, fetch session again; do not infer verification solely from the POST response. A wrong-password 401 is distinct from lost pairing: refresh session to determine whether the device remains paired.

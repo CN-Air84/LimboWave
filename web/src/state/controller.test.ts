@@ -60,6 +60,18 @@ beforeEach(async () => {
   controller.setDraft("保留草稿");
 });
 afterEach(() => controller.stop());
+
+it("server lock shows a locked state instead of a pairing form", async () => {
+  const lockedApi = new ApiClient();
+  vi.spyOn(lockedApi, "session").mockRejectedValue(
+    new ApiError(503, "unavailable", "服务器已锁定"),
+  );
+  const locked = new ChatController(lockedApi, async () => {});
+  await locked.initialize();
+  expect(locked.getSnapshot().phase).toBe("locked");
+  expect(locked.getSnapshot().connection).toBe("offline");
+  locked.stop();
+});
 it("409 preserves draft and never queues or retries a POST", async () => {
   const command = vi
     .spyOn(api, "command")
