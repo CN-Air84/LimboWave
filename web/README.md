@@ -2,6 +2,8 @@
 
 Root `web/` is the frontend source. Python owns authentication, transport policy and the runtime; this package does not reimplement the agent.
 
+For deployment, see the [Chinese LimboWave On Web handbook](../WEB_DEPLOYMENT.md), covering the Linux HTTPS service and desktop LAN mode.
+
 ## Commands
 
 Node **24+** (or 22.12+) and npm are required.
