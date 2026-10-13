@@ -6,6 +6,7 @@ import hmac
 import ipaddress
 import re
 import secrets
+import threading
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -14,10 +15,11 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import TypeAdapter, ValidationError
+from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException
 
 from limbowave.application.services.command_receipts import RuntimeConflict
-from limbowave.infrastructure.database.change_log import CursorExpired
+from limbowave.infrastructure.database.change_log import CursorExpired, SnapshotTooLarge
 
 from .auth import AuthError, AuthStore, Device
 from .dto import page, project, safe_error
@@ -43,6 +45,7 @@ def create_app(
         raise ValueError("局域网访问必须配置资料库密码核验")
     auth = auth or AuthStore()
     is_locked = locked or (lambda: False)
+    snapshot_lock = threading.Lock()
 
     def on_revoke(device_id: str) -> None:
         if password_gate is not None:
@@ -438,8 +441,24 @@ def create_app(
         store = getattr(facade, "sync_store", None)
         if store is None:
             raise HTTPException(503)
+
+        def build_snapshot() -> JSONResponse:
+            # The worker owns admission until it exits, even if the HTTP task is
+            # cancelled while its thread is still decrypting/encoding.
+            if not snapshot_lock.acquire(blocking=False):
+                return error_response(503, "snapshot_busy")
+            try:
+                response = JSONResponse(store.snapshot())
+                if len(response.body) > store.max_snapshot_bytes:
+                    raise SnapshotTooLarge("snapshot response exceeds export budget")
+                return response
+            finally:
+                snapshot_lock.release()
+
         try:
-            return JSONResponse(store.snapshot())
+            return await run_in_threadpool(build_snapshot)
+        except SnapshotTooLarge:
+            return error_response(413, "snapshot_too_large")
         except RuntimeError:
             raise HTTPException(503) from None
 

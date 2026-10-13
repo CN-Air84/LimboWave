@@ -27,3 +27,17 @@ def test_deployment_guide_documents_manual_unlock_and_backups() -> None:
     assert "locked" in guide
     assert "backup" in guide.lower()
     assert "443" in guide
+
+
+def test_deployment_installs_and_preflights_pinned_kernel_for_service_account():
+    guide = Path("docs/development/server-deployment.md").read_text(encoding="utf-8")
+    unit = Path("deploy/limbowave.service").read_text(encoding="utf-8")
+    assert "@earendil-works/pi-coding-agent@0.86.0" in guide
+    assert "22.19.0" in guide
+    assert "--ignore-scripts" in guide
+    assert "HOME=/var/lib/limbowave" in unit
+    assert "PATH=/opt/limbowave/node/bin:/opt/limbowave/pi/bin:" in unit
+    assert "ExecStartPre=/opt/limbowave/node/bin/node --version" in unit
+    assert "ExecStartPre=/opt/limbowave/pi/bin/pi --version" in unit
+    assert "sudo -u limbowave env -i" in guide
+    assert "real model" in guide

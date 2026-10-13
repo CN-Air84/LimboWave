@@ -119,7 +119,15 @@ def error_response(status: int, code: str) -> JSONResponse:
     return JSONResponse(
         {
             "code": code,
-            "message": code.replace("_", " "),
+            "message": {
+                "body_limit": (
+                    "请求内容过长，超过网页单次请求大小限制。请缩短内容，或改用桌面端发送。"
+                ),
+                "snapshot_too_large": (
+                    "资料库超过全量同步容量限制，本次未导出，也不会推进同步游标。"
+                ),
+                "snapshot_busy": "正在生成同步快照，请稍后重试。",
+            }.get(code, code.replace("_", " ")),
             "request_id": secrets.token_hex(8),
             "retryable": status in (429, 503),
         },

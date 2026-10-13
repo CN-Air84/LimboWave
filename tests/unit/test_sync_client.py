@@ -83,3 +83,23 @@ async def test_sync_client_prefers_snapshot_then_incremental_changes(
     assert calls[-1] == "/api/v1/sync/changes"
     assert cache.state().cursor == 11
     assert cache.changes()[0]["entity_id"] == "m"
+
+
+@pytest.mark.parametrize("status,code", [(413, "snapshot_too_large"), (503, "snapshot_busy")])
+async def test_failed_snapshot_keeps_existing_cache_and_cursor(tmp_path, vault_key, status, code):
+    cache = RemoteCache(tmp_path / "remote.db", vault_key)
+    original = {"conversations": [{"id": "existing"}], "cursor": 12, "revision": 34}
+    cache.save_snapshot(original)
+    cache.save_state(12, 34)
+
+    def handler(request):
+        return httpx.Response(status, json={"code": code})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://limbowave.example.com"
+    ) as transport:
+        with pytest.raises(httpx.HTTPStatusError):
+            await SyncClient(transport, cache).snapshot()
+    assert cache.load_snapshot() == original
+    assert cache.state().cursor == 12
+    assert cache.state().revision == 34

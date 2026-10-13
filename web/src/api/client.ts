@@ -66,6 +66,15 @@ export class ApiClient {
           retryable: z.boolean(),
         })
         .safeParse(await response.json().catch(() => null));
+      // nginx may reject the body before Python and return HTML instead of JSON.
+      if (response.status === 413 && (!data.success || data.data.code === "body_limit"))
+        throw new ApiError(
+          413,
+          "body_limit",
+          "请求内容过长，超过网页单次请求大小限制。请缩短内容，或改用桌面端发送。",
+          data.success ? data.data.request_id : "",
+          false,
+        );
       throw new ApiError(
         response.status,
         data.success ? data.data.code : "http_error",

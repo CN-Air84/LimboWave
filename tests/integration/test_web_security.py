@@ -239,3 +239,36 @@ async def test_invalid_sse_cursor_is_json_400_before_start(backend, cursor):
         assert result.status_code == 400
         assert result.headers["content-type"].startswith("application/json")
         assert app.state.streams == 0
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+async def test_utf8_command_body_limit_is_explained_before_execution(chunked):
+    import json
+    from unittest.mock import AsyncMock
+
+    facade = SimpleNamespace(execute=AsyncMock())
+    config = WebConfig()
+    auth = AuthStore()
+    issued = auth.issue("phone")
+    app = create_app(facade, config, auth)
+    body = json.dumps({"type": "send", "text": "汉" * 22000}, ensure_ascii=False).encode()
+    assert len(body) > config.max_body
+
+    async def chunks():
+        for offset in range(0, len(body), 4096):
+            yield body[offset : offset + 4096]
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url=config.origin
+    ) as client:
+        client.cookies.set("lw_session", issued["token"])
+        response = await client.post(
+            "/api/v1/commands",
+            content=chunks() if chunked else body,
+            headers={"Origin": config.origin, "X-CSRF-Token": issued["csrf_token"]},
+        )
+    assert response.status_code == 413
+    assert response.json()["code"] == "body_limit"
+    assert "过长" in response.json()["message"]
+    assert response.json()["retryable"] is False
+    facade.execute.assert_not_called()

@@ -240,3 +240,24 @@ it("restores stream tools on a cold snapshot and preserves terminal status", () 
     }).messages[0],
   ).toMatchObject({ status: "failed", tools: [] });
 });
+
+
+describe("request body limits", () => {
+  it.each([
+    JSON.stringify({ code: "body_limit", message: "body limit", request_id: "r", retryable: false }),
+    "<html><h1>413 Request Entity Too Large</h1></html>",
+  ])("explains application and proxy 413 responses", async (body) => {
+    const transport = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify(session)))
+      .mockResolvedValueOnce(new Response(body, { status: 413 }));
+    const api = new ApiClient(transport);
+    await api.session();
+    await expect(api.pair({ ticket: "汉".repeat(22000) })).rejects.toMatchObject({
+      status: 413,
+      code: "body_limit",
+      message: expect.stringContaining("过长"),
+      retryable: false,
+    });
+    expect(transport).toHaveBeenCalledTimes(2);
+  });
+});

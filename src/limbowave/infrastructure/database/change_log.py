@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 from contextlib import closing
 from datetime import datetime
 from pathlib import Path
@@ -12,11 +13,15 @@ from limbowave.domain.conversation import AssistantMessageSegment
 from limbowave.domain.tool_step import ToolStep
 from limbowave.infrastructure.crypto.vault import VaultKey
 from limbowave.infrastructure.database.migrations import migrate
-from limbowave.infrastructure.database.sqlite_repositories import open_connection
+from limbowave.infrastructure.database.sqlite_repositories import SqliteUnitOfWork, open_connection
 
 
 class CursorExpired(RuntimeError):
     """The client cursor is older than retained change-log history."""
+
+
+class SnapshotTooLarge(RuntimeError):
+    """A full snapshot exceeds the bounded export budget; no cursor may be saved."""
 
 
 class ChangeLogStore:
@@ -27,7 +32,14 @@ class ChangeLogStore:
         database: Path,
         uow_factory: UnitOfWorkFactory | None = None,
         key: VaultKey | None = None,
+        *,
+        max_snapshot_entities: int = 10_000,
+        max_snapshot_bytes: int = 8 * 1024 * 1024,
     ) -> None:
+        if max_snapshot_entities <= 0 or max_snapshot_bytes <= 0:
+            raise ValueError("snapshot limits must be positive")
+        self.max_snapshot_entities = max_snapshot_entities
+        self.max_snapshot_bytes = max_snapshot_bytes
         self.database = database
         self._uow_factory = uow_factory
         self._key = key
@@ -39,14 +51,14 @@ class ChangeLogStore:
             raise ValueError("invalid cursor")
 
         with closing(open_connection(self.database)) as conn:
+            conn.execute("BEGIN")
+            latest, _ = self._cursor_state(conn)
             bounds = conn.execute(
-                "SELECT COALESCE(MIN(seq), 0), COALESCE(MAX(seq), 0) FROM change_log"
+                "SELECT COALESCE(MIN(seq), 0) FROM change_log"
             ).fetchone()
             assert bounds is not None
-            floor, latest = int(bounds[0]), int(bounds[1])
-            revision_row = conn.execute("SELECT revision FROM sync_state WHERE id = 1").fetchone()
-            revision = int(revision_row[0]) if revision_row else 0
-            if after < floor - 1 or (floor == 0 and after < revision):
+            floor = int(bounds[0])
+            if after < floor - 1 or (floor == 0 and after < latest):
                 raise CursorExpired("cursor expired")
 
             rows = conn.execute(
@@ -91,6 +103,11 @@ class ChangeLogStore:
         runs: list[dict[str, Any]] = []
 
         with self._uow_factory() as uow:
+            if not isinstance(uow, SqliteUnitOfWork):
+                raise RuntimeError("snapshot requires a SQLite read transaction")
+            conn = uow.begin_read()
+            cursor, revision = self._cursor_state(conn)
+            self._check_snapshot_budget(conn)
             for conversation in uow.conversations.list_all():
                 branch_rows = uow.branches.list_for_conversation(conversation.id)
                 conversations.append(
@@ -113,7 +130,6 @@ class ChangeLogStore:
 
             memories = [_memory(document) for document in uow.memories.list_all()]
 
-        cursor, revision = self._cursor_state()
         return {
             "cursor": cursor,
             "revision": revision,
@@ -132,15 +148,33 @@ class ChangeLogStore:
             result = conn.execute("DELETE FROM change_log WHERE seq <= ?", (cursor,))
             return result.rowcount
 
-    def _cursor_state(self) -> tuple[int, int]:
-        with closing(open_connection(self.database)) as conn:
-            row = conn.execute(
-                "SELECT COALESCE(MAX(seq), 0), "
-                "COALESCE((SELECT revision FROM sync_state WHERE id = 1), 0) "
-                "FROM change_log"
-            ).fetchone()
-            assert row is not None
-            return int(row[0]), int(row[1])
+    def _check_snapshot_budget(self, conn: sqlite3.Connection) -> None:
+        # Check persisted byte lengths before allocating/decrypting entity lists.
+        # Table/column identifiers come only from this fixed local schema.
+        entities = size = 0
+        for table in ("conversations", "branches", "messages", "runs", "memory_documents"):
+            columns = conn.execute(f"PRAGMA table_info({table})").fetchall()
+            lengths = " + ".join(
+                f'COALESCE(length(CAST("{column[1]}" AS BLOB)), 0)' for column in columns
+            )
+            for row in conn.execute(
+                f"SELECT {lengths} FROM {table} LIMIT ?",
+                (self.max_snapshot_entities - entities + 1,),
+            ):
+                entities += 1
+                size += int(row[0])
+                if entities > self.max_snapshot_entities or size > self.max_snapshot_bytes:
+                    raise SnapshotTooLarge("snapshot exceeds export budget")
+
+    @staticmethod
+    def _cursor_state(conn: sqlite3.Connection) -> tuple[int, int]:
+        # sqlite_sequence preserves the high-water mark even if every row is pruned.
+        row = conn.execute(
+            "SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'change_log'), 0), "
+            "COALESCE((SELECT revision FROM sync_state WHERE id = 1), 0)"
+        ).fetchone()
+        assert row is not None
+        return int(row[0]), int(row[1])
 
 
 def _iso(value: datetime | None) -> str | None:

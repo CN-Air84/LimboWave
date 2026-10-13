@@ -18,7 +18,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 # 当前 schema 版本。新增迁移时递增。
-CURRENT_VERSION = 16
+CURRENT_VERSION = 17
 
 
 @dataclass(frozen=True, slots=True)
@@ -511,6 +511,26 @@ def _migration_016(conn: sqlite3.Connection) -> None:
         )
 
 
+def _migration_017(conn: sqlite3.Connection) -> None:
+    """Keep authorization out of content sync and bound production log retention."""
+    if not conn.in_transaction:
+        conn.execute("BEGIN")
+    for operation in ("insert", "update", "delete"):
+        conn.execute(f"DROP TRIGGER IF EXISTS sync_server_devices_{operation}")
+    # Do not reset the sequence/revision: already-issued cursors remain monotonic.
+    conn.execute("DELETE FROM change_log WHERE entity_type = 'device'")
+    conn.execute(
+        "DELETE FROM change_log WHERE seq <= "
+        "COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'change_log'), 0) - 50000"
+    )
+    conn.execute("""
+        CREATE TRIGGER sync_change_log_retention AFTER INSERT ON change_log
+        BEGIN
+            DELETE FROM change_log WHERE seq <= NEW.seq - 50000;
+        END
+    """)
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(
         from_version=0,
@@ -560,6 +580,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(from_version=13, description="服务端持久设备授权", apply=_migration_014),
     Migration(from_version=14, description="服务端持久命令回执", apply=_migration_015),
     Migration(from_version=15, description="服务端增量同步变更日志", apply=_migration_016),
+    Migration(from_version=16, description="内容日志隔离设备并限制保留窗口", apply=_migration_017),
 )
 
 

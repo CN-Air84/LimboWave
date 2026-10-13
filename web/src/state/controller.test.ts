@@ -372,3 +372,20 @@ it("revoked pairing after password failure returns to pairing", async () => {
   await controller.verifyPassword("secret");
   expect(controller.getSnapshot().phase).toBe("pairing");
 });
+
+
+it("413 preserves the long draft without retrying or looking up a receipt", async () => {
+  const draft = "汉".repeat(22000);
+  controller.setDraft(draft);
+  const command = vi.spyOn(api, "command").mockRejectedValue(
+    new ApiError(413, "body_limit", "请求内容过长，请缩短内容或改用桌面端发送。"),
+  );
+  const receipt = vi.spyOn(api, "receipt");
+  await controller.send();
+  expect(command).toHaveBeenCalledOnce();
+  expect(receipt).not.toHaveBeenCalled();
+  expect(controller.getSnapshot().drafts[draftKey(target)]).toBe(draft);
+  expect(controller.getSnapshot().pending).toBeNull();
+  expect(controller.getSnapshot().busy).toBe(false);
+  expect(controller.getSnapshot().error).toContain("过长");
+});
