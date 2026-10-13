@@ -17,6 +17,8 @@ All paths are under `/api/v1`, same origin. Internal app types are defined in `s
 | `GET commands/{id}` | `{server_epoch,client_command_id,status,revision,run_id,conversation_id,branch_id,error}`. status pending/accepted/rejected/failed; failed is a definitive rejection in UI |
 | `POST logout` | CSRF + cookie; `{ok:true}` |
 | `GET events` | `Last-Event-ID: epoch:seq`. JSON envelope protocol_version/server_epoch/seq/kind/conversation_id/branch_id/run_id/message_id/payload. Sparse snapshot/resync frames accepted |
+| `GET sync/changes?cursor=…&limit=…` | `{items:[{cursor,entity_type,entity_id,scope,operation,revision,created_at}],cursor,latest_cursor,has_more,resync_required}`; `409 resync_required` means rebuild from the snapshot |
+| `GET sync/snapshot` | `{cursor,revision,conversations,branches,messages,runs,memories,truncated}`; authoritative full-state snapshot for the single-user server |
 
 Runtime event names are normalized at the adapter: `assistant_delta`, `thinking_delta`, `assistant_start`, `assistant_end`, `user`, `tool`, `settled`, `run_failed`, `run_interrupted`, `branched`. Unknown names advance the cursor without rendering untrusted payloads. Malformed data/gaps trigger a fresh authoritative snapshot.
 

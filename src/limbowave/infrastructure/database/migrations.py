@@ -18,7 +18,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 # 当前 schema 版本。新增迁移时递增。
-CURRENT_VERSION = 15
+CURRENT_VERSION = 16
 
 
 @dataclass(frozen=True, slots=True)
@@ -312,8 +312,7 @@ def _migration_006(conn: sqlite3.Connection) -> None:
 def _migration_007(conn: sqlite3.Connection) -> None:
     """输入区权限档位按会话持久化；旧会话安全回落为「仅聊天」。"""
     conn.execute(
-        "ALTER TABLE conversations ADD COLUMN permission_preset "
-        "TEXT NOT NULL DEFAULT 'chat_only'"
+        "ALTER TABLE conversations ADD COLUMN permission_preset TEXT NOT NULL DEFAULT 'chat_only'"
     )
 
 
@@ -402,6 +401,116 @@ def _migration_015(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migration_016(conn: sqlite3.Connection) -> None:
+    """Transaction-local change log for server-authoritative incremental sync."""
+    conn.executescript(
+        """
+        CREATE TABLE sync_state (
+            id       INTEGER PRIMARY KEY CHECK (id = 1),
+            revision INTEGER NOT NULL
+        );
+        INSERT INTO sync_state (id, revision) VALUES (1, 0);
+
+        CREATE TABLE change_log (
+            seq         INTEGER PRIMARY KEY AUTOINCREMENT,
+            entity_type TEXT NOT NULL,
+            entity_id   TEXT NOT NULL,
+            scope       TEXT NOT NULL,
+            operation   TEXT NOT NULL CHECK(operation IN ('upsert', 'delete')),
+            revision    INTEGER NOT NULL,
+            created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX idx_change_log_entity
+            ON change_log(entity_type, entity_id, seq);
+        CREATE INDEX idx_change_log_revision ON change_log(revision, seq);
+        """
+    )
+
+    trigger_specs = (
+        (
+            "conversations",
+            "conversation",
+            "'conversation:' || NEW.id",
+            "'conversation:' || OLD.id",
+        ),
+        (
+            "branches",
+            "branch",
+            "'conversation:' || NEW.conversation_id || ':branch:' || NEW.id",
+            "'conversation:' || OLD.conversation_id || ':branch:' || OLD.id",
+        ),
+        (
+            "messages",
+            "message",
+            "'conversation:' || NEW.conversation_id || ':branch:' || NEW.branch_id "
+            "|| ':message:' || NEW.id",
+            "'conversation:' || OLD.conversation_id || ':branch:' || OLD.branch_id "
+            "|| ':message:' || OLD.id",
+        ),
+        (
+            "runs",
+            "run",
+            "'conversation:' || NEW.conversation_id || ':branch:' || NEW.branch_id "
+            "|| ':run:' || NEW.id",
+            "'conversation:' || OLD.conversation_id || ':branch:' || OLD.branch_id "
+            "|| ':run:' || OLD.id",
+        ),
+        (
+            "memory_documents",
+            "memory",
+            "'conversation:' || COALESCE(NEW.conversation_id, 'global') "
+            "|| ':branch:' || COALESCE(NEW.branch_id, 'global') "
+            "|| ':memory:' || NEW.id",
+            "'conversation:' || COALESCE(OLD.conversation_id, 'global') "
+            "|| ':branch:' || COALESCE(OLD.branch_id, 'global') "
+            "|| ':memory:' || OLD.id",
+        ),
+        (
+            "server_devices",
+            "device",
+            "'device:' || NEW.id",
+            "'device:' || OLD.id",
+        ),
+    )
+    for table, entity, insert_scope, delete_scope in trigger_specs:
+        conn.executescript(
+            f"""
+            CREATE TRIGGER sync_{table}_insert AFTER INSERT ON {table}
+            BEGIN
+                UPDATE sync_state SET revision = revision + 1 WHERE id = 1;
+                INSERT INTO change_log
+                    (entity_type, entity_id, scope, operation, revision)
+                VALUES (
+                    '{entity}', NEW.id, {insert_scope}, 'upsert',
+                    (SELECT revision FROM sync_state WHERE id = 1)
+                );
+            END;
+
+            CREATE TRIGGER sync_{table}_update AFTER UPDATE ON {table}
+            BEGIN
+                UPDATE sync_state SET revision = revision + 1 WHERE id = 1;
+                INSERT INTO change_log
+                    (entity_type, entity_id, scope, operation, revision)
+                VALUES (
+                    '{entity}', NEW.id, {insert_scope}, 'upsert',
+                    (SELECT revision FROM sync_state WHERE id = 1)
+                );
+            END;
+
+            CREATE TRIGGER sync_{table}_delete AFTER DELETE ON {table}
+            BEGIN
+                UPDATE sync_state SET revision = revision + 1 WHERE id = 1;
+                INSERT INTO change_log
+                    (entity_type, entity_id, scope, operation, revision)
+                VALUES (
+                    '{entity}', OLD.id, {delete_scope}, 'delete',
+                    (SELECT revision FROM sync_state WHERE id = 1)
+                );
+            END;
+            """
+        )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(
         from_version=0,
@@ -450,6 +559,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(from_version=12, description="修复旧分支缺失的压缩继承", apply=_migration_013),
     Migration(from_version=13, description="服务端持久设备授权", apply=_migration_014),
     Migration(from_version=14, description="服务端持久命令回执", apply=_migration_015),
+    Migration(from_version=15, description="服务端增量同步变更日志", apply=_migration_016),
 )
 
 

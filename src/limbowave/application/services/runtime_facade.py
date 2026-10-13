@@ -58,6 +58,7 @@ class RuntimeFacade:
         broker: EventBroker | None = None,
         receipts: CommandReceipts | None = None,
         memory_service: MemoryService | None = None,
+        sync_store: Any | None = None,
     ) -> None:
         self.session = session
         self._coordinator = session.coordinator()
@@ -70,6 +71,7 @@ class RuntimeFacade:
         self._models_provider = models_provider or (lambda: [])
         self._select_model = select_model
         self.memory_service = memory_service
+        self.sync_store = sync_store
         self._ready = ready or (lambda: True)
         self._reader = HistoryReader()
         history = HistoryService(uow_factory)

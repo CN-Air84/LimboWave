@@ -21,6 +21,7 @@ from limbowave.composition import build_kernel
 from limbowave.infrastructure.configuration.json_config_repository import JsonConfigRepository
 from limbowave.infrastructure.crypto.secret_store import SecretStore
 from limbowave.infrastructure.crypto.vault import VaultKey
+from limbowave.infrastructure.database.change_log import ChangeLogStore
 from limbowave.infrastructure.database.sqlite_repositories import SqliteUnitOfWorkFactory
 from limbowave.runtime_composition import RuntimeModelCatalog
 
@@ -140,5 +141,8 @@ def build_server_runtime(
         broker=broker,
         receipts=PersistentCommandStore(paths.data_root / "limbowave.db", broker.epoch),
         memory_service=memories,
+        sync_store=ChangeLogStore(
+            paths.data_root / "limbowave.db", uow_factory=storage, key=key
+        ),
     )
     return ServerRuntime(paths, key, storage, controller, facade, catalog)

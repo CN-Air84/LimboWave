@@ -17,6 +17,7 @@ from pydantic import TypeAdapter, ValidationError
 from starlette.exceptions import HTTPException
 
 from limbowave.application.services.command_receipts import RuntimeConflict
+from limbowave.infrastructure.database.change_log import CursorExpired
 
 from .auth import AuthError, AuthStore, Device
 from .dto import page, project, safe_error
@@ -407,6 +408,44 @@ def create_app(
             return JSONResponse({"revision": memory_revision()})
         except ValueError:
             return error_response(404, "memory_not_found")
+
+    @app.get("/api/v1/sync/changes")
+    async def sync_changes(request: Request) -> JSONResponse:
+        device(request)
+        store = getattr(facade, "sync_store", None)
+        if store is None:
+            raise HTTPException(503)
+        try:
+            raw_cursor = request.query_params.get(
+                "cursor", request.query_params.get("after", "0")
+            )
+            cursor = int(raw_cursor)
+            limit = int(request.query_params.get("limit", "100"))
+            return JSONResponse(store.page(cursor, limit=limit))
+        except ValueError:
+            raise HTTPException(400) from None
+        except CursorExpired:
+            return JSONResponse(
+                {
+                    "items": [],
+                    "cursor": 0,
+                    "latest_cursor": 0,
+                    "has_more": False,
+                    "resync_required": True,
+                },
+                status_code=409,
+            )
+
+    @app.get("/api/v1/sync/snapshot")
+    async def sync_snapshot(request: Request) -> JSONResponse:
+        device(request)
+        store = getattr(facade, "sync_store", None)
+        if store is None:
+            raise HTTPException(503)
+        try:
+            return JSONResponse(store.snapshot())
+        except RuntimeError:
+            raise HTTPException(503) from None
 
     @app.post("/api/v1/commands")
     async def commands(request: Request) -> JSONResponse:
