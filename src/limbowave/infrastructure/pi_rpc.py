@@ -370,9 +370,10 @@ def resolve_pi_argv(
 ) -> list[str]:
     """组装启动 Pi 的 argv。
 
-    直接定位 ``node`` + ``cli.js``，**不走 npm 的 ``.cmd`` 垫片**——Windows 的
+    直接定位 ``node`` + CLI 入口（npm 的 ``cli.js`` 或 Pi ≥1.0 自管安装的
+    ``pi-launcher.js``），**不走 npm 的 ``.cmd`` 垫片**——Windows 的
     ``CreateProcess`` 不用 PATHEXT 补全，批处理又要求经命令解释器启动，
-    直接调用 ``node <cli.js>`` 最确定（合同 §八 / tools README）。
+    直接 ``node <入口>`` 最确定（合同 §八 / tools README）。
     """
     node = node or shutil.which("node")
     if node is None:
@@ -387,19 +388,33 @@ def resolve_pi_argv(
 
 
 def _locate_cli(node: str | None = None) -> Path:
-    """从 npm 垫片反推全局 node_modules 中的 cli.js。"""
+    """定位 Pi CLI 入口：npm 垫片反推 cli.js，或 Pi ≥1.0 的自管安装启动器。
+
+    Pi 1.x 起安装自管化：垫片目录带 ``pi-launcher.js``，由它转发到
+    ``install/releases/<版本>/`` 下的真实 cli.js 并注入
+    ``PI_MANAGED_INSTALL_ROOT``——自管安装优先，npm 布局保留为回退。
+    PATH 仍是迁移前旧值时（GUI 继承常驻 Explorer 的环境），按 Pi 的
+    固定约定位置 ``~/.pi/agent/bin`` 兜底。
+    """
     relative = Path("@earendil-works") / "pi-coding-agent" / "dist" / "bundle" / "cli.js"
+    managed: list[Path] = []
     candidates: list[Path] = []
     for shim in ("pi", "pi.cmd", "pi.ps1"):
         found = shutil.which(shim)
         if found:
             shim_path = Path(found)
             resolved = shim_path.resolve()
+            launcher = shim_path.parent / "pi-launcher.js"
+            if launcher.is_file() and launcher not in managed:
+                managed.append(launcher)
             if resolved.name == "cli.js" and "pi-coding-agent" in resolved.parts:
                 candidates.append(resolved)
             for bindir in (shim_path.parent, resolved.parent):
                 candidates.append(bindir / "node_modules" / relative)
                 candidates.append(bindir.parent / "lib" / "node_modules" / relative)
+    home_launcher = Path.home() / ".pi" / "agent" / "bin" / "pi-launcher.js"
+    if home_launcher.is_file() and home_launcher not in managed:
+        managed.append(home_launcher)
 
     # nvm/fnm/asdf: npm global packages belong to the selected Node prefix.
     selected_node = node or shutil.which("node")
@@ -415,11 +430,12 @@ def _locate_cli(node: str | None = None) -> Path:
     candidates.append(Path("/usr/local/lib/node_modules") / relative)
     candidates.append(Path("/usr/lib/node_modules") / relative)
 
-    for candidate in candidates:
+    for candidate in [*managed, *candidates]:
         if candidate.is_file():
             return candidate
-    searched = "\n".join(f"  {p}" for p in candidates)
+    searched = "\n".join(f"  {p}" for p in [*managed, *candidates])
     raise RuntimeError(
-        "未找到 Pi CLI 入口 cli.js。已查找：\n"
-        f"{searched}\n请先执行：npm install -g --ignore-scripts @earendil-works/pi-coding-agent"
+        "未找到 Pi CLI 入口（npm cli.js 或自管安装启动器）。已查找：\n"
+        f"{searched}\n请先安装 Pi（npm install -g --ignore-scripts "
+        "@earendil-works/pi-coding-agent，或 Pi 官方自管安装）"
     )

@@ -87,6 +87,12 @@ async def test_stderr_reader_accepts_frame_larger_than_asyncio_line_limit() -> N
     assert rpc.stderr_text == payload + os.linesep
 
 
+def _isolate_home(monkeypatch, tmp_path) -> None:
+    """隔离 ``~/.pi`` 自管安装兜底：Path.home() 走 USERPROFILE/HOME。"""
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+
 def test_cli_discovery_uses_selected_node_prefix(tmp_path, monkeypatch) -> None:
     prefix = tmp_path / "nvm" / "versions" / "node" / "v24.0.0"
     node = prefix / "bin" / "node"
@@ -96,6 +102,7 @@ def test_cli_discovery_uses_selected_node_prefix(tmp_path, monkeypatch) -> None:
     cli.parent.mkdir(parents=True)
     cli.touch()
     monkeypatch.setattr(pi_rpc.shutil, "which", lambda name: None)
+    _isolate_home(monkeypatch, tmp_path / "home")
     assert pi_rpc._locate_cli(str(node)) == cli
 
 
@@ -108,7 +115,34 @@ def test_cli_discovery_resolves_npm_symlink(tmp_path, monkeypatch) -> None:
     shim.parent.mkdir()
     shim.symlink_to(cli)
     monkeypatch.setattr(pi_rpc.shutil, "which", lambda name: str(shim) if name == "pi" else None)
+    _isolate_home(monkeypatch, tmp_path / "home")
     assert pi_rpc._locate_cli() == cli
+
+
+def test_cli_discovery_prefers_managed_launcher(tmp_path, monkeypatch) -> None:
+    """Pi ≥1.0 自管安装：垫片目录带 pi-launcher.js，优先于 npm 布局。"""
+    launcher = tmp_path / "agent-bin" / "pi-launcher.js"
+    launcher.parent.mkdir(parents=True)
+    launcher.touch()
+    cli = tmp_path / "npm/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js"
+    cli.parent.mkdir(parents=True)
+    cli.touch()
+    monkeypatch.setattr(
+        pi_rpc.shutil, "which", lambda name: str(tmp_path / "agent-bin" / "pi.cmd") if name == "pi.cmd" else None
+    )
+    _isolate_home(monkeypatch, tmp_path / "home")
+    assert pi_rpc._locate_cli() == launcher
+
+
+def test_cli_discovery_falls_back_to_home_managed_install(tmp_path, monkeypatch) -> None:
+    """PATH 还是迁移前旧值时，按 Pi 约定位置 ~/.pi/agent/bin 兜底。"""
+    home = tmp_path / "home"
+    launcher = home / ".pi" / "agent" / "bin" / "pi-launcher.js"
+    launcher.parent.mkdir(parents=True)
+    launcher.touch()
+    monkeypatch.setattr(pi_rpc.shutil, "which", lambda name: None)
+    _isolate_home(monkeypatch, home)
+    assert pi_rpc._locate_cli() == launcher
 
 
 @pytest.mark.asyncio

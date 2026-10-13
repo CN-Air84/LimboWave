@@ -125,14 +125,15 @@ async def test_transport_snapshot_matches_mock_received_request(
     received = _read_jsonl(mock_log)
     assert received, "mock 应收到真实请求"
     actual_body = received[0]["body"]
-    actual_headers = received[0]["headers"]
+    # HTTP 头名不分大小写：Pi ≥1.1 的 OpenAI SDK 恒为小写。
+    actual_headers = {k.lower(): v for k, v in received[0]["headers"].items()}
 
     # 传输快照的请求体与 mock 实收一致（关键字段逐条对）
     for key in ("model", "stream", "max_completion_tokens"):
         assert transport.body.get(key) == actual_body.get(key), f"字段 {key} 不一致"
 
     # 密钥确实送达，但快照里只有脱敏视图
-    assert SECRET in actual_headers.get("Authorization", "")
+    assert SECRET in actual_headers.get("authorization", "")
     assert transport.headers["Authorization"] == {
         "present": True,
         "scheme": "Bearer",
