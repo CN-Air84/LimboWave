@@ -48,8 +48,15 @@ async def test_idle_expiry_closes_waiting_stream():
     facade, auth, d = setup_stream(idle_ttl=0.04)
     stream = event_stream(facade, auth, d, None, 65536)
     await anext(stream)
+
+    # 满载时 keepalive 帧可能先于空闲关闭到达：排空到流真正结束，
+    # 而不是要求下一次 anext 立刻抛 StopAsyncIteration。
+    async def drain() -> None:
+        while True:
+            await anext(stream)
+
     with pytest.raises(StopAsyncIteration):
-        await asyncio.wait_for(anext(stream), 0.3)
+        await asyncio.wait_for(drain(), 1.0)
     assert d.revoked.is_set()
 
 

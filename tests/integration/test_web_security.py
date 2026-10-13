@@ -105,7 +105,9 @@ async def test_concurrency_rate_chunked_body_and_revocation_during_read():
 
     entered, release = asyncio.Event(), asyncio.Event()
 
-    async def state():
+    # /api/v1/state 以设备 ID 调 facade.state(device_id)（按设备隔离导航状态）。
+    # wait_for 兜底：路由签名再漂移时快速失败，而不是永远等不到 entered。
+    async def state(device_id=None):
         entered.set()
         await release.wait()
         return {"available": True, "stream": {"text": "PRIVATE"}}
@@ -119,7 +121,7 @@ async def test_concurrency_rate_chunked_body_and_revocation_during_read():
     ) as c:
         c.cookies.set("lw_session", issued["token"])
         waiting = asyncio.create_task(c.get("/api/v1/state"))
-        await entered.wait()
+        await asyncio.wait_for(entered.wait(), timeout=10)
         assert (await c.get("/healthz")).status_code == 429
         auth.revoke(issued["device_id"])
         release.set()
