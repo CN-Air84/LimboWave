@@ -1,0 +1,22 @@
+[Unit]
+Description=LimboWave On Server (locked until manual unlock)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=limbowave
+Group=limbowave
+WorkingDirectory=/var/lib/limbowave
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/limbowave/bin/limbowave server run --data-dir /var/lib/limbowave
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/limbowave
+
+[Install]
+WantedBy=multi-user.target
