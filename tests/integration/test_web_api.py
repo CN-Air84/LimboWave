@@ -13,7 +13,7 @@ class FakeFacade:
     def __init__(self):
         self.executed = []
 
-    async def state(self):
+    async def state(self, device_id=None):
         return {
             "server_epoch": self.epoch,
             "seq": 0,

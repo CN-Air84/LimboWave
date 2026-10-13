@@ -9,7 +9,7 @@ All paths are under `/api/v1`, same origin. Internal app types are defined in `s
 | `GET session` | `{server_epoch, device_id, csrf_token, password_required:bool, transport_secure:bool, permissions:{chat,tools}}`; 401 → pairing bootstrap |
 | `GET password/challenge` | Paired devices only: `{challenge_id,public_key:PEM RSA,expires_in:120}`; one use per challenge |
 | `POST password/verify` | CSRF required; `{challenge_id,encrypted_key,iv,ciphertext}` (standard Base64 except UTF-8 challenge ID), success `{ok:true}`; password failure 401, five failures revoke pairing |
-| `GET state` | `{server_epoch, revision, seq, available, busy, conversation_id, branch_id, run_id, stream}`. `stream` is nullable, otherwise `{conversation_id,branch_id,run_id,message_id,text,thinking,status,tools?:Tool[],segments?:[{content,thinking}]}` |
+| `GET state` | `{server_epoch, revision, seq, available, busy, conversation_id, branch_id, run_id, stream}`. `conversation_id`/`branch_id` are **device-scoped navigation state**; one device switching conversations does not change another device’s target. `stream` is nullable, otherwise `{conversation_id,branch_id,run_id,message_id,text,thinking,status,tools?:Tool[],segments?:[{content,thinking}]}` |
 | `GET models` | `[{id,name}]` (not a page wrapper) |
 | `GET conversations?limit=50&cursor=…` | `{items:[{id,title,created_at,branches:[{id,title}]}],next_cursor}`; also accepts explicit `conversation_id/branch_id/updated_at/revision` |
 | `GET conversations/{id}/messages?branch_id=…&limit=50&cursor=…` | `{items:[{id,role,content,thinking,status,run_id,tools?:Tool[],created_at,branch_id}],next_cursor}`; IDs scoped by requested conversation, branch-ancestor rows retained |

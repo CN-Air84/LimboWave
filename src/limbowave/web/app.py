@@ -208,8 +208,8 @@ def create_app(
 
     @app.get("/api/v1/state")
     async def state(request: Request) -> dict[str, Any]:
-        device(request)
-        value = await facade.state()
+        d = device(request)
+        value = await facade.state(d.id)
         if not value.get("available", True):
             auth.invalidate()
             raise HTTPException(503)
@@ -313,9 +313,7 @@ def create_app(
                     )
                 )
             elif (
-                body.conversation_id is None
-                and body.branch_id is None
-                and body.content is not None
+                body.conversation_id is None and body.branch_id is None and body.content is not None
             ):
                 result = memory_item(service.save(body.content))
             elif body.conversation_id and body.branch_id and body.content is not None:
@@ -416,9 +414,7 @@ def create_app(
         if store is None:
             raise HTTPException(503)
         try:
-            raw_cursor = request.query_params.get(
-                "cursor", request.query_params.get("after", "0")
-            )
+            raw_cursor = request.query_params.get("cursor", request.query_params.get("after", "0"))
             cursor = int(raw_cursor)
             limit = int(request.query_params.get("limit", "100"))
             return JSONResponse(store.page(cursor, limit=limit))

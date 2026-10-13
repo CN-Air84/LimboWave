@@ -83,6 +83,30 @@ async def test_revision_target_and_untrusted_fields_are_rejected(runtime):
         await facade.execute("device", {**stale, "server_epoch": "old"})
 
 
+async def test_device_state_does_not_share_navigation_target(runtime):
+    facade, _session, _kernel, _store = runtime
+    first = await facade.execute("a", cmd(facade, "new_session", "draft-a"))
+    second = await facade.execute("b", cmd(facade, "new_session", "draft-b"))
+    assert first["status"] == second["status"] == "accepted"
+
+    assert (await facade.state("a"))["conversation_id"] == first["conversation_id"]
+    assert (await facade.state("b"))["conversation_id"] == second["conversation_id"]
+
+    sent = await facade.execute(
+        "a",
+        cmd(
+            facade,
+            "send",
+            "send-a",
+            text="hello",
+            conversation_id=first["conversation_id"],
+            branch_id=first["branch_id"],
+        ),
+    )
+    assert sent["status"] == "accepted"
+    assert (await facade.state("b"))["conversation_id"] == second["conversation_id"]
+
+
 async def test_disconnected_request_keeps_pending_task_and_run(runtime):
     facade, session, kernel, _store = runtime
     target = await draft(facade)

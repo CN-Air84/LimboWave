@@ -72,6 +72,7 @@ class RuntimeFacade:
         self._select_model = select_model
         self.memory_service = memory_service
         self.sync_store = sync_store
+        self._device_targets: dict[str, tuple[str, str]] = {}
         self._ready = ready or (lambda: True)
         self._reader = HistoryReader()
         history = HistoryService(uow_factory)
@@ -89,8 +90,13 @@ class RuntimeFacade:
         """Record an authenticated durable mutation outside the run coordinator."""
         self._coordinator.bump_revision()
 
-    async def state(self) -> dict[str, Any]:
+    async def state(self, device_id: str | None = None) -> dict[str, Any]:
         # No await between snapshot and cursor: replay bridges state -> subscribe.
+        target = (
+            self._device_targets.get(device_id)
+            if device_id is not None
+            else (self.session.conversation_id, self.session.branch_id)
+        ) or (self.session.conversation_id, self.session.branch_id)
         return {
             "server_epoch": self.epoch,
             "revision": self.revision,
@@ -99,8 +105,8 @@ class RuntimeFacade:
             and self.session.available
             and self._ready(),
             "busy": self.session.busy,
-            "conversation_id": self.session.conversation_id,
-            "branch_id": self.session.branch_id,
+            "conversation_id": target[0],
+            "branch_id": target[1],
             "run_id": self.session.run_id,
             "seq": self.events.seq,
             "stream": (
@@ -197,6 +203,8 @@ class RuntimeFacade:
         except Exception:
             # Never transport exception text, credentials or local paths.
             status, error = "failed", {"code": "command_failed", "status": 500}
+        if status == "accepted" and target[0] is not None and target[1] is not None:
+            self._device_targets[device] = (target[0], target[1])
         result = receipts.finish(
             device,
             command["client_command_id"],
@@ -341,6 +349,7 @@ class RuntimeFacade:
 
     def revoke_device(self, device_id: str) -> None:
         """Only after authentication revocation; receipt retention ends here."""
+        self._device_targets.pop(device_id, None)
         self._receipts.revoke(device_id)
 
     async def close(self) -> None:
