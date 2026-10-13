@@ -388,7 +388,7 @@ def refresh_inline_styles(
 
     def remap_rgba(match: re.Match[str]) -> str:
         # rgba(R, G, B, A) 的底色若是旧调色板令牌，换成新令牌、浓度不动
-        key = "#{:02x}{:02x}{:02x}".format(int(match[1]), int(match[2]), int(match[3]))
+        key = f"#{int(match[1]):02x}{int(match[2]):02x}{int(match[3]):02x}"
         replacement = colors.get(key)
         if replacement is None:
             return match.group()

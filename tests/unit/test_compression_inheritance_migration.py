@@ -8,7 +8,7 @@ import pytest
 
 from limbowave.domain.compaction import CompressionStatus, CompressionVersion
 from limbowave.domain.conversation import Branch
-from limbowave.infrastructure.database.migrations import migrate
+from limbowave.infrastructure.database.migrations import CURRENT_VERSION, migrate
 from limbowave.infrastructure.database.sqlite_repositories import SqliteUnitOfWork
 from tests.unit.test_compression_service import T0, _seed
 
@@ -68,7 +68,7 @@ def test_upgrade_repairs_missing_copies_preserving_ciphertext_and_originals(lega
     conn, factory = legacy
     originals = conn.execute("SELECT * FROM compression_versions").fetchall()
     messages = conn.execute("SELECT * FROM messages").fetchall()
-    assert migrate(conn) == 13
+    assert migrate(conn) == CURRENT_VERSION
     with factory() as uow:
         parent = uow.compressions.get_active("b1")
         child = uow.compressions.get_active("child")

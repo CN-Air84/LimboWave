@@ -18,7 +18,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 # 当前 schema 版本。新增迁移时递增。
-CURRENT_VERSION = 13
+CURRENT_VERSION = 17
 
 
 @dataclass(frozen=True, slots=True)
@@ -312,8 +312,7 @@ def _migration_006(conn: sqlite3.Connection) -> None:
 def _migration_007(conn: sqlite3.Connection) -> None:
     """输入区权限档位按会话持久化；旧会话安全回落为「仅聊天」。"""
     conn.execute(
-        "ALTER TABLE conversations ADD COLUMN permission_preset "
-        "TEXT NOT NULL DEFAULT 'chat_only'"
+        "ALTER TABLE conversations ADD COLUMN permission_preset TEXT NOT NULL DEFAULT 'chat_only'"
     )
 
 
@@ -355,6 +354,181 @@ def _migration_013(conn: sqlite3.Connection) -> None:
     )
 
     repair_missing_branch_compressions(conn)
+
+
+def _migration_014(conn: sqlite3.Connection) -> None:
+    """Persist server device authorization without storing bearer tokens."""
+    conn.executescript(
+        """
+        CREATE TABLE server_devices (
+            id                  TEXT PRIMARY KEY,
+            name                TEXT NOT NULL,
+            token_hash          TEXT NOT NULL UNIQUE,
+            csrf_hash           TEXT NOT NULL,
+            created_at          REAL NOT NULL,
+            touched_at          REAL NOT NULL,
+            absolute_expires_at REAL NOT NULL,
+            revoked_at          REAL
+        );
+        CREATE INDEX idx_server_devices_active
+            ON server_devices(revoked_at, absolute_expires_at);
+        """
+    )
+
+
+def _migration_015(conn: sqlite3.Connection) -> None:
+    """Persist idempotency receipts independently from the SSE replay buffer."""
+    conn.executescript(
+        """
+        CREATE TABLE server_commands (
+            device_id       TEXT NOT NULL,
+            operation_id    TEXT NOT NULL,
+            server_epoch    TEXT NOT NULL,
+            fingerprint     TEXT NOT NULL,
+            status          TEXT NOT NULL,
+            revision        INTEGER,
+            run_id          TEXT,
+            conversation_id TEXT,
+            branch_id       TEXT,
+            error_code      TEXT,
+            error_status    INTEGER,
+            created_at      REAL NOT NULL,
+            updated_at      REAL NOT NULL,
+            PRIMARY KEY (device_id, operation_id)
+        );
+        CREATE INDEX idx_server_commands_status ON server_commands(status, updated_at);
+        """
+    )
+
+
+def _migration_016(conn: sqlite3.Connection) -> None:
+    """Transaction-local change log for server-authoritative incremental sync."""
+    conn.executescript(
+        """
+        CREATE TABLE sync_state (
+            id       INTEGER PRIMARY KEY CHECK (id = 1),
+            revision INTEGER NOT NULL
+        );
+        INSERT INTO sync_state (id, revision) VALUES (1, 0);
+
+        CREATE TABLE change_log (
+            seq         INTEGER PRIMARY KEY AUTOINCREMENT,
+            entity_type TEXT NOT NULL,
+            entity_id   TEXT NOT NULL,
+            scope       TEXT NOT NULL,
+            operation   TEXT NOT NULL CHECK(operation IN ('upsert', 'delete')),
+            revision    INTEGER NOT NULL,
+            created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX idx_change_log_entity
+            ON change_log(entity_type, entity_id, seq);
+        CREATE INDEX idx_change_log_revision ON change_log(revision, seq);
+        """
+    )
+
+    trigger_specs = (
+        (
+            "conversations",
+            "conversation",
+            "'conversation:' || NEW.id",
+            "'conversation:' || OLD.id",
+        ),
+        (
+            "branches",
+            "branch",
+            "'conversation:' || NEW.conversation_id || ':branch:' || NEW.id",
+            "'conversation:' || OLD.conversation_id || ':branch:' || OLD.id",
+        ),
+        (
+            "messages",
+            "message",
+            "'conversation:' || NEW.conversation_id || ':branch:' || NEW.branch_id "
+            "|| ':message:' || NEW.id",
+            "'conversation:' || OLD.conversation_id || ':branch:' || OLD.branch_id "
+            "|| ':message:' || OLD.id",
+        ),
+        (
+            "runs",
+            "run",
+            "'conversation:' || NEW.conversation_id || ':branch:' || NEW.branch_id "
+            "|| ':run:' || NEW.id",
+            "'conversation:' || OLD.conversation_id || ':branch:' || OLD.branch_id "
+            "|| ':run:' || OLD.id",
+        ),
+        (
+            "memory_documents",
+            "memory",
+            "'conversation:' || COALESCE(NEW.conversation_id, 'global') "
+            "|| ':branch:' || COALESCE(NEW.branch_id, 'global') "
+            "|| ':memory:' || NEW.id",
+            "'conversation:' || COALESCE(OLD.conversation_id, 'global') "
+            "|| ':branch:' || COALESCE(OLD.branch_id, 'global') "
+            "|| ':memory:' || OLD.id",
+        ),
+        (
+            "server_devices",
+            "device",
+            "'device:' || NEW.id",
+            "'device:' || OLD.id",
+        ),
+    )
+    for table, entity, insert_scope, delete_scope in trigger_specs:
+        conn.executescript(
+            f"""
+            CREATE TRIGGER sync_{table}_insert AFTER INSERT ON {table}
+            BEGIN
+                UPDATE sync_state SET revision = revision + 1 WHERE id = 1;
+                INSERT INTO change_log
+                    (entity_type, entity_id, scope, operation, revision)
+                VALUES (
+                    '{entity}', NEW.id, {insert_scope}, 'upsert',
+                    (SELECT revision FROM sync_state WHERE id = 1)
+                );
+            END;
+
+            CREATE TRIGGER sync_{table}_update AFTER UPDATE ON {table}
+            BEGIN
+                UPDATE sync_state SET revision = revision + 1 WHERE id = 1;
+                INSERT INTO change_log
+                    (entity_type, entity_id, scope, operation, revision)
+                VALUES (
+                    '{entity}', NEW.id, {insert_scope}, 'upsert',
+                    (SELECT revision FROM sync_state WHERE id = 1)
+                );
+            END;
+
+            CREATE TRIGGER sync_{table}_delete AFTER DELETE ON {table}
+            BEGIN
+                UPDATE sync_state SET revision = revision + 1 WHERE id = 1;
+                INSERT INTO change_log
+                    (entity_type, entity_id, scope, operation, revision)
+                VALUES (
+                    '{entity}', OLD.id, {delete_scope}, 'delete',
+                    (SELECT revision FROM sync_state WHERE id = 1)
+                );
+            END;
+            """
+        )
+
+
+def _migration_017(conn: sqlite3.Connection) -> None:
+    """Keep authorization out of content sync and bound production log retention."""
+    if not conn.in_transaction:
+        conn.execute("BEGIN")
+    for operation in ("insert", "update", "delete"):
+        conn.execute(f"DROP TRIGGER IF EXISTS sync_server_devices_{operation}")
+    # Do not reset the sequence/revision: already-issued cursors remain monotonic.
+    conn.execute("DELETE FROM change_log WHERE entity_type = 'device'")
+    conn.execute(
+        "DELETE FROM change_log WHERE seq <= "
+        "COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'change_log'), 0) - 50000"
+    )
+    conn.execute("""
+        CREATE TRIGGER sync_change_log_retention AFTER INSERT ON change_log
+        BEGIN
+            DELETE FROM change_log WHERE seq <= NEW.seq - 50000;
+        END
+    """)
 
 
 MIGRATIONS: tuple[Migration, ...] = (
@@ -403,6 +577,10 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(from_version=10, description="Fork 保留起点消息", apply=_migration_011),
     Migration(from_version=11, description="助手分段与工具步骤顺序", apply=_migration_012),
     Migration(from_version=12, description="修复旧分支缺失的压缩继承", apply=_migration_013),
+    Migration(from_version=13, description="服务端持久设备授权", apply=_migration_014),
+    Migration(from_version=14, description="服务端持久命令回执", apply=_migration_015),
+    Migration(from_version=15, description="服务端增量同步变更日志", apply=_migration_016),
+    Migration(from_version=16, description="内容日志隔离设备并限制保留窗口", apply=_migration_017),
 )
 
 

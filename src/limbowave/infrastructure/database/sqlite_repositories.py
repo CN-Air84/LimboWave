@@ -145,6 +145,16 @@ class SqliteUnitOfWork:
                 self._on_close(self)
                 self._on_close = None
 
+    def begin_read(self) -> sqlite3.Connection:
+        """Pin subsequent metadata and repository reads to one SQLite snapshot.
+
+        Python's DEFERRED isolation does not issue BEGIN for SELECT statements.
+        The owning unit of work rolls back/closes this transaction on exit.
+        """
+        if not self._conn.in_transaction:
+            self._conn.execute("BEGIN")
+        return self._conn
+
     def __enter__(self) -> SqliteUnitOfWork:
         return self
 

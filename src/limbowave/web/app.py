@@ -6,6 +6,8 @@ import hmac
 import ipaddress
 import re
 import secrets
+import threading
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -13,12 +15,16 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import TypeAdapter, ValidationError
+from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException
+
+from limbowave.application.services.command_receipts import RuntimeConflict
+from limbowave.infrastructure.database.change_log import CursorExpired, SnapshotTooLarge
 
 from .auth import AuthError, AuthStore, Device
 from .dto import page, project, safe_error
 from .password_gate import PasswordError, PasswordGate
-from .schemas import Command, PairRequest, PasswordEnvelope
+from .schemas import Command, MemoryMutation, PairRequest, PasswordEnvelope, SessionMemoryMutation
 from .security import SecurityMiddleware, WebConfig, error_response
 from .stream import RevocableEventResponse, event_stream
 
@@ -32,10 +38,14 @@ def create_app(
     config: WebConfig,
     auth: AuthStore | None = None,
     password_gate: PasswordGate | None = None,
+    *,
+    locked: Callable[[], bool] | None = None,
 ) -> FastAPI:
     if not ipaddress.ip_address(config.host).is_loopback and password_gate is None:
         raise ValueError("局域网访问必须配置资料库密码核验")
     auth = auth or AuthStore()
+    is_locked = locked or (lambda: False)
+    snapshot_lock = threading.Lock()
 
     def on_revoke(device_id: str) -> None:
         if password_gate is not None:
@@ -53,7 +63,13 @@ def create_app(
 
     def cookie(response: JSONResponse, name: str, value: str, age: int) -> None:
         response.set_cookie(
-            name, value, max_age=age, httponly=True, secure=config.tls, samesite="strict", path="/"
+            name,
+            value,
+            max_age=age,
+            httponly=True,
+            secure=config.transport_secure,
+            samesite="strict",
+            path="/",
         )
 
     def paired(result: dict[str, Any]) -> JSONResponse:
@@ -70,6 +86,8 @@ def create_app(
 
     def device(request: Request, *, write: bool = False, unverified: bool = False) -> Device:
         if not app.state.accepting:
+            raise HTTPException(503)
+        if is_locked():
             raise HTTPException(503)
         try:
             d = auth.authenticate(request.cookies.get(COOKIE, ""))
@@ -119,12 +137,14 @@ def create_app(
 
     @app.get("/healthz")
     async def health() -> dict[str, bool]:
-        return {"ok": True}
+        return {"ok": True, "locked": is_locked()}
 
     @app.get("/api/v1/pair/status")
     async def pair_status(request: Request) -> JSONResponse:
         if not app.state.accepting:
             raise HTTPException(503)
+        if is_locked():
+            return JSONResponse({"status": "locked"})
         proof = request.cookies.get(PENDING)
         if proof:
             return paired(auth.status(proof))
@@ -136,6 +156,8 @@ def create_app(
     @app.post("/api/v1/pair")
     async def pair(request: Request, body: PairRequest) -> JSONResponse:
         if not app.state.accepting:
+            raise HTTPException(503)
+        if is_locked():
             raise HTTPException(503)
         csrf = request.cookies.get(BOOTSTRAP, "")
         if not csrf or not hmac.compare_digest(
@@ -163,7 +185,7 @@ def create_app(
             "server_epoch": facade.epoch,
             "csrf_token": csrf,
             "password_required": password_gate is not None and not d.password_verified,
-            "transport_secure": config.tls,
+            "transport_secure": config.transport_secure,
             "permissions": {"chat": password_gate is None or d.password_verified, "tools": False},
         }
 
@@ -189,8 +211,8 @@ def create_app(
 
     @app.get("/api/v1/state")
     async def state(request: Request) -> dict[str, Any]:
-        device(request)
-        value = await facade.state()
+        d = device(request)
+        value = await facade.state(d.id)
         if not value.get("available", True):
             auth.invalidate()
             raise HTTPException(503)
@@ -227,6 +249,218 @@ def create_app(
         return page(
             await facade.messages(conversation_id, branch, limit=limit, cursor=cursor), "message"
         )
+
+    def memory_service() -> Any:
+        service = getattr(facade, "memory_service", None)
+        if service is None:
+            raise HTTPException(503)
+        return service
+
+    def memory_revision() -> int:
+        return int(getattr(facade, "revision", 0))
+
+    def check_memory_revision(expected: int) -> None:
+        if expected != memory_revision():
+            raise RuntimeConflict("memory_conflict", 409)
+
+    def memory_item(value: Any) -> dict[str, Any]:
+        return project(value, "memory")
+
+    @app.get("/api/v1/memories")
+    async def memories(request: Request) -> dict[str, Any]:
+        device(request)
+        conversation_id = request.query_params.get("conversation_id")
+        branch_id = request.query_params.get("branch_id")
+        if not conversation_id or not branch_id:
+            raise HTTPException(400)
+        service = memory_service()
+        try:
+            session = service.list_session_global(conversation_id)
+            branch = service.list(conversation_id, branch_id)
+            return {
+                "revision": memory_revision(),
+                "global": [memory_item(item) for item in service.list()],
+                "session_global": [
+                    {"memory": memory_item(item.memory), "state": item.state} for item in session
+                ],
+                "branch": [memory_item(item) for item in branch],
+                "policy": service.policy(conversation_id).value,
+                "settings": service.settings().model_dump(),
+            }
+        except ValueError:
+            raise HTTPException(404) from None
+
+    @app.post("/api/v1/memories")
+    async def save_memory(request: Request, body: MemoryMutation) -> JSONResponse:
+        device(request, write=True)
+        check_memory_revision(body.expected_revision)
+        service = memory_service()
+        try:
+            if body.policy is not None:
+                if not body.conversation_id:
+                    raise ValueError("conversation required")
+                service.set_policy(body.conversation_id, body.policy)
+                result: dict[str, Any] = {"policy": body.policy}
+            elif (
+                body.conversation_id
+                and body.branch_id
+                and body.item_id
+                and body.content is not None
+            ):
+                result = memory_item(
+                    service.save(
+                        body.content,
+                        body.conversation_id,
+                        body.branch_id,
+                        item_id=body.item_id,
+                    )
+                )
+            elif (
+                body.conversation_id is None and body.branch_id is None and body.content is not None
+            ):
+                result = memory_item(service.save(body.content))
+            elif body.conversation_id and body.branch_id and body.content is not None:
+                result = memory_item(
+                    service.save(body.content, body.conversation_id, body.branch_id)
+                )
+            else:
+                raise ValueError("invalid memory scope")
+            facade.bump_revision()
+            return JSONResponse({"revision": memory_revision(), "item": result})
+        except ValueError as exc:
+            code = (
+                "memory_invalid_scope"
+                if "scope" in str(exc) or "会话" in str(exc)
+                else "memory_not_found"
+            )
+            return error_response(400 if code == "memory_invalid_scope" else 404, code)
+
+    @app.post("/api/v1/memories/session")
+    async def save_session_memory(request: Request, body: SessionMemoryMutation) -> JSONResponse:
+        device(request, write=True)
+        check_memory_revision(body.expected_revision)
+        try:
+            service = memory_service()
+            if body.content is None:
+                raise ValueError("content required")
+            # Session-global writes must reference a real global ID.
+            conversations = await facade.conversations(limit=100)
+            if body.conversation_id not in {c["id"] for c in conversations["items"]}:
+                raise ValueError("conversation not found")
+            if body.content is not None:
+                service.save_session_global(body.item_id, body.content, body.conversation_id)
+            facade.bump_revision()
+            return JSONResponse({"revision": memory_revision()})
+        except ValueError:
+            return error_response(404, "memory_not_found")
+
+    @app.post("/api/v1/memories/{item_id}/delete")
+    async def delete_memory(request: Request, item_id: str) -> JSONResponse:
+        device(request, write=True)
+        try:
+            payload = MemoryMutation.model_validate(await request.json())
+            check_memory_revision(payload.expected_revision)
+            if not payload.conversation_id or not payload.branch_id:
+                raise ValueError("scope")
+            memory_service().delete(item_id, payload.conversation_id, payload.branch_id)
+            facade.bump_revision()
+            return JSONResponse({"revision": memory_revision()})
+        except ValueError:
+            return error_response(404, "memory_not_found")
+
+    @app.post("/api/v1/memories/{item_id}/promote")
+    async def promote_memory(request: Request, item_id: str) -> JSONResponse:
+        device(request, write=True)
+        try:
+            payload = MemoryMutation.model_validate(await request.json())
+            check_memory_revision(payload.expected_revision)
+            if not payload.conversation_id or not payload.branch_id:
+                raise ValueError("scope")
+            item = memory_service().promote(item_id, payload.conversation_id, payload.branch_id)
+            facade.bump_revision()
+            return JSONResponse({"revision": memory_revision(), "item": memory_item(item)})
+        except ValueError:
+            return error_response(404, "memory_not_found")
+
+    @app.post("/api/v1/memories/session/{item_id}/delete")
+    async def delete_session_memory(request: Request, item_id: str) -> JSONResponse:
+        device(request, write=True)
+        try:
+            payload = MemoryMutation.model_validate(await request.json())
+            check_memory_revision(payload.expected_revision)
+            if not payload.conversation_id:
+                raise ValueError("conversation")
+            memory_service().delete_session_global(item_id, payload.conversation_id)
+            facade.bump_revision()
+            return JSONResponse({"revision": memory_revision()})
+        except ValueError:
+            return error_response(404, "memory_not_found")
+
+    @app.post("/api/v1/memories/session/{item_id}/restore")
+    async def restore_session_memory(request: Request, item_id: str) -> JSONResponse:
+        device(request, write=True)
+        try:
+            payload = MemoryMutation.model_validate(await request.json())
+            check_memory_revision(payload.expected_revision)
+            if not payload.conversation_id:
+                raise ValueError("conversation")
+            memory_service().restore_session_global(item_id, payload.conversation_id)
+            facade.bump_revision()
+            return JSONResponse({"revision": memory_revision()})
+        except ValueError:
+            return error_response(404, "memory_not_found")
+
+    @app.get("/api/v1/sync/changes")
+    async def sync_changes(request: Request) -> JSONResponse:
+        device(request)
+        store = getattr(facade, "sync_store", None)
+        if store is None:
+            raise HTTPException(503)
+        try:
+            raw_cursor = request.query_params.get("cursor", request.query_params.get("after", "0"))
+            cursor = int(raw_cursor)
+            limit = int(request.query_params.get("limit", "100"))
+            return JSONResponse(store.page(cursor, limit=limit))
+        except ValueError:
+            raise HTTPException(400) from None
+        except CursorExpired:
+            return JSONResponse(
+                {
+                    "items": [],
+                    "cursor": 0,
+                    "latest_cursor": 0,
+                    "has_more": False,
+                    "resync_required": True,
+                },
+                status_code=409,
+            )
+
+    @app.get("/api/v1/sync/snapshot")
+    async def sync_snapshot(request: Request) -> JSONResponse:
+        device(request)
+        store = getattr(facade, "sync_store", None)
+        if store is None:
+            raise HTTPException(503)
+
+        def build_snapshot() -> JSONResponse:
+            # The worker owns admission until it exits, even if the HTTP task is
+            # cancelled while its thread is still decrypting/encoding.
+            if not snapshot_lock.acquire(blocking=False):
+                return error_response(503, "snapshot_busy")
+            try:
+                response = JSONResponse(store.snapshot())
+                if len(response.body) > store.max_snapshot_bytes:
+                    raise SnapshotTooLarge("snapshot response exceeds export budget")
+                return response
+            finally:
+                snapshot_lock.release()
+
+        try:
+            return await run_in_threadpool(build_snapshot)
+        except SnapshotTooLarge:
+            return error_response(413, "snapshot_too_large")
+        except RuntimeError:
+            raise HTTPException(503) from None
 
     @app.post("/api/v1/commands")
     async def commands(request: Request) -> JSONResponse:

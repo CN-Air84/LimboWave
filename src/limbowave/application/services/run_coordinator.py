@@ -285,6 +285,8 @@ class RouteMismatchError(RuntimeError):
 
 def _arbitrated[**CommandArgs, CommandResult: (bool, str | None)](
     method: Callable[Concatenate[RunCoordinator, CommandArgs], Awaitable[CommandResult]],
+    *,
+    bump_revision: bool = True,
 ) -> Callable[Concatenate[RunCoordinator, CommandArgs], Awaitable[CommandResult]]:
     """Reserve state transitions, preserving the controller's typed return contract."""
 
@@ -295,7 +297,7 @@ def _arbitrated[**CommandArgs, CommandResult: (bool, str | None)](
         try:
             with self.command_scope():
                 result = await method(self, *args, **kwargs)
-                if result:
+                if result and bump_revision:
                     self._revision += 1
                 return result
         except CommandBusy:
@@ -303,6 +305,12 @@ def _arbitrated[**CommandArgs, CommandResult: (bool, str | None)](
             return cast(CommandResult, rejected)
 
     return wrapped
+
+
+def _arbitrated_navigation[**CommandArgs, CommandResult: (bool, str | None)](
+    method: Callable[Concatenate[RunCoordinator, CommandArgs], Awaitable[CommandResult]],
+) -> Callable[Concatenate[RunCoordinator, CommandArgs], Awaitable[CommandResult]]:
+    return _arbitrated(method, bump_revision=False)
 
 
 class CommandBusy(RuntimeError):
@@ -492,7 +500,7 @@ class RunCoordinator:
                 self._command_owner = None
 
     @contextlib.contextmanager
-    def runtime_transition(self) -> Iterator[None]:
+    def runtime_transition(self, *, bump_revision: bool = True) -> Iterator[None]:
         """保留内核变更窗口；跨 await 阻止发送、切模型和恢复相互穿插。"""
         if self.busy:
             raise RuntimeError("内核正在处理请求或切换会话，请稍后重试")
@@ -501,7 +509,8 @@ class RunCoordinator:
             yield
         finally:
             self._transitioning = False
-            self._revision += 1
+            if bump_revision:
+                self._revision += 1
 
     @property
     def run_id(self) -> str | None:
@@ -702,7 +711,9 @@ class RunCoordinator:
             with self.runtime_transition():
                 await self.wait_idle()
                 conversation_id, branch_id = await self._storage_call(
-                    "_persist_empty_session", self._tick(), self._context().logical_model_id,
+                    "_persist_empty_session",
+                    self._tick(),
+                    self._context().logical_model_id,
                 )
                 self._active_conversation_id = conversation_id
                 self._active_branch_id = branch_id
@@ -715,10 +726,14 @@ class RunCoordinator:
         # 成功提交后才由调用方切换定位；失败不能留下指向不存在记录的会话 ID。
         conversation_id, branch_id = self._new_id("conv"), self._new_id("branch")
         with self._uow_factory() as uow:
-            uow.conversations.add(Conversation(
-                id=conversation_id, title=DEFAULT_CONVERSATION_TITLE, created_at=now,
-                default_logical_model_id=logical_model_id,
-            ))
+            uow.conversations.add(
+                Conversation(
+                    id=conversation_id,
+                    title=DEFAULT_CONVERSATION_TITLE,
+                    created_at=now,
+                    default_logical_model_id=logical_model_id,
+                )
+            )
             uow.branches.add(Branch(id=branch_id, conversation_id=conversation_id, created_at=now))
             uow.commit()
         return conversation_id, branch_id
@@ -768,7 +783,7 @@ class RunCoordinator:
             snapshot=snapshot,
         )
 
-    @_arbitrated
+    @_arbitrated_navigation
     async def switch_conversation(
         self,
         conversation_id: str,
@@ -780,7 +795,7 @@ class RunCoordinator:
         if self.busy:
             return False
         try:
-            with self.runtime_transition():
+            with self.runtime_transition(bump_revision=False):
                 await self.wait_idle()
                 prepared = await asyncio.to_thread(
                     self._prepare_switch,
@@ -1002,7 +1017,10 @@ class RunCoordinator:
         )
 
     def _prepare_retry(
-        self, message_id: str, *, rebuild_attachments: bool = True,
+        self,
+        message_id: str,
+        *,
+        rebuild_attachments: bool = True,
     ) -> tuple[str, AttachmentPayload, _SwitchPreparation]:
         """恢复边界按消息 ID/重试链计算，绝不按重复文本删历史。"""
         with self._uow_factory() as uow:
@@ -1013,7 +1031,8 @@ class RunCoordinator:
             users = [m for m in messages if m.role is MessageRole.USER]
             if (
                 message.conversation_id != self._active_conversation_id
-                or not users or users[-1].id != message_id
+                or not users
+                or users[-1].id != message_id
             ):
                 raise ValueError("只能重试当前分支最后一条用户消息")
             runs = uow.runs.list_for_conversation(message.conversation_id)
@@ -1044,14 +1063,22 @@ class RunCoordinator:
                 entry_id = self._entry_for_message(uow, message.conversation_id, source_id)
                 source = next((m for m in mirrors if m.entry_id == entry_id), None)
                 prefix_ids = {m.id for m in prefix}
-                leaf = source.parent_entry_id if source is not None else (
-                    branch_path.branch_leaf_entry_from_records(
-                        branch, [run for run in runs if run.user_message_id in prefix_ids], mirrors,
+                leaf = (
+                    source.parent_entry_id
+                    if source is not None
+                    else (
+                        branch_path.branch_leaf_entry_from_records(
+                            branch,
+                            [run for run in runs if run.user_message_id in prefix_ids],
+                            mirrors,
+                        )
                     )
                 )
                 if leaf is not None:
                     snapshot = self._runtime_states.build_branch_snapshot_from_records(
-                        conversation, mirrors, leaf,
+                        conversation,
+                        mirrors,
+                        leaf,
                     )
                 if snapshot is None:
                     raise ValueError("重试前的历史缺少运行时记录，未重发消息")
@@ -1062,10 +1089,17 @@ class RunCoordinator:
             uow.commit()  # persist any legacy orphan-link repair performed above
         payload = (
             self._attachments_for_message(message_id)
-            if rebuild_attachments else AttachmentPayload()
+            if rebuild_attachments
+            else AttachmentPayload()
         )
-        return message.content, payload, _SwitchPreparation(
-            valid=True, has_messages=bool(prefix), snapshot=snapshot,
+        return (
+            message.content,
+            payload,
+            _SwitchPreparation(
+                valid=True,
+                has_messages=bool(prefix),
+                snapshot=snapshot,
+            ),
         )
 
     async def _restore_retry_context(self, prepared: _SwitchPreparation) -> None:
@@ -1774,7 +1808,15 @@ class RunCoordinator:
         if self.memory_service is not None:
             self.memory_service.clear_approvals()
         if self._kernel is not None:
-            await self._kernel.abort()
+            try:
+                await self._kernel.abort()
+            except TimeoutError:
+                # Pi 卡住、不再发结束事件：强制收尾，避免 _busy 永久为真
+                if self._live is not None:
+                    await self.mark_interrupted("停止请求超时，已强制结束本轮")
+                else:
+                    self._busy = False
+                raise
 
     async def mark_interrupted(self, reason: str = "Runtime 异常退出") -> None:
         """Runtime 非正常终止时由上层调用：本轮落成 ``interrupted``，**不自动重发**。"""
@@ -2132,7 +2174,9 @@ class RunCoordinator:
             try:
                 try:
                     _, _, prepared = await self._storage_call(
-                        "_prepare_retry", live.user_message_id, rebuild_attachments=False,
+                        "_prepare_retry",
+                        live.user_message_id,
+                        rebuild_attachments=False,
                     )
                     if self._cancel_before_prompt(live):
                         return

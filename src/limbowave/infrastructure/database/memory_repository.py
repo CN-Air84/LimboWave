@@ -20,6 +20,12 @@ class SqliteMemoryRepository:
             return None
         return MemoryDocument(row[0], self._key.decrypt(row[1]), row[2], row[3])
 
+    def list_all(self) -> list[MemoryDocument]:
+        rows = self._conn.execute(
+            "SELECT id, payload, conversation_id, branch_id FROM memory_documents ORDER BY id"
+        ).fetchall()
+        return [MemoryDocument(row[0], self._key.decrypt(row[1]), row[2], row[3]) for row in rows]
+
     def put(self, document: MemoryDocument) -> None:
         self._conn.execute(
             "INSERT INTO memory_documents (id, payload, conversation_id, branch_id) "

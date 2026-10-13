@@ -75,7 +75,7 @@ async def test_api_precedes_static_and_keeps_auth(packaged_client):
     assert not facade.mock_calls
     health = await client.get("/healthz")
     assert health.status_code == 200
-    assert health.json() == {"ok": True}
+    assert health.json() == {"ok": True, "locked": False}
 
 
 async def test_missing_packaged_entry_does_not_redirect_to_dev_server(packaged_client):

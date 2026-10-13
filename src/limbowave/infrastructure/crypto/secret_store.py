@@ -13,12 +13,12 @@
 from __future__ import annotations
 
 import base64
-import contextlib
 import json
 from pathlib import Path
 
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
+from limbowave.infrastructure.atomic import atomic_write_text
 from limbowave.infrastructure.crypto.vault import VaultKey
 
 _LEGACY_KEY_FILE = "master.key"
@@ -42,12 +42,11 @@ class SecretStore:
         return data
 
     def _write_all(self, data: dict[str, str]) -> None:
-        self._data_path.parent.mkdir(parents=True, exist_ok=True)
-        self._data_path.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        atomic_write_text(
+            self._data_path,
+            json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+            mode=0o600,
         )
-        with contextlib.suppress(OSError):
-            self._data_path.chmod(0o600)
 
     # ---------- 公开 API ----------
 

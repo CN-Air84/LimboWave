@@ -39,7 +39,7 @@ async def test_paired_cookie_cannot_read_or_write_before_password_and_replay_fai
     auth = AuthStore()
     gate = PasswordGate(lambda p: p == "vault-password")
 
-    async def state():
+    async def state(device_id=None):
         return {"available": True, "server_epoch": "test", "seq": 0, "stream": None}
 
     config = WebConfig()
@@ -172,7 +172,7 @@ async def test_actual_lan_http_transport_flags_and_no_password_bypass():
     auth, gate = AuthStore(), PasswordGate(lambda p: p == "vault-password")
     config = WebConfig(host="192.168.1.2", allow_insecure_http=True)
 
-    async def state():
+    async def state(device_id=None):
         return {"available": True, "seq": 0, "server_epoch": "epoch"}
 
     app = create_app(SimpleNamespace(epoch="epoch", state=state), config, auth, gate)

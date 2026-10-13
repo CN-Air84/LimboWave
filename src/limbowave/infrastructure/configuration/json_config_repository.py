@@ -10,6 +10,7 @@ import json
 from pathlib import Path
 
 from limbowave.domain.configuration import AppConfiguration
+from limbowave.infrastructure.atomic import atomic_write_text
 
 
 class JsonConfigRepository:
@@ -28,8 +29,5 @@ class JsonConfigRepository:
         return AppConfiguration.model_validate(data)
 
     def save(self, config: AppConfiguration) -> None:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
         payload = config.model_dump(mode="json")
-        self._path.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-        )
+        atomic_write_text(self._path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")

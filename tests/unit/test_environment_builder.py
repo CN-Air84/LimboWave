@@ -217,6 +217,12 @@ def test_catalog_entry_without_secret_is_skipped(tmp_path: Path) -> None:
     assert "LIMBOWAVE_PARAM_RULES" not in env.env
 
 
+def test_server_tool_allow_list_replaces_host_tools(tmp_path: Path) -> None:
+    decision = RoutingService(_config()).route()
+    EnvironmentBuilder(tmp_path).build(decision, SECRET, allowed_tools=("add_session_memory",))
+    assert _settings_json(tmp_path)["defaultTools"] == ["add_session_memory"]
+
+
 def test_refresh_catalog_rewrites_in_place(tmp_path: Path) -> None:
     """热更新：就地重写 models.json（不清空 runtime home），给出要同步进进程的环境。"""
     builder = EnvironmentBuilder(tmp_path)
@@ -288,15 +294,19 @@ def test_verified_efforts_are_exported_only_for_effort_protocols(protocol) -> No
     decision = replace(
         decision,
         endpoint=decision.endpoint.model_copy(update={"api": protocol}),
-        binding=decision.binding.model_copy(update={
-            "supports_thinking": True, "available_thinking_levels": ("low", "high", "max")
-        }),
+        binding=decision.binding.model_copy(
+            update={"supports_thinking": True, "available_thinking_levels": ("low", "high", "max")}
+        ),
     )
     entry = EnvironmentBuilder._model_entry(decision)
     if protocol in (ProviderProtocol.OPENAI_COMPLETIONS, ProviderProtocol.OPENAI_RESPONSES):
         assert entry["thinkingLevelMap"] == {
-            "minimal": None, "low": "low", "medium": None,
-            "high": "high", "xhigh": None, "max": "max",
+            "minimal": None,
+            "low": "low",
+            "medium": None,
+            "high": "high",
+            "xhigh": None,
+            "max": "max",
         }
     else:
         assert "thinkingLevelMap" not in entry
@@ -311,9 +321,10 @@ def test_unknown_capability_does_not_invent_effort_support() -> None:
 def test_temporary_thinking_map_is_scoped_and_not_stored_in_configuration(tmp_path):
     decision = RoutingService(_config()).route()
     builder = EnvironmentBuilder(tmp_path)
-    builder.refresh_catalog([(decision, SECRET)], temporary_thinking_levels={
-        (decision.provider_key, decision.model_id): ("max",)
-    })
+    builder.refresh_catalog(
+        [(decision, SECRET)],
+        temporary_thinking_levels={(decision.provider_key, decision.model_id): ("max",)},
+    )
     entry = _models_json(tmp_path)["providers"]["relay-a"]["models"][0]
     assert entry["reasoning"] is True
     assert entry["thinkingLevelMap"]["max"] == "max"
@@ -330,9 +341,11 @@ def test_user_confirmed_level_is_exported_for_each_protocol(protocol):
     from dataclasses import replace
 
     decision = RoutingService(_config()).route()
-    decision = replace(decision,
+    decision = replace(
+        decision,
         endpoint=decision.endpoint.model_copy(update={"api": protocol}),
-        binding=decision.binding.model_copy(update={"user_thinking_levels": ("high",)}))
+        binding=decision.binding.model_copy(update={"user_thinking_levels": ("high",)}),
+    )
     entry = EnvironmentBuilder._model_entry(decision)
     assert entry["reasoning"] is True
     assert entry["thinkingLevelMap"]["high"] == "high"

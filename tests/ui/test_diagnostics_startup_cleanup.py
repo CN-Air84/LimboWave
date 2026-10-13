@@ -45,7 +45,10 @@ def test_partial_wiring_failure_closes_storage_and_ipc(
     loop = QEventLoop(QApplication.instance())
     asyncio.set_event_loop(loop)
     try:
-        with DiagnosticRuntime(LogConfig(tmp_path / "logs")), pytest.raises(RuntimeError, match="after IPC"):
+        with (
+            DiagnosticRuntime(LogConfig(tmp_path / "logs")),
+            pytest.raises(RuntimeError, match="after IPC"),
+        ):
             app._wire(window, AppPaths(tmp_path, tmp_path / "logs"), vault_key)
         assert len(stores) == len(servers) == 1
         assert stores[0]._closed

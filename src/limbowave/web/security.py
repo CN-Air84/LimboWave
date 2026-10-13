@@ -9,6 +9,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from starlette.responses import JSONResponse
 
@@ -20,6 +21,7 @@ class WebConfig:
     certfile: str | None = None
     keyfile: str | None = None
     allow_insecure_http: bool = False
+    public_origin: str | None = None
     max_body: int = 65536
     max_requests: int = 32
     max_streams: int = 8
@@ -32,12 +34,20 @@ class WebConfig:
         return bool(self.certfile and self.keyfile)
 
     @property
+    def transport_secure(self) -> bool:
+        return self.tls or bool(self.public_origin and self.public_origin.startswith("https://"))
+
+    @property
     def authority(self) -> str:
+        if self.public_origin:
+            return urlsplit(self.public_origin).netloc
         default_port = 443 if self.tls else 80
         return self.host if self.port == default_port else f"{self.host}:{self.port}"
 
     @property
     def origin(self) -> str:
+        if self.public_origin:
+            return self.public_origin.rstrip("/")
         return f"{'https' if self.tls else 'http'}://{self.authority}"
 
     def validate(self) -> None:
@@ -51,6 +61,20 @@ class WebConfig:
         )
         if not (ip.is_loopback or private) or ip.is_unspecified or ip.is_multicast:
             raise ValueError("A concrete private IPv4 address is required")
+        if self.public_origin:
+            parsed = urlsplit(self.public_origin)
+            if (
+                not ip.is_loopback
+                or parsed.scheme != "https"
+                or not parsed.hostname
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.path not in ("", "/")
+                or parsed.query
+                or parsed.fragment
+                or self.public_origin.endswith("/")
+            ):
+                raise ValueError("Server public origin must be one canonical HTTPS origin")
         if not 0 <= self.port <= 65535:
             raise ValueError("Invalid port")
         if not ip.is_loopback and not self.tls and not self.allow_insecure_http:
@@ -95,7 +119,15 @@ def error_response(status: int, code: str) -> JSONResponse:
     return JSONResponse(
         {
             "code": code,
-            "message": code.replace("_", " "),
+            "message": {
+                "body_limit": (
+                    "请求内容过长，超过网页单次请求大小限制。请缩短内容，或改用桌面端发送。"
+                ),
+                "snapshot_too_large": (
+                    "资料库超过全量同步容量限制，本次未导出，也不会推进同步游标。"
+                ),
+                "snapshot_busy": "正在生成同步快照，请稍后重试。",
+            }.get(code, code.replace("_", " ")),
             "request_id": secrets.token_hex(8),
             "retryable": status in (429, 503),
         },
@@ -171,6 +203,18 @@ class SecurityMiddleware:
         if headers.get(b"host") != [c.authority.encode()]:
             await reject(400, "invalid_host")
             return
+        if c.public_origin:
+            forwarded_proto = headers.get(b"x-forwarded-proto")
+            forwarded_host = headers.get(b"x-forwarded-host")
+            if forwarded_proto not in (None, [b"https"]) or forwarded_host not in (
+                None,
+                [c.authority.encode()],
+            ):
+                await reject(400, "invalid_proxy_headers")
+                return
+            if len(headers.get(b"forwarded", [])) > 0:
+                await reject(400, "invalid_proxy_headers")
+                return
         origin = headers.get(b"origin")
         if (origin is not None and origin != [c.origin.encode()]) or (
             scope["method"] not in ("GET", "HEAD") and origin != [c.origin.encode()]

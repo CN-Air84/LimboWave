@@ -28,6 +28,7 @@ from limbowave.application.services.attachment_service import AttachmentPayload
 from limbowave.application.services.run_coordinator import RunContext, RunCoordinator
 from limbowave.domain.conversation import MessageRole, MessageStatus
 from limbowave.domain.run import RunStatus
+from limbowave.domain.runtime_state import RuntimeRestoreResult
 from limbowave.domain.tool_step import ToolStatus
 from limbowave.infrastructure.memory_repositories import InMemoryStore, in_memory_uow_factory
 
@@ -343,6 +344,46 @@ async def test_gate3_user_abort_keeps_partial_output(
     assert assistant.content == "开头"
     assert assistant.status is MessageStatus.PARTIAL
     assert not coordinator.busy
+
+
+async def test_abort_timeout_clears_busy_and_marks_run_interrupted(
+    coordinator: RunCoordinator, kernel: FakeKernel, store: InMemoryStore
+) -> None:
+    await coordinator.send("hello")
+    assert coordinator.busy
+
+    async def hang() -> None:
+        raise TimeoutError
+
+    kernel.abort = hang  # type: ignore[method-assign]
+    with pytest.raises(TimeoutError):
+        await coordinator.abort()
+
+    assert not coordinator.busy
+    await coordinator.wait_idle()
+    assert _only_run(store).status is RunStatus.INTERRUPTED
+
+
+async def test_navigation_does_not_bump_execution_revision(
+    coordinator: RunCoordinator, kernel: FakeKernel
+) -> None:
+    _seed_one_turn(kernel)
+    await coordinator.send("第一轮")
+    kernel.emit("run.settled", {})
+    await coordinator.wait_idle()
+
+    async def restore(snapshot: Any) -> RuntimeRestoreResult:
+        return RuntimeRestoreResult(success=True)
+
+    kernel.capabilities = lambda: KernelCapabilities(  # type: ignore[method-assign]
+        frozenset({KernelCapability.RUNTIME_RESTORE})
+    )
+    kernel.restore_runtime_state = restore  # type: ignore[method-assign]
+    target = coordinator.conversation_id, coordinator.branch_id
+    before = coordinator.revision
+
+    assert await coordinator.switch_conversation(*target)
+    assert coordinator.revision == before
 
 
 # ---------------------------------------------------------------- 门禁 4
@@ -878,6 +919,7 @@ async def test_edit_user_message_carries_attachments(store: InMemoryStore) -> No
         assert intent is not None
         assert intent.attachment_ids == ("doc-1",)
 
+
 # ---------- 文档注记与分叉：镜像匹配必须以实际 prompt 为基准 ----------
 
 DOC_NOTE = "[用户附加了文档]\n- file_id: doc-1 · 名称: notes.md · 3 行"
@@ -928,9 +970,7 @@ def _user_message(store: InMemoryStore, branch_id: str, content: str) -> Any:
 def _mirror_for(store: InMemoryStore, conversation_id: str, entry_id: str) -> Any:
     with in_memory_uow_factory(store)() as uow:
         return next(
-            m
-            for m in uow.runtime.list_for_conversation(conversation_id)
-            if m.entry_id == entry_id
+            m for m in uow.runtime.list_for_conversation(conversation_id) if m.entry_id == entry_id
         )
 
 
@@ -997,6 +1037,7 @@ async def test_relink_refused_when_orphans_ambiguous(store: InMemoryStore) -> No
     kernel.entries = []
     assert await coord.edit_user_message(user_msg.id, "第一轮（改）") is None
     assert kernel.forked == []
+
 
 async def test_edit_rejects_non_user_message(store: InMemoryStore) -> None:
     kernel = BranchingKernel()
@@ -1358,7 +1399,8 @@ async def test_no_retry_when_policy_disabled(store: InMemoryStore) -> None:
 
 
 async def test_rate_limit_wait_is_visible_until_request_is_sent(
-    coordinator: RunCoordinator, kernel: FakeKernel,
+    coordinator: RunCoordinator,
+    kernel: FakeKernel,
 ) -> None:
     events: list[str] = []
     coordinator.subscribe(lambda event: events.append(event.kind))

@@ -48,6 +48,22 @@ class SelectModel(CommandBase):
 Command = Annotated[NewSession | Send | Abort | SelectModel, Field(discriminator="type")]
 
 
+class MemoryMutation(StrictModel):
+    expected_revision: Annotated[int, Field(ge=0)]
+    conversation_id: Id | None = None
+    branch_id: Id | None = None
+    item_id: Id | None = None
+    content: Annotated[str, Field(min_length=1, max_length=4000)] | None = None
+    policy: Literal["inherit", "ask", "allow"] | None = None
+
+
+class SessionMemoryMutation(StrictModel):
+    expected_revision: Annotated[int, Field(ge=0)]
+    conversation_id: Id
+    item_id: Id
+    content: Annotated[str, Field(min_length=1, max_length=4000)] | None = None
+
+
 class PasswordEnvelope(StrictModel):
     challenge_id: Annotated[str, Field(min_length=1, max_length=128)]
     encrypted_key: Annotated[str, Field(min_length=1, max_length=512)]

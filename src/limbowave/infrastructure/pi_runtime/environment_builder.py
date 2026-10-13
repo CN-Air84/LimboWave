@@ -129,6 +129,7 @@ class EnvironmentBuilder:
         *,
         extra_env: dict[str, str] | None = None,
         catalog: Sequence[tuple[RoutingDecision, str | None]] = (),
+        allowed_tools: Sequence[str] | None = None,
     ) -> RuntimeEnvironment:
         """构建运行环境。``secret`` 是已解密的密钥（由 CredentialService 提供）。
 
@@ -151,7 +152,7 @@ class EnvironmentBuilder:
 
         runtime_home = self._prepare_home()
         self._write_models_json(runtime_home, entries)
-        self._write_settings_json(runtime_home)
+        self._write_settings_json(runtime_home, allowed_tools)
 
         env = dict(os.environ)
         # 应用侧注入的环境（如工具 IPC 通道凭据）——由调用方提供，不做默认
@@ -172,7 +173,9 @@ class EnvironmentBuilder:
         )
 
     def refresh_catalog(
-        self, catalog: Sequence[tuple[RoutingDecision, str | None]], *,
+        self,
+        catalog: Sequence[tuple[RoutingDecision, str | None]],
+        *,
         temporary_thinking_levels: dict[tuple[str, str], tuple[str, ...]] | None = None,
     ) -> CatalogSync:
         """热更新：就地重写**正在运行**的 Pi 的 models.json，并给出要同步进进程的环境。
@@ -202,7 +205,9 @@ class EnvironmentBuilder:
         return home
 
     def _write_models_json(
-        self, runtime_home: Path, entries: Sequence[tuple[RoutingDecision, str | None]],
+        self,
+        runtime_home: Path,
+        entries: Sequence[tuple[RoutingDecision, str | None]],
         temporary_thinking_levels: dict[tuple[str, str], tuple[str, ...]] | None = None,
     ) -> str:
         providers: dict[str, dict[str, object]] = {}
@@ -216,9 +221,10 @@ class EnvironmentBuilder:
             if all(existing["id"] != decision.model_id for existing in models):
                 entry = self._model_entry(decision)
                 self._allow_thinking_levels(
-                    entry, (temporary_thinking_levels or {}).get(
+                    entry,
+                    (temporary_thinking_levels or {}).get(
                         (decision.provider_key, decision.model_id), ()
-                    )
+                    ),
                 )
                 models.append(entry)
 
@@ -268,8 +274,11 @@ class EnvironmentBuilder:
         # OpenAI 逐档探测的 effort 必须传给 Pi，否则 xhigh/max 会被钳制到 high。
         # Gemini/Anthropic 的预算探测不等同于逐档 effort 映射。
         levels = decision.binding.available_thinking_levels
-        if levels and decision.binding.supports_thinking is True and decision.endpoint.api in (
-            ProviderProtocol.OPENAI_COMPLETIONS, ProviderProtocol.OPENAI_RESPONSES
+        if (
+            levels
+            and decision.binding.supports_thinking is True
+            and decision.endpoint.api
+            in (ProviderProtocol.OPENAI_COMPLETIONS, ProviderProtocol.OPENAI_RESPONSES)
         ):
             model_entry["thinkingLevelMap"] = {
                 level: level if level in levels else None
@@ -293,7 +302,9 @@ class EnvironmentBuilder:
             mapping[level] = "none" if level == "off" else level
         entry["thinkingLevelMap"] = mapping
 
-    def _write_settings_json(self, runtime_home: Path) -> None:
+    def _write_settings_json(
+        self, runtime_home: Path, allowed_tools: Sequence[str] | None = None
+    ) -> None:
         """硬化基线（ADR 第七节 / GATE-05）+ 内置工具模式（§九.1）。
 
         关：遥测、项目信任、内核内部重试（重试由应用按站点预设自己管，§八.3）。
@@ -303,11 +314,15 @@ class EnvironmentBuilder:
         ``read``/``write``/``edit``/``bash`` **有意排除**——它们会绕过应用侧的
         路径守卫与审计，与 §九.1 的「内置工具模式」相抵触。
         """
+        tools = APP_TOOLS if allowed_tools is None else allowed_tools
+        unknown = set(tools) - set(APP_TOOLS)
+        if unknown:
+            raise ValueError(f"未知应用工具：{sorted(unknown)}")
         settings = {
             "enableInstallTelemetry": False,
             "defaultProjectTrust": "never",
             "retry": {"enabled": False, "provider": {"maxRetries": 0}},
-            "defaultTools": list(APP_TOOLS),
+            "defaultTools": list(tools),
         }
         target = runtime_home / ".pi" / "agent" / "settings.json"
         target.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")

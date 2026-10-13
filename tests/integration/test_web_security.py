@@ -105,7 +105,9 @@ async def test_concurrency_rate_chunked_body_and_revocation_during_read():
 
     entered, release = asyncio.Event(), asyncio.Event()
 
-    async def state():
+    # /api/v1/state 以设备 ID 调 facade.state(device_id)（按设备隔离导航状态）。
+    # wait_for 兜底：路由签名再漂移时快速失败，而不是永远等不到 entered。
+    async def state(device_id=None):
         entered.set()
         await release.wait()
         return {"available": True, "stream": {"text": "PRIVATE"}}
@@ -119,7 +121,7 @@ async def test_concurrency_rate_chunked_body_and_revocation_during_read():
     ) as c:
         c.cookies.set("lw_session", issued["token"])
         waiting = asyncio.create_task(c.get("/api/v1/state"))
-        await entered.wait()
+        await asyncio.wait_for(entered.wait(), timeout=10)
         assert (await c.get("/healthz")).status_code == 429
         auth.revoke(issued["device_id"])
         release.set()
@@ -237,3 +239,36 @@ async def test_invalid_sse_cursor_is_json_400_before_start(backend, cursor):
         assert result.status_code == 400
         assert result.headers["content-type"].startswith("application/json")
         assert app.state.streams == 0
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+async def test_utf8_command_body_limit_is_explained_before_execution(chunked):
+    import json
+    from unittest.mock import AsyncMock
+
+    facade = SimpleNamespace(execute=AsyncMock())
+    config = WebConfig()
+    auth = AuthStore()
+    issued = auth.issue("phone")
+    app = create_app(facade, config, auth)
+    body = json.dumps({"type": "send", "text": "汉" * 22000}, ensure_ascii=False).encode()
+    assert len(body) > config.max_body
+
+    async def chunks():
+        for offset in range(0, len(body), 4096):
+            yield body[offset : offset + 4096]
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url=config.origin
+    ) as client:
+        client.cookies.set("lw_session", issued["token"])
+        response = await client.post(
+            "/api/v1/commands",
+            content=chunks() if chunked else body,
+            headers={"Origin": config.origin, "X-CSRF-Token": issued["csrf_token"]},
+        )
+    assert response.status_code == 413
+    assert response.json()["code"] == "body_limit"
+    assert "过长" in response.json()["message"]
+    assert response.json()["retryable"] is False
+    facade.execute.assert_not_called()

@@ -9,7 +9,7 @@ All paths are under `/api/v1`, same origin. Internal app types are defined in `s
 | `GET session` | `{server_epoch, device_id, csrf_token, password_required:bool, transport_secure:bool, permissions:{chat,tools}}`; 401 → pairing bootstrap |
 | `GET password/challenge` | Paired devices only: `{challenge_id,public_key:PEM RSA,expires_in:120}`; one use per challenge |
 | `POST password/verify` | CSRF required; `{challenge_id,encrypted_key,iv,ciphertext}` (standard Base64 except UTF-8 challenge ID), success `{ok:true}`; password failure 401, five failures revoke pairing |
-| `GET state` | `{server_epoch, revision, seq, available, busy, conversation_id, branch_id, run_id, stream}`. `stream` is nullable, otherwise `{conversation_id,branch_id,run_id,message_id,text,thinking,status,tools?:Tool[],segments?:[{content,thinking}]}` |
+| `GET state` | `{server_epoch, revision, seq, available, busy, conversation_id, branch_id, run_id, stream}`. `conversation_id`/`branch_id` are **device-scoped navigation state**; one device switching conversations does not change another device’s target. `stream` is nullable, otherwise `{conversation_id,branch_id,run_id,message_id,text,thinking,status,tools?:Tool[],segments?:[{content,thinking}]}` |
 | `GET models` | `[{id,name}]` (not a page wrapper) |
 | `GET conversations?limit=50&cursor=…` | `{items:[{id,title,created_at,branches:[{id,title}]}],next_cursor}`; also accepts explicit `conversation_id/branch_id/updated_at/revision` |
 | `GET conversations/{id}/messages?branch_id=…&limit=50&cursor=…` | `{items:[{id,role,content,thinking,status,run_id,tools?:Tool[],created_at,branch_id}],next_cursor}`; IDs scoped by requested conversation, branch-ancestor rows retained |
@@ -17,6 +17,8 @@ All paths are under `/api/v1`, same origin. Internal app types are defined in `s
 | `GET commands/{id}` | `{server_epoch,client_command_id,status,revision,run_id,conversation_id,branch_id,error}`. status pending/accepted/rejected/failed; failed is a definitive rejection in UI |
 | `POST logout` | CSRF + cookie; `{ok:true}` |
 | `GET events` | `Last-Event-ID: epoch:seq`. JSON envelope protocol_version/server_epoch/seq/kind/conversation_id/branch_id/run_id/message_id/payload. Sparse snapshot/resync frames accepted |
+| `GET sync/changes?cursor=…&limit=…` | `{items:[{cursor,entity_type,entity_id,scope,operation,revision,created_at}],cursor,latest_cursor,has_more,resync_required}`; `409 resync_required` means rebuild from the snapshot |
+| `GET sync/snapshot` | `{cursor,revision,conversations,branches,messages,runs,memories,truncated}`; authoritative full-state snapshot for the single-user server |
 
 Runtime event names are normalized at the adapter: `assistant_delta`, `thinking_delta`, `assistant_start`, `assistant_end`, `user`, `tool`, `settled`, `run_failed`, `run_interrupted`, `branched`. Unknown names advance the cursor without rendering untrusted payloads. Malformed data/gaps trigger a fresh authoritative snapshot.
 
@@ -30,6 +32,10 @@ Runtime event names are normalized at the adapter: `assistant_delta`, `thinking_
 
 The implemented history endpoint returns an explicit `branch_id` with each conversation, and each message page is ordered oldest → newest; `next_cursor` selects older messages. The adapter prefers the explicit branch ID. History projects persisted `status`, `run_id`, and `tools`. `complete` maps to completed, `partial` maps to aborted (已停止生成), and `failed` remains failed; missing/unknown history status fails DTO validation rather than silently displaying success. Both history and state.stream restore `tools` through a default-empty array of whitelisted metadata. `Tool` is exactly `{tool_id,name,status:"running"|"completed"|"failed"}`; args/result/error (and any other server fields) are stripped. Snapshot tool metadata is authoritative and replaces stale incremental states, including an empty array. Cold reload and stream reconnect no longer depend on previous-page tool memory.
 
+## Locked server state
+
+When the headless server is locked, authenticated API calls return `503 unavailable` without exposing pairing, data, or runtime state. The web client renders a locked state and offers a manual retry; it never treats lock as a pairing failure or automatically retries a command.
+
 ## Mandatory password gate
 
 `password_required` means this paired device still needs verification. Pair cookies only preauthorize; state/models/events/conversations/history/commands return 403 until verified. Both HTTP and HTTPS require password verification. After `{ok:true}`, fetch session again; do not infer verification solely from the POST response. A wrong-password 401 is distinct from lost pairing: refresh session to determine whether the device remains paired.
@@ -37,3 +43,8 @@ The implemented history endpoint returns an explicit `branch_id` with each conve
 RSA-OAEP SHA256 with MGF1 SHA256 wraps a random 32-byte AES key. AES-GCM uses a random 12-byte IV, UTF-8 password plaintext and UTF-8 `challenge_id` AAD. Ciphertext includes the trailing 16-byte authentication tag. Fresh challenge each attempt; no extra request ID or reusable verifier. Forge randomness must use crypto.getRandomValues and fail closed if absent.
 
 HTTP is not protected by this envelope: chat remains plaintext and an active attacker can replace the webpage/public key. The frontend displays this warning and requires explicit acknowledgement; trusted HTTPS is recommended. Passwords never enter storage, logs or controller state and the input clears immediately on submit.
+
+
+### Server memory API
+
+The server exposes explicit memory scopes under `/api/v1/memories`. Reads require both `conversation_id` and `branch_id`; mutations carry `expected_revision` and return `409 memory_conflict` when stale. Global memory omits both scope IDs, branch memory supplies both, and session-global overrides supply `conversation_id` plus `item_id`. The server never accepts a client-written historical round snapshot.

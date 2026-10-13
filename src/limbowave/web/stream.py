@@ -30,6 +30,20 @@ def encode(event: dict[str, Any]) -> bytes:
     ).encode()
 
 
+def _remaining(auth: AuthStore, device: Device) -> float:
+    """Transport idle expiry is separate from durable device authorization."""
+    now = auth.clock()
+    return min(
+        auth.absolute_ttl - (now - device.created),
+        auth.idle_ttl - (now - device.touched),
+    )
+
+
+def _active(auth: AuthStore, device: Device) -> bool:
+    # Call valid first to preserve LAN expiry/revocation semantics.
+    return auth.valid(device) and _remaining(auth, device) > 0
+
+
 async def event_stream(
     facade: Any,
     auth: AuthStore,
@@ -55,7 +69,7 @@ async def event_stream(
             snapshot = project(current, "state")
             epoch, seq = snapshot["server_epoch"], snapshot["seq"]
         subscription = facade.events.subscribe(after_seq=seq, server_epoch=epoch)
-        if snapshot is not None and auth.valid(device):
+        if snapshot is not None and _active(auth, device):
             initial = {
                 "kind": "snapshot",
                 "server_epoch": epoch,
@@ -69,19 +83,18 @@ async def event_stream(
                 return
             yield data
         iterator = subscription.__aiter__()
-        while auth.valid(device):
+        while _active(auth, device):
             next_event = asyncio.create_task(anext(iterator))
             while True:
-                remaining = min(
-                    auth.absolute_ttl - (auth.clock() - device.created),
-                    auth.idle_ttl - (auth.clock() - device.touched),
-                )
+                remaining = _remaining(auth, device)
+                if remaining <= 0:
+                    return
                 done, _ = await asyncio.wait(
                     (next_event, revoked),
                     timeout=max(0, min(remaining, heartbeat_seconds)),
                     return_when=asyncio.FIRST_COMPLETED,
                 )
-                if revoked in done or not auth.valid(device):
+                if revoked in done or not _active(auth, device):
                     return
                 if not (await facade.state()).get("available", True):
                     auth.invalidate()
@@ -105,7 +118,7 @@ async def event_stream(
             if len(data) > max_bytes:
                 yield encode({"kind": "resync_required", "server_epoch": epoch, "seq": seq})
                 break
-            if auth.valid(device):
+            if _active(auth, device):
                 yield data
     finally:
         # Close the broker registration before an await: Starlette/AnyIO can
@@ -151,11 +164,10 @@ class RevocableEventResponse(StreamingResponse):
             await send(message)
 
         async def invalidated() -> None:
-            while self.auth.valid(self.device):
-                remaining = min(
-                    self.auth.absolute_ttl - (self.auth.clock() - self.device.created),
-                    self.auth.idle_ttl - (self.auth.clock() - self.device.touched),
-                )
+            while _active(self.auth, self.device):
+                remaining = _remaining(self.auth, self.device)
+                if remaining <= 0:
+                    return
                 try:
                     await asyncio.wait_for(self.device.revoked.wait(), timeout=max(0, remaining))
                 except TimeoutError:
@@ -169,6 +181,7 @@ class RevocableEventResponse(StreamingResponse):
             if serving in done:
                 await serving
             else:
+                await watcher
                 serving.cancel()
                 await asyncio.gather(serving, return_exceptions=True)
                 if started and not finished:

@@ -80,3 +80,7 @@ class CommandReceipts:
         for key in list(self._records):
             if key[0] == device:
                 del self._records[key]
+
+    def rotated(self, epoch: str) -> CommandReceipts:
+        """Create an empty epoch-local store while old tasks retain this instance."""
+        return CommandReceipts(epoch, capacity=self.capacity)

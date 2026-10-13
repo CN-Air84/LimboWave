@@ -7,7 +7,7 @@ import contextlib
 import errno
 import ipaddress
 import socket
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from dataclasses import replace
 from typing import Any
 
@@ -47,17 +47,19 @@ class WebServer:
         config: WebConfig | None = None,
         *,
         password_gate: PasswordGate | None = None,
+        auth: AuthStore | None = None,
     ) -> None:
         self.facade = facade
         self.password_gate = password_gate
         self.config = config or WebConfig()
-        self.auth = AuthStore()
+        self.auth = auth or AuthStore()
         self.app: Any = None
         self._server: EmbeddedServer | None = None
         self._task: asyncio.Task[None] | None = None
         self._socket: socket.socket | None = None
         self._lock = asyncio.Lock()
         self.url = ""
+        self._locked: Callable[[], bool] = lambda: False
 
     @property
     def running(self) -> bool:
@@ -68,6 +70,11 @@ class WebServer:
             and not self._task.done()
             and self.app.state.accepting
         )
+
+    async def start_with_lock_state(self, locked: Callable[[], bool]) -> None:
+        """Start the listener with a dynamic locked-state gate for headless server mode."""
+        self._locked = locked
+        await self.start()
 
     async def start(self) -> None:
         async with self._lock:
@@ -90,7 +97,9 @@ class WebServer:
                 sock.setblocking(False)
                 active = replace(self.config, port=sock.getsockname()[1])
                 self.facade.rotate_epoch()
-                self.app = create_app(self.facade, active, self.auth, self.password_gate)
+                self.app = create_app(
+                    self.facade, active, self.auth, self.password_gate, locked=self._locked
+                )
                 settings = uvicorn.Config(
                     self.app,
                     host=active.host,

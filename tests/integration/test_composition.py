@@ -25,9 +25,19 @@ from limbowave.domain.providers import EndpointConfig, ProviderProtocol
 from limbowave.infrastructure.configuration.json_config_repository import JsonConfigRepository
 from limbowave.infrastructure.crypto.secret_store import SecretStore
 from limbowave.infrastructure.crypto.vault import VaultKey
+from limbowave.infrastructure.pi_rpc import resolve_pi_argv
+
+
+def _pi_available() -> bool:
+    try:
+        resolve_pi_argv()
+    except RuntimeError:
+        return False
+    return True
+
 
 pytestmark = pytest.mark.skipif(
-    __import__("shutil").which("node") is None,
+    not _pi_available(),
     reason="需要 node 与已安装的 Pi",
 )
 
@@ -114,8 +124,10 @@ async def test_kernel_from_config_without_env_vars(
     entries = _read_jsonl(log)
     assert entries, "mock 侧应收到真实请求"
 
-    # 密钥经环境变量注入、由 Pi 放进 Authorization 头
-    auth = entries[0]["headers"].get("Authorization", "")
+    # 密钥经环境变量注入、由 Pi 放进 Authorization 头。头名不分大小写：
+    # Pi 0.86 手写首字母大写，≥1.1 的 OpenAI SDK 恒为小写。
+    headers = {k.lower(): v for k, v in entries[0]["headers"].items()}
+    auth = headers.get("authorization", "")
     assert SECRET in auth, f"密钥未正确送达：{auth!r}"
 
 

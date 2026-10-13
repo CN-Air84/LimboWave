@@ -48,8 +48,15 @@ async def test_idle_expiry_closes_waiting_stream():
     facade, auth, d = setup_stream(idle_ttl=0.04)
     stream = event_stream(facade, auth, d, None, 65536)
     await anext(stream)
+
+    # 满载时 keepalive 帧可能先于空闲关闭到达：排空到流真正结束，
+    # 而不是要求下一次 anext 立刻抛 StopAsyncIteration。
+    async def drain() -> None:
+        while True:
+            await anext(stream)
+
     with pytest.raises(StopAsyncIteration):
-        await asyncio.wait_for(anext(stream), 0.3)
+        await asyncio.wait_for(drain(), 1.0)
     assert d.revoked.is_set()
 
 
@@ -133,3 +140,55 @@ async def test_slow_network_write_is_cancelled_on_revocation():
     await asyncio.wait_for(task, 0.2)
     assert closed == [True]
     assert not facade.events._subscriptions
+
+
+@pytest.mark.parametrize("blocked_write", [False, True])
+async def test_persistent_idle_stream_closes_without_revoking_or_spinning(tmp_path, blocked_write):
+    from limbowave.server.auth import PersistentAuthStore
+    from limbowave.web.stream import RevocableEventResponse
+
+    facade, _, _ = setup_stream()
+    auth = PersistentAuthStore(tmp_path / "server.db", idle_ttl=0.08)
+    issued = auth.issue("phone")
+    device = auth.authenticate(issued["token"])
+    touched = device.touched
+    valid = auth.valid
+    checks = 0
+
+    def counted_valid(d):
+        nonlocal checks
+        checks += 1
+        assert checks < 50, "idle stream is spinning on authorization queries"
+        return valid(d)
+
+    auth.valid = counted_valid
+    stream = event_stream(facade, auth, device, None, 65536)
+    if blocked_write:
+        forever = asyncio.Event()
+        closed = []
+
+        async def send(message):
+            if message["type"] == "http.response.body" and message.get("more_body"):
+                await forever.wait()
+
+        async def receive():
+            await forever.wait()
+
+        response = RevocableEventResponse(stream, auth, device, lambda: closed.append(True))
+        await asyncio.wait_for(
+            response({"type": "http", "asgi": {"spec_version": "2.4"}}, receive, send), 1
+        )
+        assert closed == [True]
+    else:
+
+        async def drain():
+            async for _ in stream:
+                pass
+
+        await asyncio.wait_for(drain(), 1)
+    assert checks < 50
+    assert device.touched == touched
+    assert not device.revoked.is_set()
+    assert not facade.events._subscriptions
+    restarted = PersistentAuthStore(tmp_path / "server.db", idle_ttl=0.08)
+    assert restarted.authenticate(issued["token"]).id == device.id

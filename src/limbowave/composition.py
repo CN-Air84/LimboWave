@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 
 from limbowave.application.kernel import AgentKernel, KernelSetup
 from limbowave.application.services.configuration_service import ConfigurationService
@@ -37,6 +38,7 @@ def build_kernel(
     key: VaultKey | None = None,
     *,
     extra_env: dict[str, str] | None = None,
+    allowed_tools: Sequence[str] | None = None,
 ) -> KernelSetup | None:
     """从权威配置构建内核。返回 None 表示无可用内核（优雅降级）。
 
@@ -71,7 +73,11 @@ def build_kernel(
 
     try:
         runtime_env = EnvironmentBuilder(runtime_root).build(
-            decision, secret, extra_env=extra_env, catalog=catalog
+            decision,
+            secret,
+            extra_env=extra_env,
+            catalog=catalog,
+            allowed_tools=allowed_tools,
         )
     except RoutingError:
         _LOG.warning("kernel.unavailable", extra={"reason": "runtime_environment"})
@@ -87,14 +93,22 @@ def build_kernel(
         kernel = PiKernelAdapter(spec)
     except Exception as exc:
         # 不将进程参数、环境或凭据异常的原文写入明文诊断。
-        _LOG.warning("kernel.unavailable", extra={
-            "reason": "runtime_setup", "error_type": type(exc).__name__,
-        })
+        _LOG.warning(
+            "kernel.unavailable",
+            extra={
+                "reason": "runtime_setup",
+                "error_type": type(exc).__name__,
+            },
+        )
         return None
 
-    _LOG.info("kernel.configured", extra={
-        "logical_model_id": decision.model.id, "endpoint_id": decision.endpoint.id,
-    })
+    _LOG.info(
+        "kernel.configured",
+        extra={
+            "logical_model_id": decision.model.id,
+            "endpoint_id": decision.endpoint.id,
+        },
+    )
     return kernel_setup(kernel, decision)
 
 
@@ -110,11 +124,17 @@ def kernel_setup(kernel: AgentKernel, decision: RoutingDecision) -> KernelSetup:
         retry_policy=decision.endpoint.retry.to_policy(),
         default_thinking_level=decision.binding.default_thinking_level,
         thinking_level_locked=decision.binding.thinking_level_locked,
-        available_thinking_levels=tuple(dict.fromkeys((
-            *decision.binding.available_thinking_levels, *decision.binding.user_thinking_levels,
-        ))),
+        available_thinking_levels=tuple(
+            dict.fromkeys(
+                (
+                    *decision.binding.available_thinking_levels,
+                    *decision.binding.user_thinking_levels,
+                )
+            )
+        ),
         supports_thinking=(
-            True if any(level != "off" for level in decision.binding.user_thinking_levels)
+            True
+            if any(level != "off" for level in decision.binding.user_thinking_levels)
             else decision.binding.supports_thinking
         ),
         supports_tools=decision.binding.supports_tools,
@@ -133,9 +153,12 @@ def resolve_catalog(
         try:
             catalog.append((item, credential.resolve(item.endpoint.credential_ref)))
         except VaultError:
-            _LOG.warning("kernel.catalog_credential_unavailable", extra={
-                "endpoint_id": item.endpoint.id,
-            })
+            _LOG.warning(
+                "kernel.catalog_credential_unavailable",
+                extra={
+                    "endpoint_id": item.endpoint.id,
+                },
+            )
             continue
     return catalog
 

@@ -60,6 +60,18 @@ beforeEach(async () => {
   controller.setDraft("保留草稿");
 });
 afterEach(() => controller.stop());
+
+it("server lock shows a locked state instead of a pairing form", async () => {
+  const lockedApi = new ApiClient();
+  vi.spyOn(lockedApi, "session").mockRejectedValue(
+    new ApiError(503, "unavailable", "服务器已锁定"),
+  );
+  const locked = new ChatController(lockedApi, async () => {});
+  await locked.initialize();
+  expect(locked.getSnapshot().phase).toBe("locked");
+  expect(locked.getSnapshot().connection).toBe("offline");
+  locked.stop();
+});
 it("409 preserves draft and never queues or retries a POST", async () => {
   const command = vi
     .spyOn(api, "command")
@@ -359,4 +371,21 @@ it("revoked pairing after password failure returns to pairing", async () => {
   );
   await controller.verifyPassword("secret");
   expect(controller.getSnapshot().phase).toBe("pairing");
+});
+
+
+it("413 preserves the long draft without retrying or looking up a receipt", async () => {
+  const draft = "汉".repeat(22000);
+  controller.setDraft(draft);
+  const command = vi.spyOn(api, "command").mockRejectedValue(
+    new ApiError(413, "body_limit", "请求内容过长，请缩短内容或改用桌面端发送。"),
+  );
+  const receipt = vi.spyOn(api, "receipt");
+  await controller.send();
+  expect(command).toHaveBeenCalledOnce();
+  expect(receipt).not.toHaveBeenCalled();
+  expect(controller.getSnapshot().drafts[draftKey(target)]).toBe(draft);
+  expect(controller.getSnapshot().pending).toBeNull();
+  expect(controller.getSnapshot().busy).toBe(false);
+  expect(controller.getSnapshot().error).toContain("过长");
 });
