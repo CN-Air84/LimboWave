@@ -25,7 +25,7 @@ from limbowave.domain.files import FileDocument, ImageAttachment
 from limbowave.domain.memory import MemoryDocument
 from limbowave.domain.permissions import PermissionAudit, PermissionGrant
 from limbowave.domain.run import RunLogSummary, RunRecord, RunStatus
-from limbowave.domain.runtime_mirror import RuntimeEntryMirror
+from limbowave.domain.runtime_mirror import RuntimeEntryMetadata, RuntimeEntryMirror
 from limbowave.domain.snapshots import RequestIntentSnapshot, TransportSnapshot
 
 
@@ -198,6 +198,24 @@ class _Messages:
                  or (upper[2] and (m.created_at, m.id) == upper[:2]))
         ), key=lambda m: (m.created_at, m.id))
 
+    def summary_for_conversation(self, conversation_id: str) -> tuple[int, datetime | None]:
+        merged = dict(self._store.messages)
+        merged.update({m.id: m for m in self._staged.values()})
+        moments = [m.created_at for m in merged.values() if m.conversation_id == conversation_id]
+        return len(moments), max(moments, default=None)
+
+    def summaries_for_branches(
+        self, conversation_id: str,
+    ) -> dict[str, tuple[int, datetime]]:
+        merged = dict(self._store.messages)
+        merged.update({m.id: m for m in self._staged.values()})
+        summaries: dict[str, tuple[int, datetime]] = {}
+        for message in merged.values():
+            if message.conversation_id == conversation_id:
+                count, latest = summaries.get(message.branch_id, (0, message.created_at))
+                summaries[message.branch_id] = count + 1, max(latest, message.created_at)
+        return summaries
+
     def count_for_branch(self, branch_id: str) -> int:
         return len(self.list_for_branch(branch_id))
 
@@ -314,6 +332,24 @@ class _RuntimeMirror:
 
     def list_for_conversation(self, conversation_id: str) -> list[RuntimeEntryMirror]:
         return [m for m in self._merged() if m.conversation_id == conversation_id]
+
+    def list_metadata_for_conversation(
+        self, conversation_id: str,
+    ) -> list[RuntimeEntryMetadata]:
+        return [RuntimeEntryMetadata(
+            id=m.id, conversation_id=m.conversation_id, entry_id=m.entry_id,
+            entry_type=m.entry_type, captured_at=m.captured_at, run_id=m.run_id,
+            parent_entry_id=m.parent_entry_id, message_id=m.message_id,
+            runtime_instance_id=m.runtime_instance_id,
+        ) for m in self._merged() if m.conversation_id == conversation_id]
+
+    def list_for_entries(
+        self, conversation_id: str, entry_ids: Sequence[str],
+    ) -> list[RuntimeEntryMirror]:
+        wanted = set(entry_ids)
+        return sorted((m for m in self._merged()
+                       if m.conversation_id == conversation_id and m.entry_id in wanted),
+                      key=lambda m: (m.captured_at, m.id))
 
     def list_for_run(self, run_id: str) -> list[RuntimeEntryMirror]:
         return [m for m in self._merged() if m.run_id == run_id]
@@ -540,6 +576,9 @@ class InMemoryUnitOfWork:
             (self._store.permission_grants, self._staged_grants),
             (self._store.permission_audit, self._staged_audit),
         ]
+
+    def begin_read(self) -> None:
+        """内存后端无需管理数据库读事务。"""
 
     def commit(self) -> None:
         for target, staged in self._all_staged():

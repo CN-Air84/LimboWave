@@ -41,6 +41,9 @@ MANIFEST_NAME = "manifest.json"
 DATABASE_NAME = "limbowave.db"
 CONFIG_NAME = "config.json"
 BLOB_PREFIX = "blobs/"
+# The v1 archive codec is one-shot AEAD. Refuse oversized libraries before reads
+# rather than risking OOM; a streaming archive format requires a versioned migration.
+MAX_BACKUP_BYTES = 128 * 1024 * 1024
 
 # 备份包内固定路径
 ARCHIVE_DATABASE = DATABASE_NAME
@@ -93,6 +96,22 @@ class BackupService:
     def _collect(self) -> dict[str, bytes]:
         """收集要备份的文件。缺失的项跳过（如还没配置站点）。"""
         files: dict[str, bytes] = {}
+        used = 0
+
+        def collect(name: str, path: Path) -> None:
+            nonlocal used
+            remaining = MAX_BACKUP_BYTES - used
+            if path.stat().st_size > remaining:
+                raise BackupError(
+                    "资料库超过 v1 备份的 128 MiB 安全预算，未创建备份。请先回收无用附件。"
+                )
+            with path.open("rb") as handle:
+                content = handle.read(remaining + 1)
+            if len(content) > remaining:
+                raise BackupError("备份期间资料库增长超过安全预算，未创建备份。")
+            files[name] = content
+            used += len(content)
+
         database = self._root / DATABASE_NAME
         if database.is_file():
             # A raw file copy loses committed pages still in the live WAL.
@@ -102,18 +121,22 @@ class BackupService:
                     closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)) as conn,
                     closing(sqlite3.connect(snapshot)) as target,
                 ):
+                    size = (conn.execute("PRAGMA page_count").fetchone()[0]
+                            * conn.execute("PRAGMA page_size").fetchone()[0])
+                    if size > MAX_BACKUP_BYTES:
+                        raise BackupError("数据库超过 v1 备份的 128 MiB 安全预算，未创建备份。")
                     conn.backup(target)
-                files[ARCHIVE_DATABASE] = snapshot.read_bytes()
+                collect(ARCHIVE_DATABASE, snapshot)
         config = self._root / CONFIG_NAME
         if config.is_file():
-            files[ARCHIVE_CONFIG] = config.read_bytes()
+            collect(ARCHIVE_CONFIG, config)
         secrets = self._root / "vault" / "secrets.json"
         if secrets.is_file():
-            files["vault/secrets.json"] = secrets.read_bytes()
+            collect("vault/secrets.json", secrets)
         blobs_dir = self._root / "blobs"
         if blobs_dir.is_dir():
             for blob in sorted(blobs_dir.glob("*.bin")):
-                files[f"{BLOB_PREFIX}{blob.name}"] = blob.read_bytes()
+                collect(f"{BLOB_PREFIX}{blob.name}", blob)
         return files
 
     def _build_manifest(self, files: dict[str, bytes]) -> BackupManifest:

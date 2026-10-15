@@ -29,7 +29,7 @@ from limbowave.domain.files import FileDocument, ImageAttachment
 from limbowave.domain.memory import MemoryDocument
 from limbowave.domain.permissions import PermissionAudit, PermissionGrant
 from limbowave.domain.run import RunLogSummary, RunRecord
-from limbowave.domain.runtime_mirror import RuntimeEntryMirror
+from limbowave.domain.runtime_mirror import RuntimeEntryMetadata, RuntimeEntryMirror
 from limbowave.domain.snapshots import RequestIntentSnapshot, TransportSnapshot
 
 
@@ -86,6 +86,16 @@ class MessageRepository(Protocol):
         """Descending keyset page projecting only public history payload fields."""
         ...
 
+    def summary_for_conversation(self, conversation_id: str) -> tuple[int, datetime | None]:
+        """Count and latest timestamp without decrypting message contents."""
+        ...
+
+    def summaries_for_branches(
+        self, conversation_id: str,
+    ) -> dict[str, tuple[int, datetime]]:
+        """Each nonempty branch's message count and latest time, without decryption."""
+        ...
+
     def count_for_branch(self, branch_id: str) -> int:
         """只取数量，不为列表/侧栏解密消息正文。"""
         ...
@@ -133,6 +143,18 @@ class RuntimeMirrorRepository(Protocol):
     def add_many(self, mirrors: list[RuntimeEntryMirror]) -> None: ...
 
     def list_for_conversation(self, conversation_id: str) -> list[RuntimeEntryMirror]: ...
+
+    def list_metadata_for_conversation(
+        self, conversation_id: str,
+    ) -> list[RuntimeEntryMetadata]:
+        """Topology/ownership only; never read or decrypt runtime payloads."""
+        ...
+
+    def list_for_entries(
+        self, conversation_id: str, entry_ids: Sequence[str],
+    ) -> list[RuntimeEntryMirror]:
+        """Only decode requested entries within the named conversation."""
+        ...
 
     def list_for_run(self, run_id: str) -> list[RuntimeEntryMirror]: ...
 
@@ -227,6 +249,10 @@ class UnitOfWork(Protocol):
     compressions: CompressionVersionRepository
     permissions: PermissionRepository
     memories: MemoryRepository
+
+    def begin_read(self) -> object:
+        """Pin multi-query reads to one snapshot; released on unit-of-work exit."""
+        ...
 
     def commit(self) -> None: ...
 

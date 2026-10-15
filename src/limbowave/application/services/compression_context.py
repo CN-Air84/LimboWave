@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Sequence
 from dataclasses import replace
 from typing import Any
 
 from limbowave.domain.compaction import CompressionVersion
 from limbowave.domain.conversation import Message
-from limbowave.domain.runtime_mirror import RuntimeEntryMirror
+from limbowave.domain.runtime_mirror import RuntimeEntryMetadata
 from limbowave.domain.runtime_state import RuntimeStateSnapshot, fingerprint_from_entry
 
 
@@ -21,8 +22,13 @@ def without_application_compactions(entries: list[dict[str, Any]]) -> list[dict[
         and isinstance(e.get("details"), dict)
         and e["details"].get("limbowaveVersion")
     }
+    if not removed:
+        # 普通未压缩会话只需复制列表；不为每条消息分配遍历集合或重建父链。
+        return list(entries)
     result = []
     changed_context = set(removed)
+    # 多个后继可以引用同一覆盖层链；只在本次投影内缓存跳过覆盖层后的父节点。
+    resolved_parents: dict[str, str | None] = {}
     for entry in entries:
         if str(entry.get("id")) in removed:
             continue
@@ -40,10 +46,14 @@ def without_application_compactions(entries: list[dict[str, Any]]) -> list[dict[
                 entry = {**entry, "message": {**message, "usage": usage}}
         visited: set[str] = set()
         while parent in removed:
+            if parent in resolved_parents:
+                parent = resolved_parents[parent]
+                break
             if parent in visited:
                 raise ValueError("压缩覆盖层父链存在循环")
             visited.add(parent)
             parent = removed[parent]
+        resolved_parents.update(dict.fromkeys(visited, parent))
         result.append({**entry, "parentId": parent} if parent != entry.get("parentId") else entry)
     return result
 
@@ -51,9 +61,14 @@ def without_application_compactions(entries: list[dict[str, Any]]) -> list[dict[
 def uncompressed_snapshot(snapshot: RuntimeStateSnapshot) -> RuntimeStateSnapshot:
     """Mirrors are immutable; discard any old branch's overlays in the runtime copy."""
     entries = without_application_compactions(snapshot.entries)
+    unchanged = len(entries) == len(snapshot.entries) and all(
+        current is original for current, original in zip(entries, snapshot.entries, strict=True)
+    )
     return replace(
         snapshot, entries=entries, leaf_entry_id=entries[-1]["id"] if entries else None,
-        fingerprint=[fingerprint_from_entry(e, branch_position=i) for i, e in enumerate(entries)],
+        fingerprint=(snapshot.fingerprint if unchanged else [
+            fingerprint_from_entry(e, branch_position=i) for i, e in enumerate(entries)
+        ]),
     )
 
 
@@ -61,7 +76,7 @@ def project_compression(
     snapshot: RuntimeStateSnapshot,
     version: CompressionVersion,
     messages: list[Message],
-    mirrors: list[RuntimeEntryMirror],
+    mirrors: Sequence[RuntimeEntryMetadata],
 ) -> RuntimeStateSnapshot:
     """Append a native compaction with the preview boundary; retain subsequent turns."""
     ids = tuple(m.id for m in messages)

@@ -78,6 +78,20 @@ class BlobStore:
         path.unlink()
         return True
 
+    def prune(self, retained: set[str]) -> int:
+        """Remove unreferenced blobs in a quiescent library; never follow links."""
+        if self._dir.is_symlink() or self._dir.is_junction():
+            raise BlobStoreError("拒绝回收链接目录")
+        removed = 0
+        for path in self._dir.glob("*.bin"):
+            if path.is_symlink() or path.stem in retained:
+                continue
+            if len(path.stem) != 32 or any(c not in "0123456789abcdef" for c in path.stem):
+                continue
+            path.unlink()
+            removed += 1
+        return removed
+
     # ---------- 内部 ----------
 
     def _key_material(self) -> bytes:

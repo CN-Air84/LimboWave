@@ -77,6 +77,7 @@ from limbowave.application.services.compression_inheritance import inherit_compr
 from limbowave.application.services.memory_service import MemoryService, capture_memory, fork_memory
 from limbowave.application.services.public_tool_steps import public_tool_steps
 from limbowave.application.services.run_origin import RUN_ORIGIN
+from limbowave.application.services.runtime_recovery_coordinator import RuntimeRecoveryCoordinator
 from limbowave.application.services.runtime_state_service import (
     RuntimeStateService,
     isolate_conversation_entries,
@@ -148,6 +149,18 @@ class _SwitchPreparation:
     valid: bool
     has_messages: bool = False
     snapshot: Any | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ConversationSwitchPreparation:
+    """一次只读预准备；提交前必须检查所属协调器、定位和执行修订号。"""
+
+    conversation_id: str
+    branch_id: str
+    revision: int
+    source_location: tuple[str | None, str | None]
+    owner: object = field(repr=False)
+    state: _SwitchPreparation = field(repr=False)
 
 
 @dataclass(frozen=True)
@@ -299,6 +312,7 @@ def _arbitrated[**CommandArgs, CommandResult: (bool, str | None)](
                     self._revision += 1
                 return result
         except CommandBusy:
+            self._emit(ERROR, message="另一端正在操作，请稍后再试。")
             rejected = False if method.__annotations__.get("return") in (bool, "bool") else None
             return cast(CommandResult, rejected)
 
@@ -330,6 +344,10 @@ class RunCoordinator:
         self._revision = 0
         self._transitioning = False
         self._runtime_valid = True
+        self._closing = False
+        self.replacement_factory: Callable[[], Awaitable[AgentKernel | None]] | None = None
+        self._recovery_task: asyncio.Task[None] | None = None
+        self._unsubscribe_kernel: Callable[[], None] = lambda: None
         self._kernel = kernel
         self._uow_factory = uow_factory
         self._context = context
@@ -353,7 +371,9 @@ class RunCoordinator:
         self._runtime_states = RuntimeStateService(uow_factory)
 
         if kernel is not None:
-            kernel.subscribe(self._on_kernel_event)
+            self._unsubscribe_kernel = kernel.subscribe(
+                lambda event: self._on_kernel_event(event) if self._kernel is kernel else None
+            )
             kernel.set_observation_handler(self._on_observation)
             kernel.set_permission_handler(self._on_permission)
 
@@ -394,7 +414,7 @@ class RunCoordinator:
 
     @property
     def available(self) -> bool:
-        return self._kernel is not None
+        return self._kernel is not None and self._runtime_valid and not self._closing
 
     @property
     def busy(self) -> bool:
@@ -637,9 +657,98 @@ class RunCoordinator:
             self._emit(ERROR, message=f"收敛上次未完成运行失败：{redact_text(str(exc))}")
 
     async def shutdown(self) -> None:
-        await self.wait_idle()
-        if self._kernel is not None:
-            await self._kernel.shutdown()
+        """Stop producers first, then drain durable finalizers without cancelling them."""
+        self._closing = True
+        if self._recovery_task is not None:
+            self._recovery_task.cancel()
+            await asyncio.gather(self._recovery_task, return_exceptions=True)
+        try:
+            if self._live is not None and not self._live.settled_emitted:
+                try:
+                    await self.abort()
+                except Exception:
+                    _LOG.warning("runtime.shutdown_abort_failed", exc_info=True)
+            # abort may return before a terminal event (or the process may be stuck).
+            if self._live is not None and not self._live.settled_emitted:
+                self._live.error = "应用关闭，本轮已中断"
+                self._busy = False
+                self._schedule_finalize(forced_status=RunStatus.INTERRUPTED)
+            await self.wait_idle(timeout=60.0)
+        finally:
+            if self._kernel is not None:
+                await self._kernel.shutdown()
+        # Shutdown itself can enqueue a last event; storage stays open until this completes.
+        await self.wait_idle(timeout=60.0)
+
+    async def _recover_runtime(self) -> None:
+        recovery = RuntimeRecoveryCoordinator()
+        recovery.on_runtime_exited()
+        replacement: AgentKernel | None = None
+        started = False
+        self._emit("runtime_recovering", message="模型内核已退出，正在恢复；不会重发消息。")
+        try:
+            await self.wait_idle(timeout=60.0)
+            if self._closing or self.replacement_factory is None:
+                return
+            old = self._kernel
+            self._unsubscribe_kernel()
+            self._kernel = None
+            if old is not None:
+                old.set_observation_handler(None)
+                old.set_permission_handler(None)
+                await old.shutdown()
+            replacement = await self.replacement_factory()
+            if replacement is None:
+                raise RuntimeError("无法创建替代模型内核")
+            await replacement.start()
+            started = True
+            prepared = None
+            if self._active_conversation_id and self._active_branch_id:
+                prepared = await self._storage_call(
+                    "_prepare_switch", self._active_conversation_id, self._active_branch_id, None
+                )
+            if prepared is not None and prepared.snapshot is not None:
+                recovery.attach_replacement_kernel(replacement)
+                result = await recovery.recover(prepared.snapshot)
+                if not result.success:
+                    raise RuntimeError(result.error or "运行时恢复校验失败")
+                recovery.make_available()
+            elif prepared is not None and prepared.has_messages:
+                raise RuntimeError("该分支缺少已提交的运行时镜像，请切换历史会话或新建会话")
+            else:
+                await replacement.new_session()
+            if self._closing:
+                await replacement.shutdown()
+                return
+            self._kernel = replacement
+            self._unsubscribe_kernel = replacement.subscribe(
+                lambda event: self._on_kernel_event(event) if self._kernel is replacement else None
+            )
+            replacement.set_observation_handler(self._on_observation)
+            replacement.set_permission_handler(self._on_permission)
+            self._runtime_valid = True
+            self._emit("runtime_recovered", message="模型内核已恢复。中断的消息未重发。")
+        except asyncio.CancelledError:
+            if replacement is not None:
+                await replacement.shutdown()
+            raise
+        except Exception as exc:
+            if replacement is not None and started and not self._closing:
+                # Keep the process available for an explicit new-session/history
+                # switch, but never permit a send with unverified context.
+                self._kernel = replacement
+                self._unsubscribe_kernel = replacement.subscribe(
+                    lambda event: (
+                        self._on_kernel_event(event) if self._kernel is replacement else None
+                    )
+                )
+                replacement.set_observation_handler(self._on_observation)
+                replacement.set_permission_handler(self._on_permission)
+            elif replacement is not None:
+                with contextlib.suppress(Exception):
+                    await replacement.shutdown()
+            self._runtime_valid = False
+            self._emit("runtime_recovery_failed", message=redact_text(str(exc)))
 
     async def state(self) -> KernelState | None:
         if self._kernel is None:
@@ -733,19 +842,24 @@ class RunCoordinator:
     ) -> _SwitchPreparation:
         """同步读取和解密只做一遍；调用方负责把本方法放在线程中。"""
         with self._uow_factory() as uow:
+            uow.begin_read()
             conversation = uow.conversations.get(conversation_id)
             branch = uow.branches.get(branch_id)
             if conversation is None or branch is None or branch.conversation_id != conversation_id:
                 return _SwitchPreparation(valid=False)
             runs = uow.runs.list_for_conversation(conversation_id)
-            mirrors = uow.runtime.list_for_conversation(conversation_id)
+            metadata = uow.runtime.list_metadata_for_conversation(conversation_id)
             active_compression = (
                 uow.compressions.get_active(branch_id) if include_compression else None
             )
             compression_messages = (
                 branch_path.branch_messages(uow, branch_id) if active_compression else []
             )
-            leaf = branch_path.branch_leaf_entry_from_records(branch, runs, mirrors)
+            leaf = branch_path.branch_leaf_entry_from_records(branch, runs, metadata)
+            chain = branch_path.runtime_branch_path(metadata, leaf) if leaf is not None else []
+            mirrors = uow.runtime.list_for_entries(
+                conversation_id, [entry.entry_id for entry in chain]
+            )
             has_messages = (
                 known_has_messages
                 if known_has_messages is not None
@@ -760,12 +874,35 @@ class RunCoordinator:
             snapshot = uncompressed_snapshot(snapshot)
         if snapshot is not None and active_compression is not None:
             snapshot = project_compression(
-                snapshot, active_compression, compression_messages, mirrors
+                snapshot, active_compression, compression_messages, metadata
             )
         return _SwitchPreparation(
             valid=True,
             has_messages=has_messages,
             snapshot=snapshot,
+        )
+
+    async def prepare_conversation_switch(
+        self,
+        conversation_id: str,
+        branch_id: str,
+        *,
+        known_has_messages: bool | None = None,
+    ) -> ConversationSwitchPreparation:
+        """只读预准备可与显示预处理并行，不改变内核或应用定位。"""
+        await self.wait_idle()
+        revision = self._revision
+        source_location = self._active_conversation_id, self._active_branch_id
+        if self.storage_worker is not None:
+            state = await self._storage_call(
+                "_prepare_switch", conversation_id, branch_id, known_has_messages
+            )
+        else:
+            state = await run_blocking(
+                self._prepare_switch, conversation_id, branch_id, known_has_messages
+            )
+        return ConversationSwitchPreparation(
+            conversation_id, branch_id, revision, source_location, self, state
         )
 
     @_arbitrated
@@ -775,6 +912,7 @@ class RunCoordinator:
         branch_id: str,
         *,
         known_has_messages: bool | None = None,
+        preparation: ConversationSwitchPreparation | None = None,
     ) -> bool:
         """把内核与应用定位作为一次切换；缺少历史时拒绝沿用旧上下文。"""
         if self.busy:
@@ -782,12 +920,19 @@ class RunCoordinator:
         try:
             with self.runtime_transition():
                 await self.wait_idle()
-                prepared = await asyncio.to_thread(
-                    self._prepare_switch,
-                    conversation_id,
-                    branch_id,
-                    known_has_messages,
-                )
+                if not (
+                    preparation is not None
+                    and preparation.owner is self
+                    and preparation.conversation_id == conversation_id
+                    and preparation.branch_id == branch_id
+                    and preparation.revision == self._revision
+                    and preparation.source_location
+                    == (self._active_conversation_id, self._active_branch_id)
+                ):
+                    preparation = await self.prepare_conversation_switch(
+                        conversation_id, branch_id, known_has_messages=known_has_messages
+                    )
+                prepared = preparation.state
                 if not prepared.valid:
                     return False
                 snapshot = prepared.snapshot
@@ -1997,6 +2142,9 @@ class RunCoordinator:
             self._on_settled()
 
         elif kind == "runtime.exited":
+            if self._closing or not self._runtime_valid:
+                return
+            self._runtime_valid = False
             # 适配器上报进程意外退出：本轮落 interrupted，不重发
             self._emit(
                 RUN_INTERRUPTED,
@@ -2008,6 +2156,10 @@ class RunCoordinator:
             self._busy = False
             self._emit(SETTLED)
             self._schedule_finalize(forced_status=RunStatus.INTERRUPTED)
+            if self.replacement_factory is not None:
+                self._recovery_task = asyncio.create_task(self._recover_runtime())
+            else:
+                self._emit("runtime_recovery_failed", message="模型内核已退出，请重启应用。")
 
         elif kind == "extension.error":
             self._emit(ERROR, message=redact_text(str(payload.get("error", "扩展错误"))))
@@ -2521,7 +2673,10 @@ class RunCoordinator:
     ) -> list[RuntimeEntryMirror]:
         """镜像尚未记录的 Pi 条目。以 ``entry_id`` 去重，避免每轮重复堆积。"""
         with self._uow_factory() as uow:
-            known = {m.entry_id for m in uow.runtime.list_for_conversation(live.conversation_id)}
+            known = {
+                m.entry_id
+                for m in uow.runtime.list_metadata_for_conversation(live.conversation_id)
+            }
             conversation = uow.conversations.get(live.conversation_id)
         entries = isolate_conversation_entries(entries, conversation)
         now = self._tick()

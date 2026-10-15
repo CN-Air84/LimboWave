@@ -125,6 +125,9 @@ class RuntimeRestoreResult:
     restored_entry_count: int = 0
     actual_fingerprint: list[EntryFingerprint] = field(default_factory=list)
     error: str | None = None
+    # Verification of this restoration, if the adapter already read back the entries.
+    # None preserves the coordinator's validation path for other kernel implementations.
+    validation: RuntimeValidationResult | None = None
 
 
 @dataclass(frozen=True, slots=True)

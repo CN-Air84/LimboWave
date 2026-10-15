@@ -23,6 +23,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
+from limbowave.application.blob_storage import BlobReader
 from limbowave.application.repositories import UnitOfWorkFactory
 from limbowave.application.services.word_reader import (
     MAX_WORD_BYTES,
@@ -35,6 +36,7 @@ from limbowave.domain.files import (
     FileKind,
     UnsupportedFileType,
     classify_path,
+    compute_line_offsets,
     detect_encoding,
 )
 
@@ -105,7 +107,7 @@ class FileService:
         self,
         uow_factory: UnitOfWorkFactory,
         *,
-        blob_store: object | None = None,  # BlobStore，剪贴板文档用；None 则不支持剪贴板
+        blob_store: BlobReader | None = None,  # 剪贴板文档用；None 则不支持剪贴板
         default_max_lines: int = DEFAULT_MAX_LINES,
     ) -> None:
         self._uow_factory = uow_factory
@@ -126,7 +128,7 @@ class FileService:
         raw = _read_path(path)
         stat = path.stat()
         encoding, readable = _readable_content(raw, path)
-        line_offsets = _compute_line_offsets(readable)
+        line_offsets = compute_line_offsets(readable)
         content_hash = hashlib.sha256(raw).hexdigest()
 
         with self._uow_factory() as uow:
@@ -212,9 +214,6 @@ class FileService:
         if document.blob_id is not None:
             if self._blob_store is None:
                 raise FileReadError("剪贴板文档需要 blob 仓，当前未配置")
-            from limbowave.infrastructure.crypto.blob_store import BlobStore
-
-            assert isinstance(self._blob_store, BlobStore)
             return self._blob_store.get(document.blob_id)
         if document.path is None:
             raise FileReadError(f"文档 {document.id} 既没有路径也没有 blob")
@@ -229,6 +228,7 @@ class FileService:
     ) -> FileDocument:
         """内容变化后重建登记卡（新行偏移 + 新哈希），保留稳定 id。"""
         stat = Path(document.path).stat() if document.path else None
+        line_offsets = compute_line_offsets(readable)
         rebuilt = FileDocument(
             id=document.id,
             kind=document.kind,
@@ -236,12 +236,12 @@ class FileService:
             path=document.path,
             blob_id=document.blob_id,
             encoding=encoding,
-            line_count=len(_compute_line_offsets(readable)),
+            line_count=len(line_offsets),
             size_bytes=len(raw),
             content_hash=hashlib.sha256(raw).hexdigest(),
             mtime_ns=stat.st_mtime_ns if stat else document.mtime_ns,
             created_at=document.created_at,
-            line_offsets=_compute_line_offsets(readable),
+            line_offsets=line_offsets,
         )
         with self._uow_factory() as uow:
             uow.file_documents.update(rebuilt)
@@ -261,7 +261,7 @@ class FileService:
         行偏移是内容的纯函数，不持久化——每次读取从原始字节重算。
         这样 DB 往返（登记卡丢失 offsets）不影响读取正确性。
         """
-        offsets = _compute_line_offsets(raw)
+        offsets = compute_line_offsets(raw)
         total = len(offsets)
         if total == 0:
             # 空文件：申请任何范围都得空内容，实际范围如实为 (start, start-1)
@@ -302,31 +302,6 @@ class FileService:
             truncated_lines=tuple(truncated),
             changed_since_index=changed,
         )
-
-
-def _compute_line_offsets(raw: bytes) -> tuple[int, ...]:
-    """每行的起始字节偏移。混合换行符（\\r\\n / \\n / \\r）都按行界处理。
-
-    空文件返回空 tuple。末尾无换行的最后一行也计入。
-    """
-    if not raw:
-        return ()
-    offsets = [0]
-    index = 0
-    length = len(raw)
-    while index < length:
-        byte = raw[index]
-        if byte == 0x0D:  # \r（可能跟着 \n）
-            index += 2 if index + 1 < length and raw[index + 1] == 0x0A else 1
-            if index < length:
-                offsets.append(index)
-        elif byte == 0x0A:  # \n
-            index += 1
-            if index < length:
-                offsets.append(index)
-        else:
-            index += 1
-    return tuple(offsets)
 
 
 def _read_path(path: Path) -> bytes:

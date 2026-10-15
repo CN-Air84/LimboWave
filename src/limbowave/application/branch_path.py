@@ -14,10 +14,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 from limbowave.application.repositories import UnitOfWork
 from limbowave.domain.conversation import Branch, Message
 from limbowave.domain.run import RunRecord
-from limbowave.domain.runtime_mirror import RuntimeEntryMirror
+from limbowave.domain.runtime_mirror import RuntimeEntryMetadata
 
 # 分支链的深度上限：防御损坏数据里的环
 _MAX_DEPTH = 256
@@ -64,10 +66,11 @@ def current_branch(uow: UnitOfWork, conversation_id: str) -> Branch | None:
     if not branches:
         return None
 
+    summaries = uow.messages.summaries_for_branches(conversation_id)
+
     def _activity(branch: Branch) -> tuple[object, ...]:
-        own = uow.messages.list_for_branch(branch.id)
-        last = max([branch.created_at, *(m.created_at for m in own)])
-        return (last, branch.created_at, branch.id)
+        latest = summaries.get(branch.id, (0, branch.created_at))[1]
+        return (max(branch.created_at, latest), branch.created_at, branch.id)
 
     return max(branches, key=_activity)
 
@@ -84,14 +87,14 @@ def branch_leaf_entry(uow: UnitOfWork, branch_id: str) -> str | None:
     return branch_leaf_entry_from_records(
         branch,
         uow.runs.list_for_conversation(branch.conversation_id),
-        uow.runtime.list_for_conversation(branch.conversation_id),
+        uow.runtime.list_metadata_for_conversation(branch.conversation_id),
     )
 
 
 def branch_leaf_entry_from_records(
     branch: Branch,
     runs: list[RunRecord],
-    mirrors: list[RuntimeEntryMirror],
+    mirrors: Sequence[RuntimeEntryMetadata],
 ) -> str | None:
     """从已读取记录定位叶子，供切换热路径复用一次解密结果。"""
     branch_runs = sorted(
@@ -99,7 +102,7 @@ def branch_leaf_entry_from_records(
         key=lambda run: (run.created_at, run.id),
         reverse=True,
     )
-    mirrors_by_run: dict[str, list[RuntimeEntryMirror]] = {}
+    mirrors_by_run: dict[str, list[RuntimeEntryMetadata]] = {}
     for mirror in mirrors:
         if mirror.run_id is not None:
             mirrors_by_run.setdefault(mirror.run_id, []).append(mirror)
@@ -122,8 +125,41 @@ def branch_leaf_entry_from_records(
     return None
 
 
-def _mirror_leaf(mirrors: list[RuntimeEntryMirror]) -> str | None:
-    ordered = sorted(mirrors, key=lambda mirror: (mirror.captured_at, mirror.id))
-    parents = {mirror.parent_entry_id for mirror in ordered if mirror.parent_entry_id}
-    tips = [mirror for mirror in ordered if mirror.entry_id not in parents]
-    return tips[-1].entry_id if tips else None
+def _mirror_leaf(mirrors: Sequence[RuntimeEntryMetadata]) -> str | None:
+    parents = {mirror.parent_entry_id for mirror in mirrors if mirror.parent_entry_id}
+    # 原先排序后取最后一个；逆序扫描保留完全同键时“最后出现者优先”的语义。
+    tip = max(
+        (mirror for mirror in reversed(mirrors) if mirror.entry_id not in parents),
+        key=lambda mirror: (mirror.captured_at, mirror.id),
+        default=None,
+    )
+    return tip.entry_id if tip is not None else None
+
+
+def runtime_branch_path[T: RuntimeEntryMetadata](
+    mirrors: Sequence[T], leaf_entry_id: str,
+) -> list[T]:
+    """从拓扑信息选出目标祖先链；不读取正文，保持首次捕获优先的规则。"""
+    by_entry: dict[str, T] = {}
+    for mirror in mirrors:
+        previous = by_entry.get(mirror.entry_id)
+        if previous is None or (mirror.captured_at, mirror.id) < (
+            previous.captured_at, previous.id
+        ):
+            by_entry[mirror.entry_id] = mirror
+    if leaf_entry_id not in by_entry:
+        return []
+    chain: list[T] = []
+    cursor: str | None = leaf_entry_id
+    visited: set[str] = set()
+    while cursor is not None:
+        if cursor in visited:
+            raise ValueError("运行时镜像的父链存在循环，无法安全恢复")
+        visited.add(cursor)
+        current = by_entry.get(cursor)
+        if current is None:
+            break
+        chain.append(current)
+        cursor = current.parent_entry_id
+    chain.reverse()
+    return chain

@@ -314,3 +314,18 @@ def test_archive_rejects_windows_unsafe_paths(name):
 def test_archive_rejects_case_collisions():
     with pytest.raises(WrongPassword):
         unpack_archive(build_archive({"blobs/a.bin": b"x", "blobs/A.bin": b"y"}))
+
+
+def test_oversized_collection_fails_before_reading_blob(tmp_path, monkeypatch):
+    from limbowave.application.services import backup_service
+    from limbowave.domain.backup import BackupError
+
+    blobs = tmp_path / "blobs"
+    blobs.mkdir()
+    source = blobs / "large.bin"
+    source.write_bytes(b"x" * 20)
+    monkeypatch.setattr(backup_service, "MAX_BACKUP_BYTES", 10)
+    service = backup_service.BackupService(tmp_path, app_version="test", schema_version=1)
+    with pytest.raises(BackupError, match="安全预算"):
+        service.create(tmp_path / "output.lwb", "password")
+    assert not (tmp_path / "output.lwb").exists()

@@ -25,6 +25,7 @@ from limbowave.application.kernel import (
 from limbowave.application.repositories import UnitOfWorkFactory
 from limbowave.application.services.memory_service import MemoryService
 from limbowave.application.services.run_coordinator import (
+    ConversationSwitchPreparation,
     RunContext,
     RunCoordinator,
 )
@@ -191,18 +192,31 @@ class SessionController:
             known_has_messages=known_has_messages,
         )
 
+    async def prepare_conversation_switch(
+        self,
+        conversation_id: str,
+        branch_id: str,
+        *,
+        known_has_messages: bool | None = None,
+    ) -> ConversationSwitchPreparation:
+        return await self._coordinator.prepare_conversation_switch(
+            conversation_id, branch_id, known_has_messages=known_has_messages
+        )
+
     async def switch_conversation(
         self,
         conversation_id: str,
         branch_id: str,
         *,
         known_has_messages: bool | None = None,
+        preparation: ConversationSwitchPreparation | None = None,
     ) -> bool:
         """恢复目标分支上下文后才更新应用定位。"""
         return await self._coordinator.switch_conversation(
             conversation_id,
             branch_id,
             known_has_messages=known_has_messages,
+            preparation=preparation,
         )
 
     # ---------- 逃生舱 ----------

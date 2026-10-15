@@ -18,10 +18,9 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from uuid import uuid4
 
+from limbowave.application.blob_storage import BlobStore
 from limbowave.application.repositories import UnitOfWorkFactory
-from limbowave.application.services.file_service import _compute_line_offsets
-from limbowave.domain.files import FileDocument, FileKind
-from limbowave.infrastructure.crypto.blob_store import BlobStore
+from limbowave.domain.files import FileDocument, FileKind, compute_line_offsets
 
 
 class DocumentInUse(Exception):
@@ -41,6 +40,7 @@ class ClipboardService:
             raise ValueError("剪贴板内容为空")
         raw = text.encode("utf-8")
         blob_id = self._blob_store.put(raw)
+        line_offsets = compute_line_offsets(raw)
         document = FileDocument(
             id=f"clip_{uuid4().hex[:16]}",
             kind=FileKind.CLIPBOARD,
@@ -48,7 +48,8 @@ class ClipboardService:
             created_at=datetime.now(UTC),
             blob_id=blob_id,
             encoding="utf-8",
-            line_count=len(_compute_line_offsets(raw)),
+            line_count=len(line_offsets),
+            line_offsets=line_offsets,
             size_bytes=len(raw),
             content_hash=hashlib.sha256(raw).hexdigest(),
         )

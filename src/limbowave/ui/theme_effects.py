@@ -251,6 +251,9 @@ class _HoverSuspension(QObject):
         self.settings = settings
         self._animations: dict[QWidget, QVariantAnimation] = {}
         self._original_styles: dict[QWidget, str] = {}
+        self._install_timer = QTimer(self)
+        self._install_timer.setSingleShot(True)
+        self._install_timer.timeout.connect(self.install_new_children)
         root.installEventFilter(self)
         self.install_new_children()
 
@@ -262,6 +265,8 @@ class _HoverSuspension(QObject):
                 self._restore(widget)
 
     def install_new_children(self) -> None:
+        # A settings refresh also consumes any deferred install for this batch.
+        self._install_timer.stop()
         for widget in self.root.findChildren(QWidget):
             if isinstance(widget, QComboBox):
                 # Combo frames animate regardless of the hover-suspension material switch.
@@ -286,8 +291,9 @@ class _HoverSuspension(QObject):
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
         if watched is self.root:
-            if event.type() == QEvent.Type.ChildAdded:
-                QTimer.singleShot(0, self.install_new_children)
+            if event.type() == QEvent.Type.ChildAdded and not self._install_timer.isActive():
+                # Wait for child construction, coalesce the batch, and cancel on destruction.
+                self._install_timer.start(0)
             return False
         if (
             not isinstance(watched, self._TYPES)

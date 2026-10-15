@@ -59,7 +59,8 @@ async def test_late_history_search_does_not_replace_new_query():
     applied = []
     reader = HistoryReader()
 
-    def search(text):
+    def search(text, *, limit=200, cancelled=lambda: False):
+        assert limit == 200
         entered.set()
         release.wait(3)
         return []
@@ -72,8 +73,11 @@ async def test_late_history_search_does_not_replace_new_query():
     search_callback = app_callback("_search_history", namespace)
     task = asyncio.create_task(search_callback())
     try:
-        while not entered.is_set():
-            await asyncio.sleep(.001)
+        async with asyncio.timeout(3):
+            while not entered.is_set():
+                if task.done():
+                    await task
+                await asyncio.sleep(.001)
         namespace["history_list_generation"] = 2
         release.set()
         await task

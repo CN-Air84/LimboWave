@@ -1069,7 +1069,7 @@ def _stylesheet() -> str:
     QLabel#oobeRailTitle {{
         color: {theme.TEXT_PRIMARY};
         font-family: {family};
-        font-size: 15px;
+        font-size: {theme.FS_TITLE}px;
         font-weight: 600;
         padding-left: 8px;
     }}
@@ -1120,18 +1120,18 @@ def _stylesheet() -> str:
     QLabel#oobeTitle {{
         color: {theme.TEXT_PRIMARY};
         font-family: {family};
-        font-size: 28px;
+        font-size: {theme.FS_TITLE * 2 - 2}px;
         font-weight: 600;
     }}
     QLabel#oobeBody, QLabel#oobeConsole {{
         color: {theme.TEXT_SECONDARY};
         font-family: {family};
-        font-size: 15px;
+        font-size: {theme.FS_TITLE}px;
     }}
     QLabel#oobeIntroParagraph {{
         color: {theme.TEXT_PRIMARY};
         font-family: {family};
-        font-size: 16px;
+        font-size: {theme.FS_TITLE + 1}px;
     }}
     QLabel#oobeHint, QLabel#oobeWelcomeNote, QLabel#oobeCaption {{
         color: {theme.TEXT_SECONDARY};
@@ -1141,13 +1141,13 @@ def _stylesheet() -> str:
     QLabel#oobeStepIndex {{
         color: {theme.ACCENT};
         font-family: {family};
-        font-size: 16px;
+        font-size: {theme.FS_TITLE + 1}px;
         font-weight: 600;
     }}
     QLabel#oobeStepLabel {{
         color: {theme.TEXT_PRIMARY};
         font-family: {family};
-        font-size: 16px;
+        font-size: {theme.FS_TITLE + 1}px;
     }}
     QLabel#oobeAddressValue, QLabel#oobeSecret {{
         color: {theme.TEXT_PRIMARY};
@@ -1156,7 +1156,7 @@ def _stylesheet() -> str:
     }}
     QComboBox#oobeMoreCombo {{
         font-family: {family};
-        font-size: 14px;
+        font-size: {theme.FS_BASE + 1}px;
     }}
     QComboBox#oobeMoreCombo[selected="true"] {{
         background: {theme.qss_alpha(theme.ACCENT, 0.14)};
@@ -1177,7 +1177,7 @@ def _stylesheet() -> str:
     QLabel#oobeProviderName {{
         color: {theme.TEXT_PRIMARY};
         font-family: {family};
-        font-size: 14px;
+        font-size: {theme.FS_BASE + 1}px;
         font-weight: 600;
     }}
     QLabel#oobeProviderDetail {{

@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any
@@ -71,14 +72,8 @@ class HistoryService:
         with self._uow_factory() as uow:
             summaries: list[ConversationSummary] = []
             for conversation in uow.conversations.list_all():
-                count = 0
-                last = conversation.created_at
-                for branch in uow.branches.list_for_conversation(conversation.id):
-                    messages = uow.messages.list_for_branch(branch.id)
-                    count += len(messages)
-                    for message in messages:
-                        if message.created_at > last:
-                            last = message.created_at
+                count, latest = uow.messages.summary_for_conversation(conversation.id)
+                last = max(conversation.created_at, latest or conversation.created_at)
                 summaries.append(
                     ConversationSummary(
                         conversation=conversation,
@@ -123,9 +118,10 @@ class HistoryService:
             if conversation is None:
                 return []
             branches = uow.branches.list_for_conversation(conversation_id)
+            summaries = uow.messages.summaries_for_branches(conversation_id)
             out: list[tuple[str, str, int]] = []
             for branch in branches:
-                count = uow.messages.count_for_branch(branch.id)
+                count = summaries.get(branch.id, (0, branch.created_at))[0]
                 label = branch.title or f"{branch.created_at.astimezone():%m-%d %H:%M} 新分支"
                 out.append((branch.id, label, count))
             return out
@@ -191,16 +187,34 @@ class HistoryService:
         *,
         start: datetime | None = None,
         end: datetime | None = None,
+        limit: int = 200,
+        cancelled: Callable[[], bool] = lambda: False,
     ) -> list[SearchHit]:
         """搜索标题、用户消息、助手最终回答。空查询返回空。"""
         query = query.strip()
-        if not query:
+        if not query or limit < 1 or cancelled():
             return []
         needle = query.casefold()
+
+        def messages(conversation_id: str, branch_id: str) -> Iterator[Message]:
+            before = None
+            while not cancelled():
+                page = uow.messages.page_history(
+                    conversation_id, branch_id, limit=50, before=before,
+                )
+                if not page:
+                    return
+                for message in page:
+                    if cancelled():
+                        return
+                    yield message
+                before = page[-1].created_at, page[-1].id
 
         hits: list[SearchHit] = []
         with self._uow_factory() as uow:
             for conversation in uow.conversations.list_all():
+                if cancelled():
+                    return []
                 # 标题命中（不受时间筛选——标题属于会话本身）
                 if needle in conversation.title.casefold():
                     hits.append(
@@ -213,7 +227,9 @@ class HistoryService:
                     )
 
                 for branch in uow.branches.list_for_conversation(conversation.id):
-                    for message in uow.messages.list_for_branch(branch.id):
+                    for message in messages(conversation.id, branch.id):
+                        if len(hits) >= limit:
+                            return hits[:limit]
                         if not _in_range(message.created_at, start, end):
                             continue
                         # 只搜用户消息与助手终答；partial 的助手消息也算"最终回答"
@@ -233,7 +249,7 @@ class HistoryService:
                                     snippet=_snippet(message.content, query),
                                 )
                             )
-        return hits
+        return hits[:limit]
 
 
 def _in_range(moment: datetime, start: datetime | None, end: datetime | None) -> bool:

@@ -364,6 +364,7 @@ class PiKernelAdapter(AgentKernel):
                 success=True,
                 restored_entry_count=len(snapshot.entries),
                 error=None,
+                validation=validation,
             )
         except Exception as exc:
             return RuntimeRestoreResult(

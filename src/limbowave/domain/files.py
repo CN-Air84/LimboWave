@@ -131,3 +131,31 @@ def detect_encoding(raw: bytes) -> tuple[str, str]:
     except UnicodeDecodeError:
         pass
     return "utf-8?", raw.decode("utf-8", errors="replace")
+
+
+# ---------- 稳定行号 ----------
+
+
+def compute_line_offsets(raw: bytes) -> tuple[int, ...]:
+    """每行的起始字节偏移。混合换行符（\\r\\n / \\n / \\r）都按行界处理。
+
+    空文件返回空 tuple。末尾无换行的最后一行也计入。
+    """
+    if not raw:
+        return ()
+    offsets = [0]
+    index = 0
+    length = len(raw)
+    while index < length:
+        byte = raw[index]
+        if byte == 0x0D:  # \r（可能跟着 \n）
+            index += 2 if index + 1 < length and raw[index + 1] == 0x0A else 1
+            if index < length:
+                offsets.append(index)
+        elif byte == 0x0A:  # \n
+            index += 1
+            if index < length:
+                offsets.append(index)
+        else:
+            index += 1
+    return tuple(offsets)

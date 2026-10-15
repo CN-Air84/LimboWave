@@ -22,9 +22,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
+from limbowave.application.blob_storage import BlobStore
 from limbowave.application.repositories import UnitOfWorkFactory
 from limbowave.domain.files import ImageAttachment, ImageFormat
-from limbowave.infrastructure.crypto.blob_store import BlobStore
 
 
 class ImageError(Exception):

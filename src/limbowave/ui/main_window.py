@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 import time
+from collections.abc import Callable
 from dataclasses import replace
 
 from PySide6.QtCore import (
@@ -655,7 +656,15 @@ class MainWindow(QMainWindow):
             pane.update()
         self._popup_materials.set_theme(definition)
 
+    _close_guard: Callable[[], bool] | None = None
+
+    def set_close_guard(self, guard: Callable[[], bool]) -> None:
+        self._close_guard = guard
+
     def closeEvent(self, event: QCloseEvent) -> None:
+        if self._close_guard is not None and not self._close_guard():
+            event.ignore()
+            return
         page = self._full_page
         resolver = getattr(page, "resolve_pending_changes", None)
         if callable(resolver) and not resolver():

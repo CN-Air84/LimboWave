@@ -20,6 +20,12 @@ from dataclasses import dataclass
 # 当前 schema 版本。新增迁移时递增。
 CURRENT_VERSION = 13
 
+MIGRATION_RECOVERY_MESSAGE = (
+    "资料库升级失败，应用未继续打开资料库。请先保留当前数据目录及备份，"
+    "检查磁盘空间、目录权限并关闭其他实例；仍无法升级时，请从已验证的备份恢复。"
+    "不要删除数据库或反复重建资料库。"
+)
+
 
 @dataclass(frozen=True, slots=True)
 class Migration:

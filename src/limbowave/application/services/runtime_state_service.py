@@ -14,6 +14,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from limbowave.application.branch_path import runtime_branch_path
 from limbowave.application.repositories import UnitOfWorkFactory
 from limbowave.application.services.compression_context import without_application_compactions
 from limbowave.domain.conversation import Conversation
@@ -72,7 +73,12 @@ class RuntimeStateService:
         不应出现在恢复后的上下文里。叶子不存在返回 None。
         """
         with self._uow_factory() as uow:
-            mirrors = uow.runtime.list_for_conversation(conversation_id)
+            uow.begin_read()
+            metadata = uow.runtime.list_metadata_for_conversation(conversation_id)
+            chain = runtime_branch_path(metadata, leaf_entry_id)
+            mirrors = uow.runtime.list_for_entries(
+                conversation_id, [entry.entry_id for entry in chain]
+            )
             conversation = uow.conversations.get(conversation_id)
         return self.build_branch_snapshot_from_records(conversation, mirrors, leaf_entry_id)
 
@@ -83,30 +89,9 @@ class RuntimeStateService:
         leaf_entry_id: str,
     ) -> RuntimeStateSnapshot | None:
         """从调用方已读取的镜像构建分支快照，避免切换时重复解密同批记录。"""
-        if not mirrors:
+        chain = runtime_branch_path(mirrors, leaf_entry_id)
+        if not chain:
             return None
-
-        by_entry: dict[str, RuntimeEntryMirror] = {}
-        for mirror in sorted(mirrors, key=lambda m: (m.captured_at, m.id)):
-            by_entry.setdefault(mirror.entry_id, mirror)  # 去重：取首次捕获
-
-        if leaf_entry_id not in by_entry:
-            return None
-
-        # 回溯到根
-        chain: list[RuntimeEntryMirror] = []
-        cursor: str | None = leaf_entry_id
-        visited: set[str] = set()
-        while cursor is not None:
-            if cursor in visited:
-                raise ValueError("运行时镜像的父链存在循环，无法安全恢复")
-            visited.add(cursor)
-            current = by_entry.get(cursor)
-            if current is None:
-                break
-            chain.append(current)
-            cursor = current.parent_entry_id
-        chain.reverse()
 
         entries: list[dict[str, Any]] = []
         for mirror in chain:
@@ -167,6 +152,8 @@ def isolate_conversation_entries(
         return []
     by_id = {str(e["id"]): e for e in entries}
     kept: dict[str, dict[str, Any]] = {}
+    # 同一祖先只判定一次；局部缓存同时支持乱序镜像、深链和无安全根的环。
+    belongs_to_conversation = dict.fromkeys(roots, True)
     for entry in entries:
         # 这些是 Pi 恢复所需的配置，不进入对话文本；删除会让 Pi 自动补条目，破坏指纹。
         if entry.get("type") in {"model_change", "thinking_level_change"}:
@@ -177,21 +164,28 @@ def isolate_conversation_entries(
             continue
         cursor: str | None = str(entry["id"])
         visited: set[str] = set()
-        while cursor in by_id and cursor not in visited:
-            if cursor in roots:
-                kept[str(entry["id"])] = dict(entry)
-                break
+        while (cursor is not None and cursor in by_id
+               and cursor not in belongs_to_conversation and cursor not in visited):
             visited.add(cursor)
             cursor = by_id[cursor].get("parentId")
+        belongs = cursor is not None and belongs_to_conversation.get(cursor, False)
+        belongs_to_conversation.update(dict.fromkeys(visited, belongs))
+        if belongs:
+            kept[str(entry["id"])] = dict(entry)
 
-    # 被移除的旧祖先/摘要不得作为新根的 parentId；其余合法父子链与工具消息保留。
+    # 被移除的旧祖先/摘要不得作为新根的 parentId；共享的移除前缀只回溯一次。
+    retained_parent: dict[str, str | None] = {}
     for entry in kept.values():
         parent = entry.get("parentId")
         visited = set()
         while parent is not None and parent not in kept:
+            if parent in retained_parent:
+                parent = retained_parent[parent]
+                break
             if parent in visited:
                 raise ValueError("运行时镜像的父链存在循环，无法安全恢复")
             visited.add(parent)
             parent = by_id.get(parent, {}).get("parentId")
+        retained_parent.update(dict.fromkeys(visited, parent))
         entry["parentId"] = parent
     return list(kept.values())

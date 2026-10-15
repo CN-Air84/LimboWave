@@ -1874,6 +1874,7 @@ class ComposerDraft:
     text: str = ""
     attachments: tuple[DraftAttachment, ...] = ()
     editing_message_id: str | None = None
+    before_edit: ComposerDraft | None = None
 
 
 class ChatView(QWidget):
@@ -2117,17 +2118,18 @@ class ChatView(QWidget):
 
         # 编辑已发送消息时的提示条：输入框与附件栏借给这次编辑，发送即分叉
         self._editing_id: str | None = None
+        self._before_edit: ComposerDraft | None = None
         self._edit_banner = QWidget()
         banner_layout = QHBoxLayout(self._edit_banner)
         banner_layout.setContentsMargins(0, 0, 0, 0)
         banner_layout.setSpacing(6)
-        banner_label = QLabel("正在编辑已发送的消息，发送后将分叉为新分支")
+        banner_label = QLabel("编辑历史消息：发送创建新分支，取消恢复原草稿")
+        banner_label.setWordWrap(True)
         banner_label.setStyleSheet(
             f"color: {theme.TEXT_SECONDARY}; font-size: {theme.FS_SMALL}px;"
             " background: transparent;"
         )
-        banner_layout.addWidget(banner_label)
-        banner_layout.addStretch(1)
+        banner_layout.addWidget(banner_label, 1)
         cancel_edit = QPushButton("取消编辑")
         cancel_edit.setProperty("flat", True)
         cancel_edit.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -2135,6 +2137,7 @@ class ChatView(QWidget):
         banner_layout.addWidget(cancel_edit)
         self._edit_banner.setVisible(False)
         text_column.addWidget(self._edit_banner)
+
 
         self._draft_notice = QLabel()
         self._draft_notice.setWordWrap(True)
@@ -2144,6 +2147,7 @@ class ChatView(QWidget):
         )
         self._draft_notice.setVisible(self._draft_only)
         text_column.addWidget(self._draft_notice)
+
 
         self._queue_panel = SendQueuePanel()
         self._queue_panel.cancel_requested.connect(self.queue_cancel_requested.emit)
@@ -2162,7 +2166,8 @@ class ChatView(QWidget):
         self._input.paste_generation = lambda: (
             bar.generation if (bar := attachment_ref()) is not None else -1
         )
-        self._input.setPlaceholderText(" ")
+        self._input.setPlaceholderText("写下你的想法…（Ctrl+Enter 发送，Enter 换行）")
+        self._input.setAccessibleName("消息输入框")
         self._input.setMinimumHeight(54)
         self._input.setMaximumHeight(120)
         self._input.setTabChangesFocus(True)
@@ -2261,6 +2266,7 @@ class ChatView(QWidget):
         self._stop_btn.setFixedSize(36, 36)
         self._stop_btn.setProperty("iconOnly", True)
         self._stop_btn.setToolTip("停止生成")
+        self._stop_btn.setAccessibleName("停止生成")
         self._stop_btn.setVisible(False)
         self._stop_btn.clicked.connect(self.stop_requested.emit)
         tools.addWidget(self._stop_btn)
@@ -2270,6 +2276,7 @@ class ChatView(QWidget):
         self._send_btn.setProperty("accent", True)
         self._send_btn.setProperty("iconOnly", True)
         self._send_btn.setDefault(True)
+        self._send_btn.setAccessibleName("发送")
         self._send_btn.setToolTip("发送（Ctrl+Enter）")
         self._send_btn.clicked.connect(self._on_send)
         tools.addWidget(self._send_btn)
@@ -2325,6 +2332,7 @@ class ChatView(QWidget):
         if editing_id is not None:
             # 附件栏留给上层装配载荷后再清空（与普通发送一致）
             self._set_editing(None)
+            self._before_edit = None
             self.edit_submitted.emit(editing_id, text)
             return
         self.message_submitted.emit(text)
@@ -2344,11 +2352,13 @@ class ChatView(QWidget):
 
     def snapshot_draft(self) -> ComposerDraft:
         return ComposerDraft(
-            self._input.toPlainText(), self._attachment_bar.snapshot(), self._editing_id
+            self._input.toPlainText(), self._attachment_bar.snapshot(), self._editing_id,
+            self._before_edit,
         )
 
     def set_draft(self, draft: ComposerDraft) -> None:
         """Replace only composer state when its conversation/branch changes."""
+        self._before_edit = draft.before_edit
         self._attachment_bar.restore(draft.attachments)
         self._set_editing(draft.editing_message_id)
         self._input.setPlainText(draft.text)
@@ -2387,7 +2397,9 @@ class ChatView(QWidget):
         return self._editing_id
 
     def begin_edit(self, message_id: str, text: str) -> None:
-        """把原文放进输入框进入编辑态；附件栏由上层预先填好原附件，可照常增删。"""
+        """先保存新消息草稿，再进入编辑态；上层随后替换为旧消息附件。"""
+        if self._editing_id is None:
+            self._before_edit = self.snapshot_draft()
         self._set_editing(message_id)
         self._input.setPlainText(text)
         cursor = self._input.textCursor()
@@ -2396,12 +2408,11 @@ class ChatView(QWidget):
         self._input.setFocus()
 
     def cancel_edit(self) -> None:
-        """放弃编辑：清掉借用的输入框与附件栏。"""
+        """放弃本次编辑，恢复借用输入框前的文字和附件。"""
         if self._editing_id is None:
             return
-        self._set_editing(None)
-        self._input.clear()
-        self._attachment_bar.clear()
+        self.set_draft(self._before_edit or ComposerDraft())
+        self._input.setFocus()
 
     def _set_editing(self, message_id: str | None) -> None:
         self._editing_id = message_id
@@ -2581,16 +2592,22 @@ class ChatView(QWidget):
         self._sync_input_enabled()
         if available:
             self.set_status("就绪")
-        else:
-            self.set_status(hint or "未配置可用的模型内核")
+        elif not self._read_only:
+            reason = hint or "暂无可用模型，请在设置中配置站点和模型。"
+            self.set_status(f"{reason}\n可先编辑文字草稿，恢复后需手动发送。")
 
     def _sync_input_enabled(self) -> None:
-        """输入框、附件与权限按钮：内核可用且不在压缩中才可操作。"""
+        """模型不可用不应阻止文字草稿；附件和权限仍须通过可用性检查。"""
         enabled = (
             self._available and not self._compressing and not self._history_loading
             and not self._read_only
         )
-        self._input.setEnabled(enabled or (self._draft_only and not self._history_loading))
+        self._input.setEnabled(
+            not self._compressing and not self._history_loading
+            and (not self._read_only or self._draft_only)
+        )
+        self._input.attachments_enabled = enabled
+        self._composer.setAcceptDrops(enabled)
         self._attach_btn.setEnabled(enabled)
         self._permission_btn.setEnabled(enabled)
         self._sync_send_button()
@@ -2635,7 +2652,7 @@ class ChatView(QWidget):
         return self._status_text
 
     def set_status(self, text: str) -> None:
-        """输入框上方的状态栏已移除；保留入口给上层现有调用，文本只记录不展示。"""
+        """仅记录最近一次状态文本；界面不再显示操作提示条。"""
         self._status_text = text
 
     # ---------- 压缩进度（整个输入框当进度条） ----------

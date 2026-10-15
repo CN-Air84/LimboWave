@@ -416,3 +416,38 @@ def test_hiding_model_info_does_not_redact_message_content(
         uow.commit()
     [path] = export.export_selection(["b1"], fmt, tmp_path / "body")
     assert text in path.read_text(encoding="utf-8")
+
+
+def test_export_counts_only_successfully_embedded_images(seeded, tmp_path: Path) -> None:
+    """A present but corrupt blob is not an embedded image."""
+    _, factory, _ = seeded
+
+    class UnreadableBlobs:
+        def get(self, blob_id: str) -> bytes:
+            raise ValueError("corrupt blob")
+
+        def exists(self, blob_id: str) -> bool:
+            return True
+
+    result = ExportService(factory, UnreadableBlobs()).export_branch("b1", tmp_path / "bad.html")
+    page = result.path.read_text(encoding="utf-8")
+    assert '<figure>' not in page
+    assert result.image_count == 0
+
+
+def test_export_needs_only_get_and_reads_each_image_once(seeded, tmp_path: Path) -> None:
+    _, factory, _ = seeded
+
+    class Reader:
+        def __init__(self) -> None:
+            self.reads: list[str] = []
+
+        def get(self, blob_id: str) -> bytes:
+            self.reads.append(blob_id)
+            return _make_png()
+
+    reader = Reader()
+    result = ExportService(factory, reader).export_branch("b1", tmp_path / "read.html")
+    page = result.path.read_text(encoding="utf-8")
+    assert page.count('<figure>') == result.image_count == 1
+    assert len(reader.reads) == 1

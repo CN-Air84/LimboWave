@@ -201,9 +201,12 @@ class RuntimeRecoveryCoordinator:
                 from_mirror_entry_count=len(snapshot.entries),
             )
 
-        # 校验：重新读 entries，与期望快照做语义比对
+        # Reuse the adapter's read-back verification for this restoration, if supplied.
+        # Other kernels still need a separate semantic check; success alone is not enough.
         self._phase = RecoveryState.RESTORING
-        validation = await kernel.validate_runtime_state(snapshot)
+        validation = getattr(restore_result, "validation", None)
+        if validation is None:
+            validation = await kernel.validate_runtime_state(snapshot)
         if not validation.valid:
             self._phase = RecoveryState.RECOVERY_FAILED
             return RecoveryResult(

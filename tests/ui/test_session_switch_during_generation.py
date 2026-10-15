@@ -299,7 +299,7 @@ async def test_completion_during_failed_navigation_activates_previous_selection(
 
     async def slow_missing_read(reader, operation, *args, **kwargs):
         result = await original(reader, operation, *args, **kwargs)
-        if operation.__name__ == "_read_history_view" and args[0] == "missing":
+        if operation is app.load_history_view and args[1] == "missing":
             entered.set()
             await release.wait()
         return result

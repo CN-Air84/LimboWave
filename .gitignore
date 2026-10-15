@@ -38,3 +38,7 @@ htmlcov/
 /web/playwright-report/
 /web/test-results/
 /src/limbowave/web/static/
+
+# Test temp dirs used when the host temp root is unavailable
+/.pytest-tmp*/
+/.tmp/

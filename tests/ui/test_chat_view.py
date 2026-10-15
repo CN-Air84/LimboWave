@@ -222,12 +222,12 @@ def test_busy_toggles_buttons(qtbot: QtBot) -> None:
     assert view._send_btn.isEnabled()
 
 
-def test_unavailable_disables_input(qtbot: QtBot) -> None:
+def test_unavailable_disables_send_but_keeps_draft_editable(qtbot: QtBot) -> None:
     view = ChatView()
     qtbot.addWidget(view)
 
     view.set_available(False, "未配置")
-    assert not view._input.isEnabled()
+    assert view._input.isEnabled()
     assert not view._send_btn.isEnabled()
 
 
@@ -453,8 +453,8 @@ def test_edit_in_composer_submits_edit_and_cancel_clears(qtbot: QtBot) -> None:
     """编辑态借用输入框：发送走 edit_submitted（附件栏保留给上层装配），取消清空。"""
     view = ChatView()
     qtbot.addWidget(view)
-    view.attachments.add_attachment("doc-1", "a.md", "3 行")
     view.begin_edit("m1", "原文")
+    view.attachments.add_attachment("doc-1", "a.md", "3 行")
     assert view.editing_message_id == "m1"
     assert view._input.toPlainText() == "原文"
 
@@ -463,6 +463,7 @@ def test_edit_in_composer_submits_edit_and_cancel_clears(qtbot: QtBot) -> None:
     assert blocker.args == ["m1", "原文"]
     assert view.editing_message_id is None
     assert view.attachments.attachment_ids() == ["doc-1"]
+    view.attachments.clear()  # The application consumes the submitted attachments.
 
     view.begin_edit("m1", "原文")
     view.cancel_edit()

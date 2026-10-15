@@ -56,7 +56,8 @@ def test_loading_animation_preserves_draft_and_availability(qtbot: QtBot) -> Non
     qtbot.waitUntil(overlay.isHidden)
     assert not overlay._timer.isActive()
     assert overlay.isHidden()
-    assert not view._input.isEnabled()
+    assert view._input.isEnabled()  # Model availability gates sending, not drafting.
+    assert not view._send_btn.isEnabled()
     view.set_available(True)
     assert view._send_btn.isEnabled()
 
@@ -468,3 +469,130 @@ def test_send_preparation_locks_without_loading_animation(qtbot):
     view.set_history_loading(True)
     qtbot.waitUntil(view._history_loading_overlay.isVisible)
     view.set_history_loading(False)
+
+
+async def test_display_and_runtime_preparation_overlap_without_switching_early(
+    qtbot: QtBot, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    window, controller, shutdown = _wire(qtbot, monkeypatch, tmp_path)
+    display_entered, runtime_entered = threading.Event(), threading.Event()
+    release = threading.Event()
+    worker_ids: list[int] = []
+    coordinator = controller.coordinator()
+    prepare = coordinator._prepare_switch
+    render = markdown_render.render
+    preparations = []
+
+    def slow_prepare(*args, **kwargs):
+        preparations.append(args)
+        worker_ids.append(threading.get_ident())
+        runtime_entered.set()
+        assert release.wait(5)
+        return prepare(*args, **kwargs)
+
+    def slow_render(text):
+        worker_ids.append(threading.get_ident())
+        display_entered.set()
+        assert release.wait(5)
+        return render(text)
+
+    monkeypatch.setattr(coordinator, "_prepare_switch", slow_prepare)
+    monkeypatch.setattr(markdown_render, "render", slow_render)
+    window.chat.add_user_message("原会话")
+    try:
+        window.sidebar.conversation_selected.emit("c1")
+        # 两项都要在释放任何一项之前开始，避免依赖机器速度的耗时断言。
+        await _until(lambda: display_entered.is_set() and runtime_entered.is_set())
+        assert len(set(worker_ids)) == 2
+        assert threading.get_ident() not in worker_ids
+        assert window.chat.history_loading
+        assert controller.conversation_id is None
+        assert window.chat._rows[0].content_text() == "原会话"
+        release.set()
+        await _until(lambda: not window.chat.history_loading)
+        assert len(preparations) == 1  # 提交切换复用预读，不再解密一次。
+        assert controller.conversation_id == "c1"
+        assert [row.content_text() for row in window.chat._rows] == ["问题", "回答"]
+    finally:
+        release.set()
+        await shutdown()
+
+
+async def test_display_failure_waits_for_runtime_reader_and_preserves_old_session(
+    qtbot: QtBot, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    window, controller, shutdown = _wire(qtbot, monkeypatch, tmp_path)
+    runtime_entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+    coordinator = controller.coordinator()
+    prepare = coordinator._prepare_switch
+
+    def slow_prepare(*args, **kwargs):
+        runtime_entered.set()
+        assert release.wait(5)
+        try:
+            return prepare(*args, **kwargs)
+        finally:
+            finished.set()
+
+    def failed_render(_text):
+        assert runtime_entered.wait(5)
+        raise RuntimeError("显示预处理失败")
+
+    monkeypatch.setattr(coordinator, "_prepare_switch", slow_prepare)
+    monkeypatch.setattr(markdown_render, "render", failed_render)
+    window.chat.add_user_message("原会话")
+    window.chat._input.setPlainText("保留草稿")
+    try:
+        window.sidebar.conversation_selected.emit("c1")
+        await _until(runtime_entered.is_set)
+        await asyncio.sleep(0.02)
+        assert window.chat.history_loading
+        assert not finished.is_set()
+        assert controller.conversation_id is None
+        release.set()
+        await _until(lambda: not window.chat.history_loading)
+        assert finished.is_set()
+        assert controller.conversation_id is None
+        assert window.chat._rows[0].content_text() == "原会话"
+        assert window.chat._input.toPlainText() == "保留草稿"
+        assert window.sidebar._list.isEnabled()
+    finally:
+        release.set()
+        await shutdown()
+
+
+async def test_shutdown_drains_parallel_runtime_preparation(
+    qtbot: QtBot, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    window, controller, shutdown = _wire(qtbot, monkeypatch, tmp_path)
+    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+    coordinator = controller.coordinator()
+    prepare = coordinator._prepare_switch
+
+    def slow_prepare(*args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        try:
+            return prepare(*args, **kwargs)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(coordinator, "_prepare_switch", slow_prepare)
+    closing = None
+    try:
+        window.sidebar.conversation_selected.emit("c1")
+        await _until(entered.is_set)
+        closing = asyncio.create_task(shutdown())
+        await asyncio.sleep(0.02)
+        assert not closing.done()
+        release.set()
+        await closing
+        assert finished.is_set()
+        assert controller.conversation_id is None
+        assert not window.chat.history_loading
+    finally:
+        release.set()
+        if closing is None:
+            await shutdown()
+        else:
+            await closing

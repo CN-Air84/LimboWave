@@ -114,6 +114,7 @@ class ConversationProcess:
         self._closed = False
 
     async def warm(self) -> int:
+        """Optional diagnostic/prewarm hook; production intentionally starts lazily."""
         return int(await self.call("pid", (None, None)))
 
     async def call(

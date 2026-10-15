@@ -31,11 +31,11 @@ from pygments.formatters import HtmlFormatter
 from pygments.lexers import get_lexer_by_name
 from pygments.util import ClassNotFound
 
+from limbowave.application.blob_storage import BlobReader
 from limbowave.application.branch_path import branch_messages
 from limbowave.application.repositories import UnitOfWork, UnitOfWorkFactory
 from limbowave.domain.conversation import Message
 from limbowave.domain.run import RunRecord
-from limbowave.infrastructure.crypto.blob_store import BlobStore
 
 PRIVACY_NOTICE = (
     "导出的文件是**明文文件**，不加密。\n"
@@ -88,7 +88,7 @@ class ExportService:
     """把一条分支导出成单文件 HTML。只读，不改任何数据。"""
 
     def __init__(
-        self, uow_factory: UnitOfWorkFactory, blob_store: BlobStore | None,
+        self, uow_factory: UnitOfWorkFactory, blob_store: BlobReader | None,
         *, model_names: Mapping[str, str] | None = None,
         endpoint_names: Mapping[str, str] | None = None,
         include_model_info: bool = False,
@@ -250,17 +250,13 @@ class ExportService:
         }
 
         body_parts: list[str] = []
-        counted_runs: set[str] = set()
         images_embedded = 0
         for message in messages:
             run = runs.get(message.id) or run_by_assistant.get(message.id)
-            body_parts.append(self._render_message(uow, message, run))
-            # 图片按 run 去重计数（一个 run 的两条消息不是两张图）
-            if run is not None and message.role.value == "user":
-                run_id = run.id
-                if run_id not in counted_runs:
-                    counted_runs.add(run_id)
-                    images_embedded += self._count_images(uow, run)
+            rendered, image_count = self._render_message(uow, message, run)
+            body_parts.append(rendered)
+            # Count the successfully rendered images, not a second existence check.
+            images_embedded += image_count
 
         page = _PAGE_TEMPLATE.format(
             title=html.escape(title),
@@ -272,7 +268,10 @@ class ExportService:
         )
         return page, {"messages": len(messages), "images": images_embedded}
 
-    def _render_message(self, uow: UnitOfWork, message: Message, run: RunRecord | None) -> str:
+    def _render_message(
+        self, uow: UnitOfWork, message: Message, run: RunRecord | None
+    ) -> tuple[str, int]:
+        image_count = 0
         role = message.role.value
         content = message.content
         thinking = message.thinking
@@ -292,21 +291,21 @@ class ExportService:
             # 图片挂在**用户**消息下（附件是那一轮用户带的）；溯源信息挂在**助手**
             # 消息下。两者分开渲染——否则同一个 run 的两条消息会把图片嵌两遍。
             if role == "user":
-                images = self._render_images(uow, run)
+                images, image_count = self._render_images(uow, run)
                 if images:
                     parts.append(images)
             else:
                 parts.extend(self._render_provenance(uow, run))
         parts.append("</article>")
-        return "\n".join(parts)
+        return "\n".join(parts), image_count
 
-    def _render_images(self, uow: UnitOfWork, run: RunRecord) -> str:
+    def _render_images(self, uow: UnitOfWork, run: RunRecord) -> tuple[str, int]:
         """把该轮的图片附件内嵌成 data URI（§十四.2：图片以内嵌资源方式保存）。"""
         if self._blobs is None:
-            return ""
+            return "", 0
         intent = uow.snapshots.get_intent(run.id)
         if intent is None or not intent.attachment_ids:
-            return ""
+            return "", 0
         mimes = {"jpeg": "image/jpeg", "png": "image/png"}
         chunks: list[str] = []
         for attachment_id in intent.attachment_ids:
@@ -327,7 +326,8 @@ class ExportService:
                 f'alt="{html.escape(attachment.source_path or attachment.id)}">'
                 f"<figcaption>{caption}</figcaption></figure>"
             )
-        return f'<div class="attachments">{"".join(chunks)}</div>' if chunks else ""
+        rendered = f'<div class="attachments">{"".join(chunks)}</div>' if chunks else ""
+        return rendered, len(chunks)
 
     def _render_provenance(self, uow: UnitOfWork, run: RunRecord) -> list[str]:
         """可选模型/站点信息 + 工具步骤（折叠）。不含请求头、密钥、原始载荷。"""
@@ -359,20 +359,6 @@ class ExportService:
                 "</details>"
             )
         return out
-
-    def _count_images(self, uow: UnitOfWork, run: RunRecord | None) -> int:
-        """该轮实际内嵌的图片数（只算真的找到了登记卡与 blob 的）。"""
-        if run is None or self._blobs is None:
-            return 0
-        intent = uow.snapshots.get_intent(run.id)
-        if intent is None:
-            return 0
-        count = 0
-        for attachment_id in intent.attachment_ids:
-            attachment = uow.image_attachments.get(attachment_id)
-            if attachment is not None and self._blobs.exists(attachment.blob_id):
-                count += 1
-        return count
 
 
 def _image_data_uri(raw: bytes, mime: str = "image/png") -> str:

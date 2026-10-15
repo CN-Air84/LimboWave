@@ -362,3 +362,20 @@ async def test_pending_empty_session_arbitrates_duplicate_open_send_and_new(proc
         lock.close()
     assert await task
     assert coord.conversation_id is not None
+
+
+async def test_switch_preparation_and_fallback_run_in_storage_process(process_stack, monkeypatch):
+    coord, kernel, _factory, _worker, _database = process_stack
+    await _turn(kernel, coord, "question", "answer")
+    target = coord.conversation_id, coord.branch_id
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("switch preparation ran in caller process")
+
+    monkeypatch.setattr(coord, "_prepare_switch", forbidden)
+    preparation = await coord.prepare_conversation_switch(*target)
+    assert preparation.state.valid
+    assert preparation.state.snapshot.entries
+    assert await coord.switch_conversation(*target, preparation=preparation)
+    coord.bump_revision()  # 过期后仍从存储进程重读。
+    assert await coord.switch_conversation(*target, preparation=preparation)

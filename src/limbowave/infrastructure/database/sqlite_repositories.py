@@ -56,7 +56,7 @@ from limbowave.domain.permissions import (
     RiskLevel,
 )
 from limbowave.domain.run import RunLogSummary, RunRecord, RunStatus
-from limbowave.domain.runtime_mirror import RuntimeEntryMirror
+from limbowave.domain.runtime_mirror import RuntimeEntryMetadata, RuntimeEntryMirror
 from limbowave.domain.snapshots import RequestIntentSnapshot, TransportSnapshot
 from limbowave.domain.tool_step import ToolStep
 from limbowave.infrastructure.crypto.vault import VaultKey
@@ -144,6 +144,16 @@ class SqliteUnitOfWork:
             if self._on_close is not None:
                 self._on_close(self)
                 self._on_close = None
+
+    def begin_read(self) -> sqlite3.Connection:
+        """Pin subsequent metadata and repository reads to one SQLite snapshot.
+
+        Python's DEFERRED isolation does not issue BEGIN for SELECT statements.
+        The owning unit of work rolls back/closes this transaction on exit.
+        """
+        if not self._conn.in_transaction:
+            self._conn.execute("BEGIN")
+        return self._conn
 
     def __enter__(self) -> SqliteUnitOfWork:
         return self
@@ -406,6 +416,22 @@ class _Messages:
             status=MessageStatus(r[5]), run_id=r[6],
             tool_steps=_load_tool_steps(self._key.decrypt(r[7])),
         ) for r in rows]
+
+    def summary_for_conversation(self, conversation_id: str) -> tuple[int, datetime | None]:
+        row = self._conn.execute(
+            "SELECT COUNT(*), MAX(created_at) FROM messages WHERE conversation_id = ?",
+            (conversation_id,),
+        ).fetchone()
+        return int(row[0]), _parse_iso(row[1]) if row[1] is not None else None
+
+    def summaries_for_branches(
+        self, conversation_id: str,
+    ) -> dict[str, tuple[int, datetime]]:
+        rows = self._conn.execute(
+            "SELECT branch_id, COUNT(*), MAX(created_at) FROM messages "
+            "WHERE conversation_id = ? GROUP BY branch_id", (conversation_id,),
+        )
+        return {row[0]: (int(row[1]), _parse_iso(row[2])) for row in rows}
 
     def count_for_branch(self, branch_id: str) -> int:
         row = self._conn.execute(
@@ -724,6 +750,34 @@ class _RuntimeMirror:
         if not conversation_id:
             return self._merged("", ())
         return self._merged("WHERE conversation_id = ?", (conversation_id,))
+
+    def list_metadata_for_conversation(
+        self, conversation_id: str,
+    ) -> list[RuntimeEntryMetadata]:
+        rows = self._conn.execute(
+            "SELECT id, conversation_id, entry_id, entry_type, captured_at, run_id, "
+            "parent_entry_id, message_id, runtime_instance_id FROM runtime_mirrors "
+            "WHERE conversation_id = ? ORDER BY captured_at, id", (conversation_id,),
+        )
+        return [RuntimeEntryMetadata(
+            id=r[0], conversation_id=r[1], entry_id=r[2], entry_type=r[3],
+            captured_at=_parse_iso(r[4]), run_id=r[5], parent_entry_id=r[6],
+            message_id=r[7], runtime_instance_id=r[8],
+        ) for r in rows]
+
+    def list_for_entries(
+        self, conversation_id: str, entry_ids: Sequence[str],
+    ) -> list[RuntimeEntryMirror]:
+        wanted = list(dict.fromkeys(entry_ids))
+        result = []
+        for offset in range(0, len(wanted), 500):
+            batch = wanted[offset:offset + 500]
+            placeholders = ",".join("?" for _ in batch)
+            result.extend(self._merged(
+                f"WHERE conversation_id = ? AND entry_id IN ({placeholders})",
+                (conversation_id, *batch),
+            ))
+        return sorted(result, key=lambda mirror: (mirror.captured_at, mirror.id))
 
     def list_for_run(self, run_id: str) -> list[RuntimeEntryMirror]:
         return self._merged("WHERE run_id = ?", (run_id,))

@@ -44,9 +44,16 @@ def test_unchecked_and_checked_both_draw_a_visible_box(qtbot: QtBot) -> None:
         image = box.grab().toImage()
         scale = image.devicePixelRatio()
         middle = round(rect.center().y() * scale)
-        edge = image.pixelColor(round(rect.left() * scale), middle)
-        outside = image.pixelColor(max(0, round((rect.left() - 2) * scale)), middle)
-        assert edge != outside, checked
+        # Some offscreen platform combinations place the indicator at x=0. In that
+        # case the old `left - 2` sample clamps to the same border pixel and makes
+        # a visible box look invisible. Compare both vertical strokes with a point
+        # that is always to the right of the indicator instead.
+        edges = (
+            image.pixelColor(round(rect.left() * scale), middle),
+            image.pixelColor(round((rect.right() - 1) * scale), middle),
+        )
+        outside = image.pixelColor(round((rect.right() + 2) * scale), middle)
+        assert any(edge != outside for edge in edges), (checked, edges, outside)
 
 
 def test_toggle_animates_in_both_directions(qtbot: QtBot) -> None:

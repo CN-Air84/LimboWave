@@ -15,7 +15,8 @@ from typing import Any
 
 
 @dataclass(frozen=True, slots=True)
-class RuntimeEntryMirror:
+class RuntimeEntryMetadata:
+    """无需解密正文即可读取的拓扑和归属信息。"""
     id: str
     conversation_id: str
     entry_id: str
@@ -25,4 +26,8 @@ class RuntimeEntryMirror:
     parent_entry_id: str | None = None
     message_id: str | None = None
     runtime_instance_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeEntryMirror(RuntimeEntryMetadata):
     payload: dict[str, Any] = field(default_factory=dict)

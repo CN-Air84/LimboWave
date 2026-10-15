@@ -19,7 +19,7 @@ from __future__ import annotations
 import enum
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 from limbowave.application.background import run_blocking
@@ -152,11 +152,19 @@ class CompressionService:
         with self._uow_factory() as uow:
             messages = branch_messages(uow, branch_id)
             whitelist = tuple(m.id for m in messages if m.is_whitelisted)
+            # Sort key is (created_at, id) and id is random: on coarse clocks two versions
+            # created back-to-back can share a timestamp and flip order. Force a strict order.
+            created_at = datetime.now(UTC)
+            existing = uow.compressions.list_for_branch(branch_id)
+            if existing:
+                latest = max(v.created_at for v in existing)
+                if created_at <= latest:
+                    created_at = latest + timedelta(microseconds=1)
             version = CompressionVersion(
                 id=f"cmp_{uuid4().hex[:16]}",
                 conversation_id=conversation_id,
                 branch_id=branch_id,
-                created_at=datetime.now(UTC),
+                created_at=created_at,
                 status=CompressionStatus.DRAFT,
                 input_message_ids=tuple(m.id for m in messages),
                 tokens_before=tokens_before,
@@ -170,7 +178,11 @@ class CompressionService:
             return version
 
     def build_prompt(
-        self, branch_id: str, *, goal: str = "", tasks: str = "",
+        self,
+        branch_id: str,
+        *,
+        goal: str = "",
+        tasks: str = "",
         message_ids: tuple[str, ...] | None = None,
     ) -> str:
         """组装压缩提示词（Task 5.2 的全部组成部分）。
@@ -204,7 +216,11 @@ class CompressionService:
         )
 
     async def generate_isolated(
-        self, version_id: str, source: AgentKernel, *, timeout: float = 120.0,
+        self,
+        version_id: str,
+        source: AgentKernel,
+        *,
+        timeout: float = 120.0,
         on_event: Callable[[KernelEvent], None] | None = None,
     ) -> bool:
         """Generate a preview in a disposable kernel; never fall back to the live chat."""
@@ -218,7 +234,7 @@ class CompressionService:
                 isolated = source.create_isolated()
                 if isolated is None or isolated is source:
                     isolated = None
-                    raise RuntimeError('当前内核不支持隔离压缩，未向主会话发送请求')
+                    raise RuntimeError("当前内核不支持隔离压缩，未向主会话发送请求")
                 if on_event is not None:
                     unsubscribe = isolated.subscribe(on_event)
                 state = await source.get_state()
@@ -228,10 +244,10 @@ class CompressionService:
                 await isolated.set_thinking_level(state.thinking_level)
                 return await self.generate(version_id, isolated, timeout=timeout)
         except asyncio.CancelledError:
-            await run_blocking(self.record_failure, version_id, '压缩已取消')
+            await run_blocking(self.record_failure, version_id, "压缩已取消")
             raise
         except Exception as exc:
-            error = '压缩生成超时' if isinstance(exc, TimeoutError) else redact_text(str(exc))
+            error = "压缩生成超时" if isinstance(exc, TimeoutError) else redact_text(str(exc))
             await run_blocking(self.record_failure, version_id, error)
             return False
         finally:
@@ -265,7 +281,10 @@ class CompressionService:
             return False
 
         prompt = await run_blocking(
-            self.build_prompt, version.branch_id, goal=goal, tasks=tasks,
+            self.build_prompt,
+            version.branch_id,
+            goal=goal,
+            tasks=tasks,
             message_ids=version.input_message_ids,
         )
         chunks: list[str] = []
@@ -305,7 +324,8 @@ class CompressionService:
                 raise RuntimeError(runtime_error[0])
         except Exception as exc:
             await run_blocking(
-                self.record_failure, version_id,
+                self.record_failure,
+                version_id,
                 "压缩生成超时" if isinstance(exc, TimeoutError) else redact_text(str(exc)),
             )
             return False

@@ -173,7 +173,11 @@ def test_settings_name_lists_keep_ids_internal_and_scroll(
     tab._on_save()
     assert tab._selected_id() == ("endpoint-b" if endpoints else "model-b")
     assert view.currentItem().text() == "Renamed"
-    assert view.item(0).text() == name
+    # Renaming re-sorts logical models. Verify by identity, not the old row index.
+    remaining_id = "endpoint-a" if endpoints else "model-a"
+    remaining = next(view.item(i) for i in range(view.count())
+                     if view.item(i).data(Qt.ItemDataRole.UserRole) == remaining_id)
+    assert remaining.text() == name
     if not endpoints:
         tab._on_default_model()
         assert view.currentItem().text() == "Renamed"

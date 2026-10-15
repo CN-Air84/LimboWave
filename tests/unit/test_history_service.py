@@ -242,3 +242,18 @@ def test_delete_unknown_returns_false(history: HistoryService) -> None:
 def test_delete_is_idempotent(history: HistoryService) -> None:
     assert history.delete("c1")
     assert not history.delete("c1")  # 第二次删除返回 False（已不存在）
+
+
+def test_search_is_bounded_and_cancelled(history):
+    assert len(history.search("部署", limit=1)) == 1
+    assert history.search("部署", cancelled=lambda: True) == []
+
+
+def test_sidebar_does_not_decrypt_messages(history, monkeypatch):
+    factory = history._uow_factory
+    with factory() as uow:
+        repository_type = type(uow.messages)
+    def forbidden(*args, **kwargs):
+        raise AssertionError("sidebar must not load message plaintext")
+    monkeypatch.setattr(repository_type, "list_for_branch", forbidden)
+    assert history.list_conversations()[1].message_count == 2

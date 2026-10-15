@@ -280,6 +280,8 @@ class AgentKernel(ABC):
         :class:`limbowave.domain.runtime_state.RuntimeRestoreResult`。
 
         **恢复只物化会话文件与切换，不得触发任何 Provider 请求。**
+        若实现已重新读取并验证本次恢复状态，可在结果的 ``validation`` 中返回该验证；
+        未提供时，恢复协调器会另行调用 ``validate_runtime_state``。
         """
         return None
 

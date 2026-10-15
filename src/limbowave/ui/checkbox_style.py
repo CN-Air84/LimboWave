@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import itertools
 import math
 
 from PySide6.QtCore import (
@@ -64,17 +65,21 @@ class _CheckTransition(QObject):
         return animation
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
-        if watched is self.box and isValid(self.box):
-            kind = event.type()
-            if kind == QEvent.Type.Enter:
-                self._retarget_hover(1.0 if self.box.isEnabled() else 0.0)
-            elif kind == QEvent.Type.Leave:
-                self._retarget_hover(0.0)
-            elif kind == QEvent.Type.EnabledChange:
-                self._retarget_hover(1.0 if self.box.underMouse() and self.box.isEnabled() else 0.0)
-            elif kind == QEvent.Type.Hide:
-                self._hover_animation.stop()
-                self.hover = 0.0
+        # Qt can deliver a teardown event after the Python wrapper has lost its
+        # instance attributes; ignore it rather than leaking an exception.
+        box: QCheckBox | None = getattr(self, "box", None)
+        if box is None or watched is not box or not isValid(box):
+            return False
+        kind = event.type()
+        if kind == QEvent.Type.Enter:
+            self._retarget_hover(1.0 if box.isEnabled() else 0.0)
+        elif kind == QEvent.Type.Leave:
+            self._retarget_hover(0.0)
+        elif kind == QEvent.Type.EnabledChange:
+            self._retarget_hover(1.0 if box.underMouse() and box.isEnabled() else 0.0)
+        elif kind == QEvent.Type.Hide:
+            self._hover_animation.stop()
+            self.hover = 0.0
         return False
 
     def sync(self, fill: float, glyph: Qt.CheckState) -> None:
@@ -149,11 +154,13 @@ def _mix(left: QColor, right: QColor, amount: float) -> QColor:
     )
 
 
-def _partial_path(box: QRectF, points: tuple[tuple[float, float], ...], progress: float) -> QPainterPath:
+def _partial_path(
+    box: QRectF, points: tuple[tuple[float, float], ...], progress: float
+) -> QPainterPath:
     """按总笔画长度截取折线的前 ``progress`` 部分——对勾是「画出来」的。"""
     mapped = [QPointF(box.x() + x * box.width(), box.y() + y * box.height()) for x, y in points]
     lengths = [
-        math.hypot(b.x() - a.x(), b.y() - a.y()) for a, b in zip(mapped, mapped[1:], strict=False)
+        math.hypot(b.x() - a.x(), b.y() - a.y()) for a, b in itertools.pairwise(mapped)
     ]
     remaining = sum(lengths) * max(0.0, min(1.0, progress))
     path = QPainterPath(mapped[0])
