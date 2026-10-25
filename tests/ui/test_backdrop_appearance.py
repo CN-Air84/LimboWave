@@ -156,15 +156,10 @@ def test_workspace_controls_show_backdrop_through_clear_surfaces(
         app.setStyleSheet(old_css)
 
 
-def test_light_theme_sidebar_button_keeps_accent_fill_and_visible_glyph(
+def test_light_theme_sidebar_button_keeps_neutral_fill_and_visible_glyph(
     qtbot: QtBot,
 ) -> None:
-    """浅色主题下「新建会话」按钮必须仍是强调色底 + 可见文字。
-
-    回归形态：侧栏拿到无选择器的 ``background: <card>`` 级联样式，把应用级
-    QSS 里 ``[accent="true"]`` 的强调色底盖成白卡片——白字（text_on_accent）
-    落在白底上，整颗按钮渲染成单色一片。
-    """
+    """The ghost action keeps its soft fill and dark text under sidebar material QSS."""
     source = BUILTIN_THEMES[0]
     light = next(theme_def for theme_def in BUILTIN_THEMES if theme_def.id == "builtin:clear-day")
     app = QApplication.instance()
@@ -185,9 +180,19 @@ def test_light_theme_sidebar_button_keeps_accent_fill_and_visible_glyph(
             for y in range(image.height())
             for x in range(image.width())
         }
-        assert theme.ACCENT.upper() in colors
-        # 文字可见：除了底色与抗锯齿边缘，画面里必须有第二种实色。
-        assert len(colors - {theme.ACCENT.upper()}) >= 1
+        assert theme.ACCENT.upper() not in colors
+        # Sample the composited window: grabbing a translucent button alone
+        # returns alpha pixels rather than its actual on-screen background.
+        screenshot = window.grab().toImage()
+        button = window._sidebar._new_btn
+        fill = screenshot.pixelColor(button.mapTo(window, QPoint(8, 8)))
+        base = screenshot.pixelColor(button.mapTo(window, QPoint(-3, 8)))
+        ink = QColor(theme.TEXT_PRIMARY)
+        for channel in (QColor.red, QColor.green, QColor.blue):
+            expected = round(channel(base) * 0.92 + channel(ink) * 0.08)
+            assert abs(channel(fill) - expected) <= 2
+        if QFontDatabase.families():
+            assert theme.TEXT_PRIMARY.upper() in colors
     finally:
         theme.apply_appearance_theme(source)
         app.setStyleSheet(old_css)

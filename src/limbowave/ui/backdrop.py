@@ -11,8 +11,10 @@ import math
 from collections import OrderedDict
 from collections.abc import Iterable
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Event
 from typing import cast
 
 from PIL import Image, ImageColor, ImageFilter, ImageOps
@@ -170,13 +172,21 @@ def _render_payload(
     settings: BackgroundSettings,
     base_color: str,
     radii: tuple[int, ...],
+    *,
+    cancelled: Event | None = None,
 ) -> dict[int, tuple[bytes, int, int]]:
+    if cancelled is not None and cancelled.is_set():
+        return {}
     composed = _compose(path, output, settings, base_color)
     payload: dict[int, tuple[bytes, int, int]] = {}
     for radius in radii:
+        if cancelled is not None and cancelled.is_set():
+            return {}
         # Pillow extends edge pixels for GaussianBlur; uniform-edge regression tests
         # protect against dark halos without allocating a second padded 4K surface.
         frame = composed.filter(ImageFilter.GaussianBlur(radius)) if radius else composed
+        if cancelled is not None and cancelled.is_set():
+            return {}
         payload[radius] = (frame.tobytes("raw", "RGBA"), frame.width, frame.height)
     return payload
 
@@ -193,6 +203,8 @@ class BackdropEngine(QObject):
         self._cache: OrderedDict[_RenderKey, QPixmap] = OrderedDict()
         self._cache_bytes = 0
         self._generation = 0
+        self._cancelled = Event()
+        self._closed = False
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="limbowave-theme")
         self._future: Future[dict[int, tuple[bytes, int, int]]] | None = None
         self._payload_ready.connect(self._install_payload)
@@ -203,21 +215,28 @@ class BackdropEngine(QObject):
     def active(self) -> bool:
         return bool(self._frames)
 
-    def clear(self) -> None:
+    def discard_pending(self) -> None:
+        """Keep the displayed frame, but reject work for an obsolete size/theme."""
         self._generation += 1
+        self._pending = None
+        self._cancelled.set()
+        if self._future is not None:
+            self._future.cancel()
+
+    def clear(self) -> None:
+        self.discard_pending()
         self._frame = QPixmap()
         self._frames.clear()
-        self._pending = None
         self.changed.emit()
 
     def close(self) -> None:
-        self._generation += 1
-        if self._future is not None:
-            self._future.cancel()
+        self._closed = True
+        self.discard_pending()
         self._executor.shutdown(wait=False, cancel_futures=True)
 
     def prepare(self, image_path: str, radius: int) -> bool:
         """Synchronous compatibility entry point used by focused tests."""
+        self.discard_pending()
         settings = BackgroundSettings(asset=image_path)
         request = self._request_parts(image_path, settings, "#000000", (radius,))
         if request is None:
@@ -250,26 +269,28 @@ class BackdropEngine(QObject):
         path, output, normalized_radii, keys = request
         cached = {key.radius: self._cache[key] for key in keys if key in self._cache}
         if len(cached) == len(keys):
+            self.discard_pending()
             self._frames = cached
             self._frame = cached[normalized_radii[0]]
             for key in keys:
                 self._cache.move_to_end(key)
             self.changed.emit()
             return True
-        if (
-            self._pending is not None
-            and self._pending[1] == keys
-            and self._future is not None
-            and not self._future.done()
-        ):
+        # A finished future can still be waiting for queued GUI delivery.
+        if self._pending is not None and self._pending[1] == keys:
             return True
-        if self._future is not None and not self._future.done():
-            self._future.cancel()
-        self._generation += 1
+        self.discard_pending()
+        self._cancelled = Event()
         generation = self._generation
         self._pending = generation, keys
         future = self._executor.submit(
-            _render_payload, path, output, settings, base_color, normalized_radii
+            _render_payload,
+            path,
+            output,
+            settings,
+            base_color,
+            normalized_radii,
+            cancelled=self._cancelled,
         )
         self._future = future
 
@@ -278,7 +299,10 @@ class BackdropEngine(QObject):
                 payload = done.result()
             except Exception:
                 payload = {}
-            self._payload_ready.emit((generation, keys, payload))
+            if not self._closed:
+                # The workspace may have been deleted while its worker finished.
+                with suppress(RuntimeError):
+                    self._payload_ready.emit((generation, keys, payload))
 
         future.add_done_callback(completed)
         return True
@@ -344,6 +368,7 @@ class BackdropEngine(QObject):
     ) -> None:
         if not force and generation != self._generation:
             return
+        self._pending = None
         if not payload:
             if not self.active:
                 self.clear()
@@ -351,7 +376,7 @@ class BackdropEngine(QObject):
         installed: dict[int, QPixmap] = {}
         for key in keys:
             raw, width, height = payload[key.radius]
-            image = QImage(raw, width, height, width * 4, QImage.Format.Format_RGBA8888).copy()
+            image = QImage(raw, width, height, width * 4, QImage.Format.Format_RGBA8888)
             pixmap = QPixmap.fromImage(image)
             installed[key.radius] = pixmap
             previous = self._cache.pop(key, None)

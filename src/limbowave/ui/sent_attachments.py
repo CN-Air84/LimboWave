@@ -11,13 +11,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QGuiApplication, QMouseEvent, QPixmap
+from PySide6.QtGui import QGuiApplication, QMouseEvent, QPixmap, QResizeEvent
 from PySide6.QtWidgets import (
     QDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
     QScrollArea,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
@@ -42,30 +43,48 @@ class SentAttachment:
     thumbnail: QPixmap | None = None  # 图片原图；None 表示文档
 
 
+class _PreviewImage(QLabel):
+    """始终从原图等比例适配可用空间，不让 pixmap 的尺寸限制窗口缩小。"""
+
+    def __init__(self, pixmap: QPixmap) -> None:
+        super().__init__()
+        self._source = QPixmap(pixmap)
+        self.setPixmap(pixmap)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+
+    def resizeEvent(self, event: QResizeEvent) -> None:
+        super().resizeEvent(event)
+        size = self.contentsRect().size()
+        if size.isEmpty() or self._source.isNull():
+            return
+        ratio = self.devicePixelRatioF()
+        pixmap = self._source.scaled(
+            size * ratio,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        pixmap.setDevicePixelRatio(ratio)
+        self.setPixmap(pixmap)
+
+
 class ImagePreviewDialog(QDialog):
-    """图片放大预览：不超过屏幕可用区的八成，超出按比例缩小。"""
+    """图片放大预览：初始按屏幕限幅，之后随窗口等比例缩放。"""
 
     def __init__(self, item: SentAttachment, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle(item.title)
         assert item.thumbnail is not None
-        pixmap = item.thumbnail
+        initial_size = item.thumbnail.deviceIndependentSize().toSize()
         screen = QGuiApplication.primaryScreen()
         if screen is not None:
             area = screen.availableGeometry()
             max_w, max_h = int(area.width() * 0.8), int(area.height() * 0.8)
-            if pixmap.width() > max_w or pixmap.height() > max_h:
-                pixmap = pixmap.scaled(
-                    max_w,
-                    max_h,
-                    Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation,
-                )
+            if initial_size.width() > max_w or initial_size.height() > max_h:
+                initial_size.scale(max_w, max_h, Qt.AspectRatioMode.KeepAspectRatio)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
-        image = QLabel()
-        image.setPixmap(pixmap)
-        image.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        image = _PreviewImage(item.thumbnail)
         scroll = QScrollArea()
         scroll.setWidget(image)
         scroll.setWidgetResizable(True)
@@ -74,7 +93,7 @@ class ImagePreviewDialog(QDialog):
         detail = QLabel(item.detail)
         detail.setStyleSheet(f"color: {theme.TEXT_SECONDARY}; font-size: {theme.FS_SMALL}px;")
         layout.addWidget(detail)
-        self.resize(pixmap.width() + 28, pixmap.height() + 56)
+        self.resize(initial_size.width() + 28, initial_size.height() + 56)
 
 
 class _SentAttachmentTile(QFrame):

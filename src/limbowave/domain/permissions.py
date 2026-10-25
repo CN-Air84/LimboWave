@@ -34,6 +34,7 @@ class Capability(enum.StrEnum):
     NETWORK = "network"
     MEMORY_WRITE = "memory_write"
     CLOCK_READ = "clock_read"
+    HISTORY_READ = "history_read"
 
 
 class PermissionPreset(enum.StrEnum):
@@ -235,6 +236,13 @@ def evaluate(
     3. 有匹配授权且在范围内：放行。
     4. 无匹配授权：要求确认（用户可授予本次或本会话）。
     """
+    if request.capability is Capability.HISTORY_READ:
+        return PermissionDecision(
+            decision=Decision.CONFIRM,
+            risk=RiskLevel.HIGH,
+            reason="查询聊天记录会读取其他会话的私人内容；除完全访问外，每次调用均需确认",
+            matched_rule="history.per_call",
+        )
     if request.capability is Capability.CLOCK_READ:
         return PermissionDecision(
             decision=Decision.ALLOW,

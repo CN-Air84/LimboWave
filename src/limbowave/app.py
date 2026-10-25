@@ -107,11 +107,17 @@ def build_application(argv: Sequence[str]) -> QApplication:
     app.setOrganizationName(APP_NAME)
 
     # 全局主题：设计令牌集中在 ui.theme，视图只声明 objectName / 动态属性。
-    # 具体调色板与字号在这里先按默认装好，main() 读到偏好后会再设一次。
+    # 具体调色板与字号在这里先按系统默认装好，main() 读到偏好后会再设一次。
+    from limbowave.application.services.preferences_service import (
+        capture_system_theme,
+        default_theme,
+    )
     from limbowave.ui import theme
     from limbowave.ui.checkbox_style import CheckBoxStyle
     from limbowave.ui.smooth_scroll import install_smooth_scrolling
 
+    capture_system_theme(app)
+    theme.set_palette(default_theme())
     # 代理样式必须先于样式表装上：样式表样式会包住当时的应用样式。
     app.setStyle(CheckBoxStyle())
     app.setStyleSheet(theme.app_stylesheet())
@@ -558,7 +564,7 @@ def _make_permission_handler(
     memory_service: Any = None,
     memory_context: Callable[[], Any] | None = None,
 ) -> Callable[[str, str], Awaitable[bool]]:
-    """普通工具使用预选权限；记忆工具独立遵守逐次询问或自动允许策略。"""
+    """普通工具使用预选权限；记忆与跨会话查询独立审批，历史仅完全访问免询问。"""
 
     async def confirm(title: str, detail: str) -> bool:
         from limbowave.application.services.run_origin import remote_tools_denied
@@ -639,6 +645,41 @@ def _make_permission_handler(
             )
             if not isinstance(preset, PermissionPreset):
                 preset = PermissionPreset(preset)
+
+            if request.capability is Capability.HISTORY_READ:
+                from limbowave.ui.permission_prompt import ONCE
+
+                if preset is PermissionPreset.FULL_ACCESS:
+                    decision = await run_blocking(permissions.authorize, request, conversation_id)
+                    return (
+                        decision.decision is Decision.ALLOW
+                        and conversation_provider is not None
+                        and conversation_provider() == conversation_id
+                        and not remote_tools_denied(
+                            gateway.origin_provider if gateway is not None else None
+                        )
+                    )
+                decision = await run_blocking(permissions.authorize, request, conversation_id)
+                answer = await _ask_permission(window, request, decision.reason, None)
+                allowed = (
+                    answer == ONCE
+                    and conversation_provider is not None
+                    and conversation_provider() == conversation_id
+                    and not remote_tools_denied(
+                        gateway.origin_provider if gateway is not None else None
+                    )
+                )
+                await run_blocking(
+                    permissions.authorize, request, conversation_id,
+                    user_confirmed=allowed, user_denied=not allowed,
+                )
+                return (
+                    allowed and conversation_provider is not None
+                    and conversation_provider() == conversation_id
+                    and not remote_tools_denied(
+                        gateway.origin_provider if gateway is not None else None
+                    )
+                )
 
             if preset is PermissionPreset.CHAT_ONLY:
                 await run_blocking(permissions.authorize, request, conversation_id)
@@ -860,7 +901,12 @@ def _wire_impl(
 
     shell_env = _run_startup_task(partial(probe_shell, paths.data_root))
     terminal = TerminalTools(create_executor(shell_env)) if shell_env is not None else None
-    tool_gateway = ToolGateway(permissions, paths.data_root, documents=files, terminal=terminal)
+    from limbowave.application.services.chat_history_service import ChatHistoryService
+
+    tool_gateway = ToolGateway(
+        permissions, paths.data_root, documents=files, terminal=terminal,
+        chat_history=ChatHistoryService(uow_factory),
+    )
     # 装配可观测：read_document 报「文档服务未配置」时，先看这条日志——
     # documents=False 意味着这个进程跑在未解锁状态，或是修复前的旧进程。
     _LOG.info(
@@ -1390,9 +1436,8 @@ def _wire_impl(
                     Path(image.source_path).name if image.source_path else image.id,
                     f"{image.format.value.upper()} · {image.dimensions} · {summary.size_text}"
                     f" · ~{summary.context_tokens_estimate} tokens(估算)",
-                    decoded.scaled(256, 256, Qt.AspectRatioMode.KeepAspectRatio,
-                                   Qt.TransformationMode.SmoothTransformation)
-                    if not decoded.isNull() else None,
+                    # 预览与附件 chip 共用此图；这里只解码原图，缩略图由 chip 自行生成。
+                    decoded if not decoded.isNull() else None,
                 )
             if files is not None and (document := files.get(attachment_id)) is not None:
                 return (

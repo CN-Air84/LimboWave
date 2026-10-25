@@ -28,6 +28,7 @@ from limbowave.ui import theme
 
 if TYPE_CHECKING:
     from markdown_it import MarkdownIt
+    from markdown_it.rules_core import StateCore
 
 # 代码高亮：内联样式（Qt 不支持 class CSS），nowrap 只产 <span>，
 # 外层 <pre> 由 markdown-it 统一包裹。
@@ -66,6 +67,19 @@ def _highlight(code: str, lang: str | None, _attrs: str | None) -> str:
     return rendered.rstrip("\n")
 
 
+def _style_lists(state: StateCore) -> None:
+    """Qt 不继承 li 的行高到 p；紧凑/宽松列表都显式设置，保留嵌套层级。"""
+    depth = 0
+    for token in state.tokens:
+        if token.type in {"bullet_list_open", "ordered_list_open"}:
+            depth += 1
+            token.attrSet("style", "margin-top: 4px; margin-bottom: 6px; margin-left: 0;")
+        elif token.type in {"bullet_list_close", "ordered_list_close"}:
+            depth -= 1
+        elif depth and token.type in {"list_item_open", "paragraph_open"}:
+            token.attrSet("style", "margin-top: 3px; margin-bottom: 3px; line-height: 160%;")
+
+
 @lru_cache(maxsize=1)
 def _markdown() -> MarkdownIt:
     # Login/empty conversations need neither the parser nor the lexer registry.
@@ -74,6 +88,7 @@ def _markdown() -> MarkdownIt:
     parser = MarkdownIt("commonmark", {"highlight": _highlight, "html": False, "breaks": False})
     parser.enable("table")
     parser.enable("strikethrough")
+    parser.core.ruler.push("chat_list_typography", _style_lists)
     return parser
 
 # Qt 的 Unicode 属性识别 emoji，\X 一次匹配完整字素簇（肤色、ZWJ、旗帜等）。

@@ -379,3 +379,36 @@ async def test_switch_preparation_and_fallback_run_in_storage_process(process_st
     assert await coord.switch_conversation(*target, preparation=preparation)
     coord.bump_revision()  # 过期后仍从存储进程重读。
     assert await coord.switch_conversation(*target, preparation=preparation)
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_normalized_user_anchor_roundtrips_through_storage_process(process_stack, legacy):
+    from datetime import UTC, datetime
+
+    from tests.unit.test_runtime_message_anchors import orphan_user
+
+    coord, kernel, factory, _worker, _database = process_stack
+    await coord.send("image question")
+    message = kernel.path[-1]["message"]
+    message["content"][0]["text"] += "\n\n[Runtime image hint]"
+    message["timestamp"] = int(datetime.now(UTC).timestamp() * 1000)
+    kernel.emit("message.end", {"message": message})
+    kernel.say("original answer")
+    kernel.emit("run.settled", {})
+    await coord.wait_idle()
+    original_branch = coord.branch_id
+    original = HistoryService(factory).branch_messages(original_branch)
+    if legacy:
+        orphan_user(factory, coord.conversation_id, "e1")
+    assert await coord.fork_message(original[-1].id)
+    assert kernel.sent == ["image question"]
+    assert await coord.regenerate(original[-1].id)
+    with factory() as uow:
+        user = next(m for m in uow.runtime.list_for_conversation(coord.conversation_id)
+                    if m.entry_id == "e1")
+        assert user.message_id == original[0].id
+    kernel.say("new answer")
+    kernel.emit("run.settled", {})
+    await coord.wait_idle()
+    assert kernel.sent == ["image question", "image question"]
+    assert HistoryService(factory).branch_messages(original_branch) == original

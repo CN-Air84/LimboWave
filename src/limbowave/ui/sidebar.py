@@ -8,8 +8,8 @@
 - 列表内容由上层（app 接线）经 :meth:`show_conversations` / :meth:`show_search_results`
   灌入；视图不自己查询仓库。
 
-当前会话指示：消息区正在显示的会话行左侧画一条强调色竖条、标题加粗
-（由上层经 :meth:`set_active` 标记，和鼠标选中高亮区分开）。
+当前会话指示：消息区正在显示的会话行使用柔和圆角底色、标题加粗
+（由上层经 :meth:`set_active` 标记，不再叠加强调色竖条或焦点描边）。
 
 分支：双击会话行展开/收起它的分支子行（展开时发 ``branches_requested``，上层经
 :meth:`set_branches` 灌入），单击分支子行外发 ``branch_switch_requested``。
@@ -21,28 +21,25 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from typing import cast
 
 from PySide6.QtCore import (
-    QAbstractAnimation,
     QEasingCurve,
-    QEvent,
     QMargins,
     QModelIndex,
-    QObject,
     QPersistentModelIndex,
     QPoint,
-    QPropertyAnimation,
+    QPointF,
     QRect,
     QSize,
     Qt,
     QVariantAnimation,
     Signal,
 )
-from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPaintEvent, QPen, QPixmap
+from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPainterPath, QPaintEvent, QPen, QPixmap
 from PySide6.QtWidgets import (
-    QFrame,
     QHBoxLayout,
     QLabel,
     QListWidget,
@@ -50,6 +47,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QProgressBar,
     QPushButton,
+    QStyle,
     QStyledItemDelegate,
     QStyleOptionViewItem,
     QVBoxLayout,
@@ -82,8 +80,13 @@ class _ConversationDelegate(QStyledItemDelegate):
         option: QStyleOptionViewItem,
         index: QModelIndex | QPersistentModelIndex,
     ) -> None:
-        # 基类先画 选中/悬停 背景
-        super().paint(painter, option, index)
+        # Keep the QSS rounded fill, but not the platform's focus rectangle.
+        # Keyboard navigation retains the same visible, borderless selected fill.
+        background_option = QStyleOptionViewItem(option)
+        background_option.state &= ~QStyle.StateFlag.State_HasFocus
+        if index.data(ROLE_ACTIVE):
+            background_option.state |= QStyle.StateFlag.State_Selected
+        super().paint(painter, background_option, index)
 
         title = index.data(ROLE_TITLE) or ""
         subtitle = index.data(ROLE_SUBTITLE) or ""
@@ -181,6 +184,35 @@ def _search_icon() -> QIcon:
     return QIcon(image)
 
 
+def _settings_icon() -> QIcon:
+    """Draw a theme-aware gear at 2x resolution for high-DPI sidebar chrome."""
+    image = QPixmap(36, 36)
+    image.setDevicePixelRatio(2.0)
+    image.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(image)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    pen = QPen(QColor(theme.TEXT_SECONDARY), 1.25)
+    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    painter.setPen(pen)
+    center = QPointF(9.0, 9.0)
+    path = QPainterPath()
+    for vertex in range(32):
+        angle = math.tau * (vertex - 0.5) / 32
+        radius = 7.6 if vertex % 4 in (1, 2) else 5.8
+        x = center.x() + math.cos(angle) * radius
+        y = center.y() + math.sin(angle) * radius
+        if vertex == 0:
+            path.moveTo(x, y)
+        else:
+            path.lineTo(x, y)
+    path.closeSubpath()
+    painter.drawPath(path)
+    # Use the floating-point center overload; x/y/width/height truncates to integers.
+    painter.drawEllipse(center, 2.5, 2.5)
+    painter.end()
+    return QIcon(image)
+
+
 class Sidebar(QWidget):
     """会话导航栏。搜索框有内容时列表显示搜索结果，否则显示会话列表。"""
 
@@ -199,6 +231,7 @@ class Sidebar(QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self._backdrop_engine: BackdropEngine | None = None
         self._backdrop_tint = "#00000000"
         self._backdrop_radius = 0.0
@@ -224,10 +257,13 @@ class Sidebar(QWidget):
         top = QHBoxLayout()
         top.setSpacing(6)
         self._new_btn = QPushButton("＋ 新建会话")
-        self._new_btn.setProperty("accent", True)
+        self._new_btn.setObjectName("sidebarNewConversation")
+        self._new_btn.setMinimumHeight(38)
         self._new_btn.clicked.connect(self.new_conversation_requested.emit)
         top.addWidget(self._new_btn, 1)
         self._search_btn = QPushButton()
+        self._search_btn.setObjectName("sidebarSearch")
+        self._search_btn.setAccessibleName("搜索历史")
         self._search_btn.setIcon(_search_icon())
         self._search_btn.setFixedSize(44, 38)
         self._search_btn.setStyleSheet("QPushButton { padding: 0; margin: 0; }")
@@ -237,7 +273,8 @@ class Sidebar(QWidget):
         root.addLayout(top)
 
         self._list = QListWidget()
-        # 光效轮廓与全局 QListWidget::item 的圆角、外边距保持一致，分支行也复用。
+        self._list.setObjectName("conversationList")
+        # 光效轮廓与会话列表的圆角、外边距保持一致，分支行也复用。
         self._list.setProperty("revealItemRadius", theme.RADIUS_MD)
         self._list.setProperty("revealItemMargins", QMargins(2, 1, 2, 1))
         self._list.setItemDelegate(_ConversationDelegate(self._list))
@@ -248,22 +285,6 @@ class Sidebar(QWidget):
         # 右键菜单：重命名 / 删除（Task 3.1）
         self._list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._list.customContextMenuRequested.connect(self._on_context_menu)
-        self._active_indicator = QFrame(self._list.viewport())
-        self._active_indicator.setObjectName("conversationActiveIndicator")
-        self._active_indicator.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-        self._active_indicator.setStyleSheet(
-            f"background: {theme.ACCENT}; border: none; border-radius: 1px;"
-        )
-        self._active_indicator.hide()
-        self._indicator_animation = QPropertyAnimation(
-            self._active_indicator, b"geometry", self
-        )
-        self._indicator_animation.setDuration(260)
-        self._indicator_animation.setEasingCurve(QEasingCurve.Type.InOutCubic)
-        self._list.viewport().installEventFilter(self)
-        self._list.verticalScrollBar().valueChanged.connect(
-            lambda _value: self._sync_active_indicator(animated=False)
-        )
         root.addWidget(self._list, 1)
         self._branch_loading = QWidget(self)
         loading_layout = QHBoxLayout(self._branch_loading)
@@ -280,7 +301,11 @@ class Sidebar(QWidget):
 
         # 左下角：唯一入口「设置」（站点与模型 / 数据 / 请求日志都收进设置页面）
         self._settings_btn = QPushButton("设置")
-        self._settings_btn.setProperty("flat", True)
+        self._settings_btn.setObjectName("sidebarSettings")
+        self._settings_btn.setIcon(_settings_icon())
+        self._settings_btn.setIconSize(QSize(18, 18))
+        self._settings_btn.setMinimumHeight(40)
+        self._settings_btn.setAccessibleName("设置")
         self._settings_btn.clicked.connect(self.settings_requested.emit)
         root.addWidget(self._settings_btn)
 
@@ -304,17 +329,8 @@ class Sidebar(QWidget):
     def restyle(self) -> None:
         """图标不是 QSS，切换主题时重新绘制。"""
         self._search_btn.setIcon(_search_icon())
-        self._active_indicator.setStyleSheet(
-            f"background: {theme.ACCENT}; border: none; border-radius: 1px;"
-        )
-
-    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
-        if watched is self._list.viewport() and event.type() in (
-            QEvent.Type.Resize,
-            QEvent.Type.Show,
-        ):
-            self._sync_active_indicator(animated=False)
-        return super().eventFilter(watched, event)
+        self._settings_btn.setIcon(_settings_icon())
+        self._list.viewport().update()
 
     # ---------- 展示更新（由上层驱动） ----------
 
@@ -343,7 +359,6 @@ class Sidebar(QWidget):
             if conversation_id in self._expanded:
                 self._insert_branch_rows(item)
         self._list.blockSignals(False)
-        self._sync_active_indicator(animated=False)
 
     def show_search_results(
         self, rows: list[tuple[str, str]], *, targets: Sequence[object] | None = None
@@ -351,8 +366,6 @@ class Sidebar(QWidget):
         """显示搜索结果。每行 (conversation_id, 摘要文本)。"""
         self._searching = True
         self._stop_branch_animations()
-        self._indicator_animation.stop()
-        self._active_indicator.hide()
         self._list.clear()
         if not rows:
             item = QListWidgetItem("（无匹配）")
@@ -372,7 +385,6 @@ class Sidebar(QWidget):
 
     def set_active(self, conversation_id: str | None, branch_id: str | None = None) -> None:
         """标记消息区正在显示的会话（和分支）。纯展示，不外发信号。"""
-        previous_conversation_id = self._active_conversation_id
         self._active_conversation_id = conversation_id
         self._active_branch_id = branch_id
         if self._searching:
@@ -397,46 +409,6 @@ class Sidebar(QWidget):
             self._list.setCurrentRow(-1)
         self._list.blockSignals(False)
         self._list.viewport().update()
-        self._sync_active_indicator(
-            animated=(
-                previous_conversation_id is not None
-                and conversation_id is not None
-                and previous_conversation_id != conversation_id
-            )
-        )
-
-    def _indicator_target(self) -> QRect | None:
-        if self._searching or self._active_conversation_id is None:
-            return None
-        item = self._conversation_item(self._active_conversation_id)
-        if item is None:
-            return None
-        row = self._list.visualItemRect(item)
-        if row.isEmpty() or not row.intersects(self._list.viewport().rect()):
-            return None
-        return QRect(2, row.top() + 10, 3, max(3, row.height() - 20))
-
-    def _sync_active_indicator(self, *, animated: bool) -> None:
-        target = self._indicator_target()
-        if target is None:
-            self._indicator_animation.stop()
-            self._active_indicator.hide()
-            return
-        current = self._active_indicator.geometry()
-        can_animate = animated and self.isVisible() and self._active_indicator.isVisible()
-        if can_animate and current != target:
-            self._indicator_animation.stop()
-            self._indicator_animation.setStartValue(current)
-            self._indicator_animation.setEndValue(target)
-            self._active_indicator.show()
-            self._active_indicator.raise_()
-            self._indicator_animation.start()
-        else:
-            if self._indicator_animation.state() == QAbstractAnimation.State.Running:
-                self._indicator_animation.stop()
-            self._active_indicator.setGeometry(target)
-            self._active_indicator.show()
-            self._active_indicator.raise_()
 
     def branches_loading(self, conversation_id: str) -> bool:
         return conversation_id in self._loading_branches
@@ -583,7 +555,6 @@ class Sidebar(QWidget):
                 item.setData(ROLE_BRANCH_REVEAL, progress)
                 item.setSizeHint(QSize(-1, round(BRANCH_ROW_HEIGHT * progress)))
             self._list.viewport().update()
-            self._sync_active_indicator(animated=False)
 
         def _finished() -> None:
             self._branch_animations.pop(conversation_id, None)
@@ -593,7 +564,6 @@ class Sidebar(QWidget):
                     self._list.blockSignals(True)
                     self._remove_branch_rows(parent)
                     self._list.blockSignals(False)
-            self._sync_active_indicator(animated=False)
 
         animation.valueChanged.connect(_apply)
         animation.finished.connect(_finished)

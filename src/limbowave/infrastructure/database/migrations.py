@@ -18,7 +18,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 # 当前 schema 版本。新增迁移时递增。
-CURRENT_VERSION = 13
+CURRENT_VERSION = 18
 
 MIGRATION_RECOVERY_MESSAGE = (
     "资料库升级失败，应用未继续打开资料库。请先保留当前数据目录及备份，"
@@ -363,6 +363,267 @@ def _migration_013(conn: sqlite3.Connection) -> None:
     repair_missing_branch_compressions(conn)
 
 
+def _migration_014(conn: sqlite3.Connection) -> None:
+    """Persist server device authorization without storing bearer tokens."""
+    conn.executescript(
+        """
+        CREATE TABLE server_devices (
+            id                  TEXT PRIMARY KEY,
+            name                TEXT NOT NULL,
+            token_hash          TEXT NOT NULL UNIQUE,
+            csrf_hash           TEXT NOT NULL,
+            created_at          REAL NOT NULL,
+            touched_at          REAL NOT NULL,
+            absolute_expires_at REAL NOT NULL,
+            revoked_at          REAL
+        );
+        CREATE INDEX idx_server_devices_active
+            ON server_devices(revoked_at, absolute_expires_at);
+        """
+    )
+
+
+def _migration_015(conn: sqlite3.Connection) -> None:
+    """Persist idempotency receipts independently from the SSE replay buffer."""
+    conn.executescript(
+        """
+        CREATE TABLE server_commands (
+            device_id       TEXT NOT NULL,
+            operation_id    TEXT NOT NULL,
+            server_epoch    TEXT NOT NULL,
+            fingerprint     TEXT NOT NULL,
+            status          TEXT NOT NULL,
+            revision        INTEGER,
+            run_id          TEXT,
+            conversation_id TEXT,
+            branch_id       TEXT,
+            error_code      TEXT,
+            error_status    INTEGER,
+            created_at      REAL NOT NULL,
+            updated_at      REAL NOT NULL,
+            PRIMARY KEY (device_id, operation_id)
+        );
+        CREATE INDEX idx_server_commands_status ON server_commands(status, updated_at);
+        """
+    )
+
+
+_SYNC_RETENTION_TRIGGER = "sync_change_log_retention"
+
+# 发布版 ``change_log`` 的列集合。迁移 17 用它判断库里的日志是否同一版结构。
+_SYNC_LOG_COLUMNS = frozenset(
+    {"seq", "entity_type", "entity_id", "scope", "operation", "revision", "created_at"}
+)
+
+# 内容表 → 变更日志的实体类型与作用域。这是迁移 16 发布时的定义，只保留一份：
+# 迁移 17 的修复路径也用它重建，避免两处各写一套再漂移。
+_SYNC_TRIGGER_SPECS: tuple[tuple[str, str, str, str], ...] = (
+    (
+        "conversations",
+        "conversation",
+        "'conversation:' || NEW.id",
+        "'conversation:' || OLD.id",
+    ),
+    (
+        "branches",
+        "branch",
+        "'conversation:' || NEW.conversation_id || ':branch:' || NEW.id",
+        "'conversation:' || OLD.conversation_id || ':branch:' || OLD.id",
+    ),
+    (
+        "messages",
+        "message",
+        "'conversation:' || NEW.conversation_id || ':branch:' || NEW.branch_id "
+        "|| ':message:' || NEW.id",
+        "'conversation:' || OLD.conversation_id || ':branch:' || OLD.branch_id "
+        "|| ':message:' || OLD.id",
+    ),
+    (
+        "runs",
+        "run",
+        "'conversation:' || NEW.conversation_id || ':branch:' || NEW.branch_id "
+        "|| ':run:' || NEW.id",
+        "'conversation:' || OLD.conversation_id || ':branch:' || OLD.branch_id "
+        "|| ':run:' || OLD.id",
+    ),
+    (
+        "memory_documents",
+        "memory",
+        "'conversation:' || COALESCE(NEW.conversation_id, 'global') "
+        "|| ':branch:' || COALESCE(NEW.branch_id, 'global') "
+        "|| ':memory:' || NEW.id",
+        "'conversation:' || COALESCE(OLD.conversation_id, 'global') "
+        "|| ':branch:' || COALESCE(OLD.branch_id, 'global') "
+        "|| ':memory:' || OLD.id",
+    ),
+    (
+        "server_devices",
+        "device",
+        "'device:' || NEW.id",
+        "'device:' || OLD.id",
+    ),
+)
+
+
+def _create_sync_tables(conn: sqlite3.Connection) -> None:
+    """建 ``sync_state`` 与 ``change_log``，结构与迁移 16 发布时逐字一致。
+
+    ``IF NOT EXISTS`` 不会写进 ``sqlite_master``，所以新建库的最终 schema 不变；
+    它只是让迁移 17 的修复路径能与 16 共用同一份定义。语句逐条执行而非
+    ``executescript``：后者会先提交调用方开启的事务，破坏单条迁移的原子性。
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sync_state (
+            id       INTEGER PRIMARY KEY CHECK (id = 1),
+            revision INTEGER NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "INSERT INTO sync_state (id, revision) SELECT 1, 0 "
+        "WHERE NOT EXISTS (SELECT 1 FROM sync_state WHERE id = 1)"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS change_log (
+            seq         INTEGER PRIMARY KEY AUTOINCREMENT,
+            entity_type TEXT NOT NULL,
+            entity_id   TEXT NOT NULL,
+            scope       TEXT NOT NULL,
+            operation   TEXT NOT NULL CHECK(operation IN ('upsert', 'delete')),
+            revision    INTEGER NOT NULL,
+            created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_change_log_entity
+            ON change_log(entity_type, entity_id, seq)"""
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_change_log_revision ON change_log(revision, seq)")
+
+
+def _create_sync_triggers(conn: sqlite3.Connection) -> None:
+    """为内容表建同步触发器：在同一事务里推进修订号并登记一条变更。"""
+    for table, entity, insert_scope, delete_scope in _SYNC_TRIGGER_SPECS:
+        for operation, event, row, scope, kind in (
+            ("insert", "INSERT", "NEW", insert_scope, "upsert"),
+            ("update", "UPDATE", "NEW", insert_scope, "upsert"),
+            ("delete", "DELETE", "OLD", delete_scope, "delete"),
+        ):
+            conn.execute(
+                f"""
+            CREATE TRIGGER sync_{table}_{operation} AFTER {event} ON {table}
+            BEGIN
+                UPDATE sync_state SET revision = revision + 1 WHERE id = 1;
+                INSERT INTO change_log
+                    (entity_type, entity_id, scope, operation, revision)
+                VALUES (
+                    '{entity}', {row}.id, {scope}, '{kind}',
+                    (SELECT revision FROM sync_state WHERE id = 1)
+                );
+            END
+            """
+            )
+
+
+def _migration_016(conn: sqlite3.Connection) -> None:
+    """Transaction-local change log for server-authoritative incremental sync."""
+    _create_sync_tables(conn)
+    _create_sync_triggers(conn)
+
+
+def _rebuild_prerelease_change_log(conn: sqlite3.Connection) -> None:
+    """把开发版迁移 16 留下的旧同步日志升级成发布版结构。
+
+    16 号迁移在开发期曾以「只有 ``cursor`` 列、没有 ``sync_state``、触发器不写
+    修订号」的形态落盘（该形态没有进入 git 历史），这类库的版本号同样是 16，
+    直接跑 17 会因缺列失败。变更日志是缓存：实体真值在业务表里，游标比保留窗口
+    旧时客户端本就该走全量快照。因此这里重建成发布版结构，只把 AUTOINCREMENT
+    高水位搬到新表——已发出的游标保持单调，比高水位旧的游标会拿到
+    ``CursorExpired`` 去重建快照，不会静默漏变更。
+    """
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(change_log)")}
+    released_log = columns >= _SYNC_LOG_COLUMNS
+    has_sync_state = (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sync_state'"
+        ).fetchone()
+        is not None
+    )
+    if released_log and has_sync_state:
+        return
+
+    high_water = 0
+    if columns:
+        if "cursor" in columns:
+            row = conn.execute("SELECT COALESCE(MAX(cursor), 0) FROM change_log").fetchone()
+            high_water = int(row[0])
+        if conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_sequence'"
+        ).fetchone():
+            row = conn.execute(
+                "SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'change_log'), 0)"
+            ).fetchone()
+            high_water = max(high_water, int(row[0]))
+
+    for table, *_ in _SYNC_TRIGGER_SPECS:
+        for operation in ("insert", "update", "delete"):
+            conn.execute(f"DROP TRIGGER IF EXISTS sync_{table}_{operation}")
+    conn.execute(f"DROP TRIGGER IF EXISTS {_SYNC_RETENTION_TRIGGER}")
+    if not released_log:
+        conn.execute("DROP TABLE IF EXISTS change_log")
+    _create_sync_tables(conn)
+    _create_sync_triggers(conn)
+    if not released_log and high_water:
+        conn.execute("DELETE FROM sqlite_sequence WHERE name = 'change_log'")
+        conn.execute(
+            "INSERT INTO sqlite_sequence (name, seq) VALUES ('change_log', ?)",
+            (high_water,),
+        )
+
+
+def _migration_017(conn: sqlite3.Connection) -> None:
+    """Repair the pre-release 16 log, drop device changes, bound log retention."""
+    if not conn.in_transaction:
+        conn.execute("BEGIN")
+    _rebuild_prerelease_change_log(conn)
+    for operation in ("insert", "update", "delete"):
+        conn.execute(f"DROP TRIGGER IF EXISTS sync_server_devices_{operation}")
+    # Do not reset the sequence/revision: already-issued cursors remain monotonic.
+    conn.execute("DELETE FROM change_log WHERE entity_type = 'device'")
+    conn.execute(
+        "DELETE FROM change_log WHERE seq <= "
+        "COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'change_log'), 0) - 50000"
+    )
+    conn.execute(f"DROP TRIGGER IF EXISTS {_SYNC_RETENTION_TRIGGER}")
+    conn.execute(
+        """
+        CREATE TRIGGER sync_change_log_retention AFTER INSERT ON change_log
+        BEGIN
+            DELETE FROM change_log WHERE seq <= NEW.seq - 50000;
+        END
+        """
+    )
+
+
+def _migration_018(conn: sqlite3.Connection) -> None:
+    """Cover metadata reads so branch selection never visits large encrypted rows."""
+    if not conn.in_transaction:
+        conn.execute("BEGIN")
+    conn.execute(
+        "CREATE INDEX idx_messages_conversation_activity "
+        "ON messages(conversation_id, branch_id, created_at)"
+    )
+    conn.execute(
+        "CREATE INDEX idx_mirrors_conversation_topology ON runtime_mirrors("
+        "conversation_id, captured_at, id, entry_id, entry_type, run_id, "
+        "parent_entry_id, message_id, runtime_instance_id)"
+    )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(
         from_version=0,
@@ -409,6 +670,19 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(from_version=10, description="Fork 保留起点消息", apply=_migration_011),
     Migration(from_version=11, description="助手分段与工具步骤顺序", apply=_migration_012),
     Migration(from_version=12, description="修复旧分支缺失的压缩继承", apply=_migration_013),
+    Migration(from_version=13, description="服务端持久设备授权", apply=_migration_014),
+    Migration(from_version=14, description="服务端持久命令回执", apply=_migration_015),
+    Migration(from_version=15, description="服务端增量同步变更日志", apply=_migration_016),
+    Migration(
+        from_version=16,
+        description="修复开发版 16 的日志结构、隔离设备并限制保留窗口",
+        apply=_migration_017,
+    ),
+    Migration(
+        from_version=17,
+        description="会话加载的消息活动与运行时拓扑覆盖索引",
+        apply=_migration_018,
+    ),
 )
 
 

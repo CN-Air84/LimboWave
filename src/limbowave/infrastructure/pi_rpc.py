@@ -19,6 +19,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import shutil
 import sys
 from collections import deque
@@ -386,8 +387,39 @@ def resolve_pi_argv(
     return argv
 
 
+def _managed_cli(bindir: Path) -> Path | None:
+    """Resolve the active release beside a managed Pi launcher without executing it."""
+    install = bindir.parent / "install"
+    try:
+        version = (install / "current-version").read_text(encoding="utf-8").strip()
+        if version in {".", ".."} or re.fullmatch(r"[0-9A-Za-z._+-]+", version) is None:
+            return None
+        package = (
+            install / "releases" / version / "node_modules"
+            / "@earendil-works" / "pi-coding-agent"
+        )
+        manifest = json.loads((package / "package.json").read_text(encoding="utf-8"))
+        if not isinstance(manifest, dict):
+            return None
+        entry = manifest.get("bin")
+        if isinstance(entry, dict):
+            entry = entry.get("pi")
+        if not isinstance(entry, str) or not entry:
+            return None
+        relative = Path(entry)
+        if relative.is_absolute() or relative.drive or ".." in relative.parts:
+            return None
+        cli = (package / relative).resolve()
+        if cli.is_relative_to(package.resolve()) and cli.is_file():
+            return cli
+    except (OSError, UnicodeError, ValueError):
+        # A broken optional installation must not prevent checking normal npm prefixes.
+        return None
+    return None
+
+
 def _locate_cli(node: str | None = None) -> Path:
-    """从 npm 垫片反推全局 node_modules 中的 cli.js。"""
+    """从 Pi 启动器定位当前托管版本，兼容全局 npm 与 Node 版本管理器布局。"""
     relative = Path("@earendil-works") / "pi-coding-agent" / "dist" / "bundle" / "cli.js"
     candidates: list[Path] = []
     for shim in ("pi", "pi.cmd", "pi.ps1"):
@@ -398,6 +430,9 @@ def _locate_cli(node: str | None = None) -> Path:
             if resolved.name == "cli.js" and "pi-coding-agent" in resolved.parts:
                 candidates.append(resolved)
             for bindir in (shim_path.parent, resolved.parent):
+                managed = _managed_cli(bindir)
+                if managed is not None:
+                    candidates.append(managed)
                 candidates.append(bindir / "node_modules" / relative)
                 candidates.append(bindir.parent / "lib" / "node_modules" / relative)
 

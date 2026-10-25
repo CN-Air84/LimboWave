@@ -32,6 +32,7 @@ PARAM_RULES_ENV = "LIMBOWAVE_PARAM_RULES"
 # 与扩展 registerAppTools() 及 tool_gateway._SCHEMAS 一一对应（有测试守）。
 APP_TOOLS = (
     "get_current_datetime",
+    "query_chat_history",
     "read_document",
     "list_directory",
     "stat_file",

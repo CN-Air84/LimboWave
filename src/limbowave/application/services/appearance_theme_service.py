@@ -15,11 +15,13 @@ from typing import Any
 
 from PIL import Image, ImageOps, UnidentifiedImageError
 
+from limbowave.application.services.preferences_service import default_theme
 from limbowave.domain.appearance import (
     BUILTIN_BY_ID,
     BUILTIN_THEMES,
     DEFAULT_THEME_ID,
     AppearanceTheme,
+    default_theme_id_for_mode,
 )
 
 SCHEMA_VERSION = 1
@@ -39,7 +41,7 @@ class AppearanceThemeService:
         self,
         root: Path,
         *,
-        legacy_theme: str = "dark",
+        legacy_theme: str | None = None,
         legacy_background_image: str = "",
         legacy_blur_radius: int = 0,
     ) -> None:
@@ -48,10 +50,13 @@ class AppearanceThemeService:
         self.assets = root / "assets"
         self.path = root / "theme-state.json"
         self._lock = RLock()
-        self._legacy_theme = legacy_theme
+        self._legacy_theme = default_theme() if legacy_theme is None else legacy_theme
         self._state = self._load()
         if not state_existed and legacy_background_image:
             self._migrate_legacy_background(legacy_background_image, legacy_blur_radius)
+
+    def _default_theme_id(self) -> str:
+        return default_theme_id_for_mode(self._legacy_theme)
 
     def _migrate_legacy_background(self, path: str, radius: int) -> None:
         try:
@@ -221,8 +226,7 @@ class AppearanceThemeService:
 
     def _load(self) -> ThemeState:
         if not self.path.is_file():
-            legacy_id = "builtin:clear-day" if self._legacy_theme == "light" else DEFAULT_THEME_ID
-            return ThemeState(0, legacy_id, ())
+            return ThemeState(0, self._default_theme_id(), ())
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
             if int(raw.get("schema_version", -1)) != SCHEMA_VERSION:

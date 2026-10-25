@@ -229,3 +229,38 @@ def test_markdown_dependencies_load_only_when_needed():
         )], capture_output=True, text=True, timeout=20,
     )
     assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("markdown", [
+    "- 阅读、搜索资料\n- 整理要点",
+    "- 阅读、搜索资料\n\n- 整理要点",
+    "3. 阅读、搜索资料\n4. 整理要点",
+    "3. 阅读、搜索资料\n\n4. 整理要点",
+    "- 阅读、搜索资料\n  - 整理要点\n    1. 子项目",
+])
+def test_list_typography_in_qt(qapp: QApplication, markdown: str) -> None:
+    document = QTextDocument()
+    document.setIndentWidth(20)
+    document.setHtml(render(markdown))
+    block = document.begin()
+    list_blocks = []
+    while block.isValid():
+        if block.textList() is not None:
+            list_blocks.append(block)
+            assert block.blockFormat().lineHeight() == 160
+            assert block.blockFormat().lineHeightType() == 1  # ProportionalHeight
+        block = block.next()
+    assert len(list_blocks) >= 2
+    expected_depths = [1, 2, 3] if "子项目" in markdown else [1, 1]
+    assert [b.textList().format().indent() for b in list_blocks] == expected_depths
+    if markdown.startswith("3."):
+        assert list_blocks[0].textList().format().start() == 3
+
+
+def test_list_styling_does_not_leak_into_code_or_paragraphs(qapp: QApplication) -> None:
+    document = QTextDocument()
+    document.setHtml(render("正文\n\n- 项目\n\n```text\n- not a list\n```"))
+    for text in ("正文", "- not a list"):
+        block = document.find(text).block()
+        assert block.textList() is None
+        assert block.blockFormat().lineHeight() != 160

@@ -20,6 +20,7 @@ from limbowave.infrastructure.memory_repositories import InMemoryStore, in_memor
 
 TOOLS = {
     "get_current_datetime": {},
+    "query_chat_history": {"query": "secret"},
     "add_session_memory": {"content": "secret", "call_id": "call", "run_id": "run"},
     "read_document": {"file_id": "attachment"},
     "list_directory": {"path": "."},
@@ -38,6 +39,8 @@ def gateway(tmp_path: Path) -> ToolGateway:
     permissions = PermissionService(in_memory_uow_factory(InMemoryStore()))
     # Existing persisted conversation grants must not enlarge the remote ceiling.
     for capability in Capability:
+        if capability is Capability.HISTORY_READ:
+            continue  # 该能力不支持持久授权；只能逐次确认或完全访问。
         permissions.grant(
             "conversation", capability, allowed_paths=(str(tmp_path),), allowed_domains=("*",)
         )
@@ -56,10 +59,10 @@ def test_web_denied_before_any_dependency(
     gateway: ToolGateway, tool: str, confirmed: bool, mode: ExecutionMode
 ) -> None:
     # Even an authorizer that would permit everything must never be consulted.
-    dependencies = [Mock(), Mock(), Mock(), Mock(), Mock(), Mock(), Mock()]
+    dependencies = [Mock() for _ in range(8)]
     (
         gateway._permissions, gateway._files, gateway._network, gateway._terminal,
-        gateway._documents, gateway.memory_service, gateway.memory_context,
+        gateway._documents, gateway.memory_service, gateway.memory_context, gateway._chat_history,
     ) = dependencies
     with remote_origin():
         result = gateway.invoke(
@@ -224,6 +227,7 @@ PERMISSION_GATES = [
     ("user_bash", {"tool": "user_bash", "input": {"command": "whoami"},
                    "command": "whoami"}),
     ("unknown", {"tool": "unknown", "input": {"path": "notes.txt"}}),
+    ("query_chat_history", {"tool": "query_chat_history", "input": {"query": "secret"}}),
     ("add_session_memory", {"tool": "add_session_memory", "input": {"content": "note"},
                             "run_id": "run", "call_id": "call"}),
     ("malformed", "not json"),

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import fields
+from dataclasses import fields, replace
 from pathlib import Path
 
 import pytest
@@ -34,9 +34,16 @@ UI_DIR = Path(__file__).resolve().parents[2] / "src" / "limbowave" / "ui"
 @pytest.fixture(autouse=True)
 def _restore_default_theme():
     """每个用例后恢复默认主题，避免用例间互相污染（令牌是模块级全局）。"""
+    from PySide6.QtWidgets import QApplication
+
+    app = QApplication.instance()
+    old_css = app.styleSheet() if isinstance(app, QApplication) else None
     yield
     theme.set_palette("dark")
     theme.set_font_scale(1.0)
+    app = QApplication.instance()
+    if isinstance(app, QApplication) and old_css is not None:
+        app.setStyleSheet(old_css)
 
 
 # ---------- 调色板 ----------
@@ -147,12 +154,31 @@ def test_bubble_styles_follow_palette() -> None:
     )
 
 
-def test_assistant_bubble_uses_card_surface_and_border() -> None:
-    theme.set_palette("dark")
+@pytest.mark.parametrize("palette", ["dark", "light"])
+def test_assistant_reply_uses_rounded_theme_card(palette: str) -> None:
+    theme.set_palette(palette)
     stylesheet = theme.bubble_stylesheet("assistant")
 
-    assert f"background: {theme.card_surface()}" in stylesheet
-    assert f"border: 1px solid {theme.BORDER}" in stylesheet
+    assert f"background: {theme.card_surface()};" in stylesheet
+    assert "border: none;" in stylesheet
+    assert f"border-radius: {theme.RADIUS_BUBBLE}px;" in stylesheet
+    assert f"color: {theme.TEXT_PRIMARY};" in stylesheet
+
+
+@pytest.mark.parametrize("wallpaper", [False, True])
+@pytest.mark.parametrize("cards_enabled", [False, True])
+def test_assistant_background_respects_card_material(wallpaper: bool, cards_enabled: bool) -> None:
+    definition = BUILTIN_THEMES[0]
+    definition = replace(
+        definition,
+        background=replace(definition.background, asset="wall.png" if wallpaper else ""),
+        materials=replace(definition.materials, cards_enabled=cards_enabled, content_opacity=0.6),
+    )
+    theme.apply_appearance_theme(definition)
+    expected = (
+        theme.qss_alpha(theme.BG_SURFACE, 0.6) if wallpaper and cards_enabled else theme.BG_SURFACE
+    )
+    assert f"background: {expected};" in theme.bubble_stylesheet("assistant")
 
 
 # ---------- 偏好持久化 ----------
@@ -172,6 +198,38 @@ def test_preferences_missing_file_gives_defaults(tmp_path: Path) -> None:
     loaded = PreferencesService(tmp_path / "nope.json").load()
     assert loaded.theme == DEFAULT_THEME
     assert loaded.font_scale == DEFAULT_FONT_SCALE
+
+
+def test_preferences_default_theme_follows_system_color_scheme(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from PySide6.QtCore import Qt
+
+    from limbowave.application.services import preferences_service
+
+    class _FakeHints:
+        def __init__(self, scheme: Qt.ColorScheme) -> None:
+            self._scheme = scheme
+
+        def colorScheme(self) -> Qt.ColorScheme:
+            return self._scheme
+
+    app = preferences_service.detect_system_theme
+    assert app() in SUPPORTED_THEMES
+
+    from PySide6.QtGui import QGuiApplication
+
+    gui_app = QGuiApplication.instance()
+    if gui_app is not None:
+        monkeypatch.setattr(gui_app, "styleHints", lambda: _FakeHints(Qt.ColorScheme.Light))
+        assert preferences_service.detect_system_theme() == "light"
+        assert Preferences().theme == "light"
+        assert PreferencesService(tmp_path / "missing-light.json").load().theme == "light"
+
+        monkeypatch.setattr(gui_app, "styleHints", lambda: _FakeHints(Qt.ColorScheme.Dark))
+        assert preferences_service.detect_system_theme() == "dark"
+        assert Preferences().theme == "dark"
+        assert PreferencesService(tmp_path / "missing-dark.json").load().theme == "dark"
 
 
 def test_preferences_corrupt_file_gives_defaults(tmp_path: Path) -> None:

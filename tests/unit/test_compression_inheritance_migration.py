@@ -68,7 +68,7 @@ def test_upgrade_repairs_missing_copies_preserving_ciphertext_and_originals(lega
     conn, factory = legacy
     originals = conn.execute("SELECT * FROM compression_versions").fetchall()
     messages = conn.execute("SELECT * FROM messages").fetchall()
-    assert migrate(conn) == 13
+    assert migrate(conn, target=13) == 13
     with factory() as uow:
         parent = uow.compressions.get_active("b1")
         child = uow.compressions.get_active("child")

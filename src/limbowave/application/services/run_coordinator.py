@@ -186,6 +186,8 @@ class _LiveRun:
     # 实际发给内核的 prompt（含文档注记）；镜像匹配以它为用户条目的基准
     origin: str = "desktop"
     sent_prompt: str | None = None
+    # Accepted user events carry Pi identity even when image processing changes text.
+    accepted_user_timestamps: set[int | float] = field(default_factory=set)
     images: list[dict[str, Any]] = field(default_factory=list)
     route_error: bool = False
     first_turn: bool = False
@@ -1563,15 +1565,45 @@ class RunCoordinator:
         allowed: set[str],
         message_id: str,
     ) -> str | None:
-        """补链旧版落空的镜像：带注记的消息曾按**原文**匹配，镜像 message_id 悬空。
+        """Repair NULL links only with unique, verifiable run or exact-prompt evidence.
 
-        只认「原文 + 意图快照注记」拼回的**实际 prompt** 严格相等、且全会话孤儿
-        候选唯一；有歧义宁可继续拒绝——分叉锚点不能靠猜（旧版同文误关联的教训）。
-        补链与分叉在同一事务提交，恢复原分支时也互不亏欠。
+        Pi can normalize images or expand input before persisting the user entry,
+        so its text need not equal the application's input. A legacy repair needs
+        both run ownership and the accepted user's timestamp within that run.
+        Older attachment-note records without timestamps keep their exact-match
+        fallback; ambiguous candidates never become a branch anchor.
         """
         message = uow.messages.get(message_id)
         if message is None or message.role is not MessageRole.USER:
             return None
+        run = uow.runs.get(message.run_id) if message.run_id else None
+        if (
+            run is not None
+            and run.user_message_id == message.id
+            and run.conversation_id == message.conversation_id
+            and run.branch_id == message.branch_id
+            and run.finished_at is not None
+        ):
+            # Capture ownership alone is not enough: old runtimes sometimes copied
+            # a previous session into this run. Require a unique user in this run
+            # AND a timestamp inside its lifetime (Pi has millisecond precision).
+            users = [
+                m for m in mirrors
+                if m.run_id == run.id
+                and (m.payload.get("message") or {}).get("role") == "user"
+            ]
+            if len(users) == 1:
+                orphan = users[0]
+                stamp = (orphan.payload.get("message") or {}).get("timestamp")
+                if (
+                    orphan.message_id is None
+                    and orphan.entry_id in allowed
+                    and isinstance(stamp, (int, float)) and not isinstance(stamp, bool)
+                    and int(run.created_at.timestamp() * 1000)
+                    <= stamp <= run.finished_at.timestamp() * 1000 + 1
+                ):
+                    uow.runtime.link_message(orphan.id, message_id)
+                    return str(orphan.entry_id)
         intent = uow.snapshots.get_intent(message.run_id) if message.run_id else None
         attachment_ids = list(intent.attachment_ids) if intent else []
         if not attachment_ids or self.attachment_builder is None:
@@ -2068,6 +2100,12 @@ class RunCoordinator:
 
         elif kind == "message.end":
             message = payload.get("message") or {}
+            stamp = message.get("timestamp")
+            if (
+                live is not None and message.get("role") == "user"
+                and isinstance(stamp, (int, float)) and not isinstance(stamp, bool)
+            ):
+                live.accepted_user_timestamps.add(stamp)
             if message.get("role") == "assistant":
                 final_text = self._extract_text(message)
                 stop = message.get("stopReason")
@@ -2681,12 +2719,23 @@ class RunCoordinator:
         entries = isolate_conversation_entries(entries, conversation)
         now = self._tick()
         mirrors: list[RuntimeEntryMirror] = []
+        # Never attach two same-text or same-timestamp entries to one application
+        # input. Restrict identity matching to entries first captured in this run.
+        user_candidates = {
+            str(entry["id"]) for entry in entries
+            if entry.get("id") and entry["id"] not in known
+            and (entry.get("message") or {}).get("role") == "user"
+            and self._match_message_id(live, entry["message"]) == live.user_message_id
+        }
         for entry in entries:
             entry_id = entry.get("id")
             if not entry_id or entry_id in known:
                 continue
             known.add(entry_id)
             message = entry.get("message") or {}
+            message_id = self._match_message_id(live, message)
+            if message.get("role") == "user" and user_candidates != {str(entry_id)}:
+                message_id = None
             mirrors.append(
                 RuntimeEntryMirror(
                     id=self._new_id("mirror"),
@@ -2696,7 +2745,7 @@ class RunCoordinator:
                     captured_at=now,
                     run_id=live.run_id,
                     parent_entry_id=entry.get("parentId"),
-                    message_id=self._match_message_id(live, message),
+                    message_id=message_id,
                     # 镜像内容同样脱敏：Pi 条目里可能带上工具参数中的凭据
                     payload=redact_body(entry),
                 )
@@ -2705,13 +2754,19 @@ class RunCoordinator:
 
     @staticmethod
     def _match_message_id(live: _LiveRun, message: dict[str, Any]) -> str | None:
-        """把 Pi 条目关联回应用消息。对不上就留空——**不用 Pi entry ID 当应用主键**。
+        """Use accepted user identity; text is a fallback for timestamp-less kernels.
 
-        用户条目以**实际发出的 prompt** 为基准：注记只进 prompt、不落消息原文，
-        用原文比会让带附件的消息永远关联不上，分叉时找不到 entry。
+        Pi's image normalization can append hints after send_message. Match the
+        timestamp received in message.end rather than assuming text is immutable.
+        Keep assistant matching and attachment-prompt matching for older kernels.
         """
         role = message.get("role")
         if role == "user":
+            if live.accepted_user_timestamps:
+                return (
+                    live.user_message_id
+                    if message.get("timestamp") in live.accepted_user_timestamps else None
+                )
             baseline = live.sent_prompt if live.sent_prompt is not None else ""
             if RunCoordinator._extract_text(message) == baseline:
                 return live.user_message_id

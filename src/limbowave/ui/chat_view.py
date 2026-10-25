@@ -5,7 +5,7 @@
 
 视觉结构：消息排在居中的一栏里（最宽与输入框一致），每条消息是一个行容器
 （``_BubbleRow``）。用户消息套靠右的强调色气泡；助手回复放在铺满整栏的
-低对比度背景板里，内含 Markdown 正文（``QTextBrowser``）与复制 / Fork 动作栏；
+圆角背景板里，Markdown 正文（``QTextBrowser``）与下方复制 / Fork 动作栏对齐板内左缘；
 错误是靠左的暖红提示块。用户消息保持纯文本。
 
 一轮 Agent run 只占**一张**卡片（长任务不再碎成多卡）：卡片内按模型消息分成
@@ -78,6 +78,7 @@ from PySide6.QtGui import (
     QPainterPath,
     QPaintEvent,
     QPen,
+    QRegion,
     QResizeEvent,
     QShowEvent,
     QTextCursor,
@@ -109,6 +110,7 @@ from limbowave.domain.files import SUPPORTED_ATTACHMENTS_HINT
 from limbowave.domain.permissions import PermissionPreset
 from limbowave.domain.tool_step import ToolStep, finish
 from limbowave.ui import markdown_render, soft_shadow, theme
+from limbowave.ui.ambient_background import paint_ambient_background
 from limbowave.ui.attachment_bar import AttachmentBar, AttachmentMenu, DraftAttachment
 from limbowave.ui.backdrop import BackdropEngine
 from limbowave.ui.compression_widgets import (
@@ -147,8 +149,8 @@ _TOOL_STEPS_FADE_MS = 220
 _HISTORY_ENTER_OFFSET = 8
 _COMPOSER_WRAP_BOTTOM = 14  # 输入框外包布局的底边距
 _COMPOSER_WRAP_SIDE = 16  # 输入框行与对话区左右边缘的最小间距
-_COMPOSER_MAX_WIDTH = 800  # 输入框最宽多少；对话区再宽，输入框（连同高级栏）居中
-_COMPOSER_MIN_WIDTH = 480  # 窄对话区里，收起高级栏后输入框至少放宽到这么宽
+_COMPOSER_MAX_WIDTH = 800  # 高级设置叠盖在输入框内，不参与限宽布局
+_ADVANCED_SLIDE_MS = 240
 # 消息排在居中的一栏里，最宽与输入框一致（_COMPOSER_MAX_WIDTH）；对话区再宽只加大两侧留白。
 _MESSAGE_SIDE_MIN = 32  # 消息栏与对话区左右边缘的最小留白
 _MESSAGE_COLUMN_MIN = 240  # 视口还没排版（很窄）时，气泡宽度按这个栏宽估算
@@ -158,8 +160,7 @@ _BUBBLE_PAD_X = 16  # 气泡内文字与左右边缘的间距
 _BUBBLE_PAD_Y = 10  # 气泡内文字与上下边缘的间距
 _ACTION_BUTTON_SIZE = 28  # 消息动作按钮（复制 / Fork / 编辑）的点击区
 _COPIED_FEEDBACK_MS = 1500  # 复制后对勾停留多久再换回复制图标
-_ADVANCED_SLIDE_MS = 220  # 高级栏向右展开 / 收回、输入框随之平移的时长
-# 输入框的投影观感参数在 soft_shadow（与高级栏共用），范围罩在输入框行的
+# 输入框的投影观感参数在 soft_shadow，范围罩在输入框行的
 # 上下边距（10 / 14）以内，否则会被上面的消息区、下面的垫块盖住一截。
 _TRANSCRIPT_BOTTOM = 12  # 消息区内容的底边距
 _STICK_THRESHOLD = 24  # 距底部多少像素以内视为「停在底部」，流式输出会自动跟随
@@ -454,7 +455,7 @@ class _BubbleRow(QWidget):
     - 用户消息：靠右的气泡，宽度随文字收窄，最宽占栏宽的 ``_USER_BUBBLE_RATIO``；
       编辑按钮在气泡左侧，悬停才显示（位置常驻，显隐时气泡不挪动）；
       这条消息发送失败时，编辑按钮再左侧常驻一个重试按钮。
-    - 助手消息：铺满整栏的低对比度背景板。**一轮 Agent run 一张卡**：卡内按
+    - 助手消息：铺满整栏的低对比度圆角背景板。**一轮 Agent run 一张卡**：卡内按
       模型消息分段（``_AssistantSegment``，段间细分隔线），思考块与工具 chip
       归属各段；思考块默认折叠，工具步骤与动作栏（复制 / Fork）在卡级共享，
       动作栏整轮收敛后才出现。
@@ -522,6 +523,7 @@ class _BubbleRow(QWidget):
         # 这样定稿时动作按钮的可见状态也能立即生效，无需等下一轮事件循环。
         panel = QFrame(self)
         panel.setObjectName("assistantMessagePanel")
+        panel.setFrameShape(QFrame.Shape.NoFrame)
         panel.setStyleSheet(
             "QFrame#assistantMessagePanel"
             f" {{ {theme.bubble_stylesheet('assistant')} }}"
@@ -806,8 +808,9 @@ class _BubbleRow(QWidget):
             "QTextBrowser { background: transparent; border: none; }"
             "QTextBrowser QScrollBar:horizontal { height: 0px; width: 0px; margin: 0; }"
         )
-        # 正文与思考块、工具步骤、动作栏左缘对齐
+        # 正文与思考块、工具步骤、动作栏左缘对齐；收敛列表默认缩进（Qt 默认 40px 过深）
         browser.document().setDocumentMargin(0)
+        browser.document().setIndentWidth(20)
         browser.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         # 工具往返会留下空正文段。空浏览器加上主题圆角滚动条，会退化成一根
         # 没有语义的横条；这里直接拆掉横向滚动条，空段也先不占位。
@@ -1309,6 +1312,10 @@ class _BackdropHost(QWidget):
                 radius=getattr(self, "_backdrop_radius", 0.0),
             )
             painter.end()
+        elif isinstance(view, QWidget):
+            painter = QPainter(self)
+            paint_ambient_background(self, painter, canvas=view)
+            painter.end()
 
 
 class _ContextUsageRing(QWidget):
@@ -1727,7 +1734,7 @@ class _ComposerFrame(QFrame):
         self._refresh_style()
 
     def _refresh_style(self) -> None:
-        border = theme.ACCENT if self._drag_active else theme.BORDER
+        border = theme.ACCENT if self._drag_active else theme.container_border()
         surface = "transparent" if self._backdrop is not None else theme.card_surface()
         self.setStyleSheet(
             f"QFrame#composer {{ background: {surface}; border: 1px solid {border};"
@@ -1788,42 +1795,22 @@ class _ComposerFrame(QFrame):
         event.ignore()
 
 
-def _composer_span(available: int, panel: int, progress: float) -> tuple[int, int]:
-    """输入框在输入框行里的宽度与左侧偏移。
-
-    ``panel`` 是右侧并排高级栏占的宽度（含间距），``progress`` 是它的展开进度。
-    展开时输入框与高级栏并排、整体居中；收起时同宽的输入框单独居中。
-    对话区窄到放不下时，收起态的输入框放宽到 ``_COMPOSER_MIN_WIDTH``，不白白让位。
-    """
-    expanded = max(0, min(_COMPOSER_MAX_WIDTH, available - panel))
-    collapsed = max(expanded, min(available, _COMPOSER_MIN_WIDTH))
-    width = round(collapsed + (expanded - collapsed) * progress)
-    group = width + round(panel * progress)
-    return width, max(0, (available - group) // 2)
+def _composer_span(available: int) -> tuple[int, int]:
+    """输入框占满分配到的宽度（最多 800px）。"""
+    width = max(0, min(_COMPOSER_MAX_WIDTH, available))
+    return width, max(0, (available - width) // 2)
 
 
 class _ComposerRowLayout(QLayout):
-    """输入框所在的一行：输入框限宽居中，高级栏展开时向左让出右侧并排的位置。
-
-    让位只影响摆放，不计入最小尺寸：宽对话区里两侧留白很大，
-    若算进最小尺寸，会反过来撑住窗口、缩不回去。
-    """
+    """输入框限宽居中；叠在其内部的设置栏不占布局空间。"""
 
     def __init__(self) -> None:
         super().__init__()
         self._item: QLayoutItem | None = None
-        self._panel = 0
-        self._progress = 0.0
-
-    def set_side_panel(self, width: int, progress: float) -> None:
-        """设置右侧并排高级栏的宽度（含间距）与展开进度，并立即重排。"""
-        self._panel = width
-        self._progress = progress
-        if not self.geometry().isEmpty():
-            self.setGeometry(self.geometry())
 
     def addItem(self, item: QLayoutItem) -> None:
         self._item = item
+        self.invalidate()
 
     def count(self) -> int:
         return 0 if self._item is None else 1
@@ -1851,12 +1838,7 @@ class _ComposerRowLayout(QLayout):
         if self._item is None:
             return
         area = self.contentsRect()
-        width, offset = _composer_span(area.width(), self._panel, self._progress)
-        # The composer width is a layout decision, not a content size hint. In
-        # particular, attachment chips can report a very wide minimum size;
-        # honoring it here lets them push the composer past its configured cap.
-        width = min(area.width(), width)
-        offset = min(offset, area.width() - width)
+        width, offset = _composer_span(area.width())
         self._item.setGeometry(QRect(area.x() + offset, area.y(), width, area.height()))
 
     def _with_margins(self, size: QSize) -> QSize:
@@ -1905,7 +1887,7 @@ class ChatView(QWidget):
     # 加载历史只改变布局，不应覆盖用户当前的展开 / 收起状态。
     docked_changed = Signal(bool, bool)
     advanced_toggle_requested = Signal()  # 输入框右上角的高级栏开关被点击
-    # 高级栏展开进度（0 = 收起，1 = 展开），动画中逐帧发出；上层据此摆放高级栏
+    # 高级栏叠盖进度（0 = 收起，1 = 展开），动画中逐帧通知订阅方
     advanced_progress_changed = Signal(float)
 
     def __init__(
@@ -1921,8 +1903,9 @@ class ChatView(QWidget):
         self._dock_progress = 0.0  # 0 = 居中，1 = 停靠底部
         self._dock_anim: QVariantAnimation | None = None
         self._advanced_progress = 0.0  # 0 = 收起，1 = 展开
+        self._advanced_panel: QWidget | None = None
+        self._advanced_clip: QWidget | None = None
         self._advanced_anim: QVariantAnimation | None = None
-        self._side_panel_width = 0  # 输入框右侧并排高级栏占的宽度（含间距）
         self._shadow_painted = QRect()  # 上次画输入框阴影的范围，输入框挪动时连同旧位置一起重画
         self._stream_row: _BubbleRow | None = None
         self._run_rows: list[_BubbleRow] = []
@@ -2006,6 +1989,8 @@ class ChatView(QWidget):
         if engine is not None and engine.active:
             # 输入框行两侧与消息区、底部垫块是同一张背景图（不着色），看不出分层
             engine.paint(self, painter, tint="#00000000", radius=0.0)
+        else:
+            paint_ambient_background(self, painter)
         self._paint_composer_shadow(painter)
         painter.end()
 
@@ -2089,7 +2074,7 @@ class ChatView(QWidget):
         scroll_bar.rangeChanged.connect(self._on_scroll_range_changed)
 
         # Zcode 风格组合输入框：附件、逻辑模型、上下文圆环和发送合并到单一容器。
-        # 输入框限宽居中；高级栏展开时并排在它右侧（高级栏本身由上层摆放）。
+        # 输入框限宽居中；高级面板由上层悬浮摆放，不参与布局。
         self._composer_row = _ComposerRowLayout()
         self._composer_row.setContentsMargins(
             _COMPOSER_WRAP_SIDE, 10, _COMPOSER_WRAP_SIDE, _COMPOSER_WRAP_BOTTOM
@@ -2255,7 +2240,7 @@ class ChatView(QWidget):
             "QComboBox::drop-down { background: transparent; border: none; width: 16px; }"
             "QComboBox::down-arrow { image: none; }"
             f"QComboBox QAbstractItemView {{ background: {theme.BG_SURFACE};"
-            f" color: {theme.TEXT_PRIMARY}; border: 1px solid {theme.BORDER};"
+            f" color: {theme.TEXT_PRIMARY}; border: 1px solid {theme.container_border()};"
             f" selection-background-color: {theme.BG_SURFACE_HOVER}; }}"
         )
         self._logical_model.currentIndexChanged.connect(self._on_logical_model_changed)
@@ -2304,6 +2289,9 @@ class ChatView(QWidget):
             bounds = self._composer_shadow_bounds()
             self.update(self._shadow_painted.united(bounds))
             self._shadow_painted = bounds
+            self._place_advanced_panel()
+        if watched is self._advanced_panel and event.type() == QEvent.Type.LayoutRequest:
+            self._place_advanced_panel()
         if watched is self._input and event.type() == QEvent.Type.KeyPress:
             key_event = cast(QKeyEvent, event)
             if (
@@ -3622,25 +3610,32 @@ class ChatView(QWidget):
 
     @property
     def advanced_progress(self) -> float:
-        """高级栏展开进度：0 = 收起，1 = 展开；动画中介于两者之间。"""
+        """高级栏叠盖进度：0 = 收起，1 = 展开，动画中为中间值。"""
         return self._advanced_progress
 
-    def set_side_panel_width(self, width: int) -> None:
-        """输入框右侧并排高级栏占的宽度（含与输入框的间距）；展开时输入框为它让位。"""
-        self._side_panel_width = max(0, width)
-        self._composer_row.set_side_panel(self._side_panel_width, self._advanced_progress)
+    def set_advanced_panel(self, panel: QWidget) -> None:
+        """高级栏在输入框右半部内滑入，不改变输入框与对话的布局。"""
+        self._advanced_panel = panel
+        clip = QWidget(self._composer)
+        clip.setObjectName("advancedComposerClip")
+        clip.setStyleSheet("#advancedComposerClip { background: transparent; }")
+        self._advanced_clip = clip
+        panel.setParent(clip)
+        panel.installEventFilter(self)
+        clip.hide()
 
     def set_advanced_expanded(self, expanded: bool) -> None:
-        """同步右上角开关，并把输入框平移到展开 / 收起后的位置（可见时带动画）。"""
+        """双向滑动可从当前进度反转，避免重新起步或瞬间显隐。"""
         self._advanced_expanded = expanded
         self._refresh_advanced_btn()
         if self._advanced_anim is not None:
             self._advanced_anim.stop()
             self._advanced_anim = None
-        target = 1.0 if expanded else 0.0
+        target = float(expanded)
         if not self.isVisible() or self._advanced_progress == target:
             self._on_advanced_progress(target)
             return
+        self._place_advanced_panel()
         anim = QVariantAnimation(self)
         anim.setDuration(_ADVANCED_SLIDE_MS)
         anim.setStartValue(self._advanced_progress)
@@ -3653,22 +3648,46 @@ class ChatView(QWidget):
 
     def _on_advanced_progress(self, value: object) -> None:
         self._advanced_progress = float(cast(float, value))
-        self._composer_row.set_side_panel(self._side_panel_width, self._advanced_progress)
+        self._place_advanced_panel()
         self.advanced_progress_changed.emit(self._advanced_progress)
 
     def _on_advanced_finished(self) -> None:
         self._advanced_anim = None
 
+    def _place_advanced_panel(self) -> None:
+        panel, clip = self._advanced_panel, self._advanced_clip
+        if panel is None or clip is None:
+            return
+        if not self._advanced_expanded and self._advanced_progress <= 0.0:
+            clip.hide()
+            return
+        composer = self._composer
+        width = max(1, composer.width() // 2)
+        panel.setFixedWidth(width)
+        height = min(composer.height(), panel.sizeHint().height())
+        clip.setGeometry(composer.width() - width, composer.height() - height, width, height)
+        offset = round(width * (1.0 - self._advanced_progress))
+        panel.setGeometry(offset, 0, width, height)
+        # The viewport clips both painting and hit testing. Never place a parent
+        # opacity effect over the action row's own animated graphics effects.
+        clip.setMask(QRegion(min(offset, width - 1), 0, max(1, width - offset), height))
+        panel.show()
+        clip.show()
+        clip.raise_()
+
     def _refresh_advanced_btn(self) -> None:
-        """箭头指向点击后高级栏的去向：收起时向右展开，展开时向左收回。"""
+        """开关保留在输入框右上角，箭头指示右侧设置区域。"""
         expanded = self._advanced_expanded
         button = self._advanced_btn
-        button.setText("高级 ⟨" if expanded else "高级 ⟩")
+        button.setText("高级 ‹" if expanded else "高级 ›")
+        button.setAccessibleName("高级设置")
+        button.setCheckable(True)
+        button.setChecked(expanded)
         button.setToolTip("收起高级栏" if expanded else "展开高级栏")
         color = theme.ACCENT if expanded else theme.TEXT_SECONDARY
         button.setStyleSheet(
             f"QPushButton {{ background: transparent; color: {color};"
-            f" border: 1px solid {theme.BORDER}; border-radius: 12px; padding: 0 9px;"
+            f" border: 1px solid {theme.container_border()}; border-radius: 12px; padding: 0 9px;"
             f" font-size: {theme.FS_SMALL}px; }}"
             f"QPushButton:hover {{ color: {theme.TEXT_PRIMARY}; }}"
         )
@@ -3718,7 +3737,7 @@ class ChatView(QWidget):
             self._scroll_to_bottom()
 
     def _apply_lift(self) -> None:
-        """居中态让输入框中线对齐对话区中线；停靠态抬升为 0。"""
+        """居中态让整个输入区域对齐对话区中线；停靠态抬升为 0。"""
         centered = max(0, (self.height() - self._composer.height()) // 2 - _COMPOSER_WRAP_BOTTOM)
         lift = round(centered * (1.0 - self._dock_progress))
         if lift != self._composer_lift.height():
@@ -3758,13 +3777,17 @@ class ChatView(QWidget):
     def _fit_column(self) -> None:
         """按视口宽度摆消息栏：最宽与输入框一致并居中，窄时两侧至少留 _MESSAGE_SIDE_MIN。"""
         width = self._scroll.viewport().width()
-        side = max(_MESSAGE_SIDE_MIN, (width - _COMPOSER_MAX_WIDTH) // 2)
+        available = max(0, width - 2 * _MESSAGE_SIDE_MIN)
+        column = min(_COMPOSER_MAX_WIDTH, available)
+        # 奇数视口把多出的 1px 分给右侧，避免消息栏突破 800px 上限。
+        left = max(_MESSAGE_SIDE_MIN, (width - column) // 2)
+        right = max(_MESSAGE_SIDE_MIN, width - column - left)
         margins = self._transcript.contentsMargins()
-        if margins.left() != side or margins.right() != side:
-            margins.setLeft(side)
-            margins.setRight(side)
+        if margins.left() != left or margins.right() != right:
+            margins.setLeft(left)
+            margins.setRight(right)
             self._transcript.setContentsMargins(margins)
-        column = max(_MESSAGE_COLUMN_MIN, width - 2 * side)
+        column = max(_MESSAGE_COLUMN_MIN, column)
         if column != self._column_width:
             self._column_width = column
             for row in self._rows:

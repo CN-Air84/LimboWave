@@ -52,11 +52,11 @@ class Palette:
 
 DARK = Palette(
     name="dark",
-    bg_app="#0f1115",
-    bg_surface="#171a21",
-    bg_surface_hover="#1e222b",
-    bg_elevated="#22262f",
-    border="#2a2f3a",
+    bg_app="#0b0c0e",
+    bg_surface="#16181d",
+    bg_surface_hover="#1e2026",
+    bg_elevated="#1c1f25",
+    border="#2a2c32",
     accent="#5b6cff",
     accent_hover="#6d7dff",
     accent_pressed="#4a5ae0",
@@ -66,7 +66,7 @@ DARK = Palette(
     danger_bg="#3a2226",
     danger_text="#f2b8c6",
     warning="#d9a03f",
-    code_bg="#1c1f27",
+    code_bg="#212631",
 )
 
 # 浅色：白底 + 同色相强调色（保证与深色同一设计语言），文字用深灰而非纯黑
@@ -76,7 +76,7 @@ LIGHT = Palette(
     bg_surface="#ffffff",
     bg_surface_hover="#eef1f5",
     bg_elevated="#e6eaf0",
-    border="#d6dbe3",
+    border="#dde2ea",
     accent="#4a5ae0",
     accent_hover="#5b6cff",
     accent_pressed="#3a48c0",
@@ -86,7 +86,7 @@ LIGHT = Palette(
     danger_bg="#fbe6ea",
     danger_text="#a3324a",
     warning="#8a5b12",
-    code_bg="#eef1f5",
+    code_bg="#edf2f7",
 )
 
 _PALETTES: dict[str, Palette] = {"dark": DARK, "light": LIGHT}
@@ -199,9 +199,9 @@ def apply_appearance_theme(definition: AppearanceTheme) -> Palette:
         name=definition.id,
         bg_app=colors.background,
         bg_surface=colors.card,
-        bg_surface_hover=_blend(colors.component, colors.text, 0.10),
+        bg_surface_hover=_blend(colors.component, colors.text, 0.06 if dark else 0.08),
         bg_elevated=colors.component,
-        border=_blend(colors.component, colors.text, 0.20),
+        border=_blend(colors.component, "#FFFFFF" if dark else colors.text, 0.06 if dark else 0.11),
         accent=colors.accent,
         accent_hover=_blend(colors.accent, "#FFFFFF" if dark else "#000000", 0.12),
         accent_pressed=_blend(colors.accent, "#000000", 0.16),
@@ -211,7 +211,11 @@ def apply_appearance_theme(definition: AppearanceTheme) -> Palette:
         danger_bg=colors.error,
         danger_text=_blend(colors.text, colors.error, 0.12),
         warning=colors.warning,
-        code_bg=_blend(colors.component, colors.background, 0.35),
+        code_bg=(
+            _blend(colors.card, colors.text, 0.06)
+            if dark
+            else _blend(colors.card, colors.background, 0.85)
+        ),
     )
     global _current_materials, _background_active, TAB_INDICATOR
     _current_materials = definition.materials
@@ -273,6 +277,27 @@ def tool_hover_surface() -> str:
     目标只有 30px 高、比整行页签更容易错过，浓度略高。
     """
     return qss_alpha(TEXT_PRIMARY, 0.08)
+
+
+def is_dark(palette: Palette | None = None) -> bool:
+    return sum(_rgb((palette or _current_palette).bg_app)) < 384
+
+
+def container_border(*, hovered: bool = False, palette: Palette | None = None) -> str:
+    """Quiet decorative edges; keep BORDER opaque for native QPainter controls."""
+    palette = palette or _current_palette
+    if is_dark(palette):
+        return qss_alpha("#FFFFFF", 0.08 if hovered else 0.06)
+    return palette.text_secondary if hovered else palette.border
+
+
+def sidebar_surface() -> str:
+    """An intermediate elevation without introducing a new persisted theme color."""
+    return _blend(BG_APP, BG_SURFACE, 0.58) if is_dark() else BG_SURFACE
+
+
+def ambient_background_active() -> bool:
+    return is_dark() and not _background_active
 
 
 def card_surface() -> str:
@@ -352,7 +377,7 @@ def user_bubble_surface() -> str:
 def bubble_stylesheet(role: str) -> str:
     """消息气泡的 QSS 声明，调用方贴在气泡容器上。
 
-    用户消息使用强调色淡色调；助手消息使用主题卡片表面与细边框；
+    用户消息使用强调色淡色调；助手消息使用主题卡片底色与圆角，不叠加边框；
     错误提示使用暖红背景。
     """
     if role == "error":
@@ -360,7 +385,7 @@ def bubble_stylesheet(role: str) -> str:
     if role == "assistant":
         return (
             f"background: {card_surface()}; color: {TEXT_PRIMARY};"
-            f" border: 1px solid {BORDER}; border-radius: {RADIUS_BUBBLE}px;"
+            f" border: none; border-radius: {RADIUS_BUBBLE}px;"
         )
     return (
         f"background: {user_bubble_surface()}; color: {TEXT_PRIMARY};"
@@ -399,7 +424,9 @@ def refresh_inline_styles(
         css = widget.styleSheet()
         if not css:
             continue
-        updated = css
+        updated = css.replace(
+            container_border(palette=previous), "__CONTAINER_BORDER__"
+        )
         if old_card_surface:
             updated = re.sub(
                 re.escape(old_card_surface), card_surface(), updated, flags=re.IGNORECASE
@@ -417,6 +444,7 @@ def refresh_inline_styles(
             lambda m: f"font-size: {sizes.get(int(m.group(1)), int(m.group(1)))}px",
             updated,
         )
+        updated = updated.replace("__CONTAINER_BORDER__", container_border())
         if updated != css:
             widget.setStyleSheet(updated)
 
@@ -432,11 +460,14 @@ def chrome_surface(color: str) -> str:
 
 def combo_frame_colors() -> tuple[str, str, str]:
     """下拉框边框的（静止, 悬停/焦点, 展开）颜色。全部不透明，动画层可直接覆盖在 QSS 边框上。"""
-    return TEXT_SECONDARY, _blend(TEXT_SECONDARY, TEXT_PRIMARY, 0.55), ACCENT
+    if is_dark():
+        return _blend(BG_ELEVATED, "#FFFFFF", 0.08), ACCENT, ACCENT
+    return _blend(BORDER, TEXT_SECONDARY, 0.28), TEXT_SECONDARY, ACCENT
 
 
 def app_stylesheet() -> str:
     """全局 QSS。切换主题/字号后重新设置一次，多数组件立即生效。"""
+    border = container_border()
     icon_dir = (Path(__file__).parent / "assets").as_posix()
     button_surface = control_surface("buttons")
     input_surface = control_surface("text_inputs")
@@ -451,7 +482,7 @@ def app_stylesheet() -> str:
     button_surface = chrome_surface(button_surface)
     input_surface = chrome_surface(input_surface)
     selection_surface = chrome_surface(selection_surface)
-    selection_border = qss_alpha(TEXT_SECONDARY, 0.55)
+    selection_border = container_border() if is_dark() else qss_alpha(TEXT_SECONDARY, 0.55)
     combo_rest, combo_emphasis, combo_open = combo_frame_colors()
     item_surface = chrome_surface(item_surface)
     return f"""
@@ -462,10 +493,11 @@ QWidget {{
     font-family: {FONT_FAMILY};
     font-size: {FS_BASE}px;
 }}
+Sidebar {{ background: {sidebar_surface()}; }}
 QToolTip {{
     background: {BG_ELEVATED};
     color: {TEXT_PRIMARY};
-    border: 1px solid {BORDER};
+    border: 1px solid {border};
     padding: 4px 8px;
     border-radius: {RADIUS_SM}px;
 }}
@@ -474,14 +506,14 @@ QToolTip {{
 QPushButton {{
     background: {button_surface};
     color: {TEXT_PRIMARY};
-    border: 1px solid {BORDER};
+    border: 1px solid {border};
     border-radius: {RADIUS_MD}px;
     padding: 7px 16px;
 }}
-QPushButton:hover {{ background: {hover}; border-color: {TEXT_SECONDARY}; }}
+QPushButton:hover {{ background: {hover}; border-color: {container_border(hovered=True)}; }}
 QPushButton:pressed {{ background: {elevated}; }}
 QPushButton:focus {{ border-color: {ACCENT}; }}
-QPushButton:disabled {{ color: {TEXT_SECONDARY}; background: {disabled}; border-color: {BORDER}; }}
+QPushButton:disabled {{ color: {TEXT_SECONDARY}; background: {disabled}; border-color: {border}; }}
 QPushButton[accent="true"] {{
     background: {ACCENT};
     color: {TEXT_ON_ACCENT};
@@ -501,10 +533,47 @@ QPushButton[flat="true"]:focus {{ border-color: {ACCENT}; color: {TEXT_PRIMARY};
 /* 方形图标按钮（如输入框发送/停止）：去掉正文按钮的内边距，图标才能居中。 */
 QPushButton[iconOnly="true"] {{ padding: 0px; margin: 0px; }}
 
+/* Sidebar actions share quiet neutral surfaces, not the primary-action accent. */
+QPushButton#sidebarNewConversation,
+QPushButton#sidebarSearch,
+QPushButton#sidebarSettings {{
+    border: 1px solid transparent;
+    padding: 0px 12px;
+    color: {TEXT_PRIMARY};
+}}
+QPushButton#sidebarNewConversation {{
+    background: {qss_alpha(TEXT_PRIMARY, 0.08)};
+    text-align: left;
+}}
+QPushButton#sidebarSearch {{ background: {qss_alpha(TEXT_PRIMARY, 0.08)}; }}
+QPushButton#sidebarSettings {{
+    background: transparent;
+    text-align: left;
+}}
+QPushButton#sidebarNewConversation:hover,
+QPushButton#sidebarSearch:hover,
+QPushButton#sidebarSettings:hover {{
+    background: {qss_alpha(TEXT_PRIMARY, 0.12)};
+    border-color: transparent;
+}}
+QPushButton#sidebarNewConversation:pressed,
+QPushButton#sidebarSearch:pressed,
+QPushButton#sidebarSettings:pressed {{ background: {qss_alpha(TEXT_PRIMARY, 0.16)}; }}
+QPushButton#sidebarNewConversation:focus,
+QPushButton#sidebarSearch:focus,
+QPushButton#sidebarSettings:focus {{ border-color: {qss_alpha(TEXT_PRIMARY, 0.35)}; }}
+QPushButton#sidebarNewConversation:disabled,
+QPushButton#sidebarSearch:disabled,
+QPushButton#sidebarSettings:disabled {{
+    background: {qss_alpha(TEXT_PRIMARY, 0.03)};
+    color: {TEXT_SECONDARY};
+    border-color: transparent;
+}}
+
 /* ---------- 输入 ---------- */
 QLineEdit, QPlainTextEdit, QSpinBox, QDoubleSpinBox, QDateEdit {{
     background: {input_surface};
-    border: 1px solid {BORDER};
+    border: 1px solid {border};
     border-radius: {RADIUS_MD}px;
     min-height: 20px;
     padding: 7px 12px;
@@ -535,7 +604,7 @@ QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {{
     subcontrol-origin: border;
     width: 22px;
     background: {selection_surface};
-    border-left: 1px solid {BORDER};
+    border-left: 1px solid {border};
 }}
 QSpinBox::up-button, QDoubleSpinBox::up-button {{
     subcontrol-position: top right;
@@ -543,7 +612,7 @@ QSpinBox::up-button, QDoubleSpinBox::up-button {{
 }}
 QSpinBox::down-button, QDoubleSpinBox::down-button {{
     subcontrol-position: bottom right;
-    border-top: 1px solid {BORDER};
+    border-top: 1px solid {border};
     border-bottom-right-radius: {RADIUS_MD}px;
 }}
 QSpinBox::up-button:hover, QSpinBox::down-button:hover,
@@ -583,7 +652,7 @@ QComboBox:on {{
 }}
 QComboBox:disabled {{
     color: {TEXT_SECONDARY};
-    border-color: {BORDER};
+    border-color: {border};
 }}
 QComboBox::drop-down {{
     subcontrol-origin: padding;
@@ -591,7 +660,7 @@ QComboBox::drop-down {{
     width: 22px;
     background: {selection_surface};
     border: none;
-    border-left: 1px solid {BORDER};
+    border-left: 1px solid {border};
     border-top-right-radius: {RADIUS_MD}px;
     border-bottom-right-radius: {RADIUS_MD}px;
 }}
@@ -609,6 +678,9 @@ QComboBox QAbstractItemView {{
     selection-background-color: {BG_SURFACE_HOVER};
     selection-color: {TEXT_PRIMARY};
     outline: none;
+}}
+QComboBox QAbstractItemView QWidget {{
+    background: transparent;
 }}
 QComboBox QAbstractItemView::item:hover, QComboBox QAbstractItemView::item:selected {{
     background: {BG_SURFACE_HOVER};
@@ -628,6 +700,13 @@ QListWidget::item {{
 }}
 QListWidget::item:hover {{ background: {hover}; }}
 QListWidget::item:selected {{ background: {elevated}; color: {TEXT_PRIMARY}; }}
+/* Conversation selection is a single soft fill, including keyboard navigation. */
+QListWidget#conversationList::item {{ border: none; }}
+QListWidget#conversationList::item:hover {{ background: {qss_alpha(TEXT_PRIMARY, 0.04)}; }}
+QListWidget#conversationList::item:selected {{
+    background: {qss_alpha(TEXT_PRIMARY, 0.08)};
+    color: {TEXT_PRIMARY};
+}}
 /* 设置页名称列表使用更具体的选择器，确保条目背景按圆角裁切。 */
 QListWidget#settingsNameList::item {{
     border-radius: {RADIUS_MD}px;
@@ -657,7 +736,7 @@ QListWidget#modelBindingsList::item {{
     padding: 8px 10px;
     margin: 0px;
     border-radius: 0px;
-    border-bottom: 1px solid {BORDER};
+    border-bottom: 1px solid {border};
 }}
 QListWidget#modelBindingsList::item:hover {{ background: {BG_SURFACE_HOVER}; }}
 QListWidget#modelBindingsList::item:selected {{
@@ -668,7 +747,7 @@ QListWidget#modelBindingsList::item:selected {{
 /* ---------- 树 / 表格 ---------- */
 QTreeWidget {{
     background: {item_surface};
-    border: 1px solid {BORDER};
+    border: 1px solid {border};
     border-radius: {RADIUS_MD}px;
     outline: none;
 }}
@@ -678,7 +757,7 @@ QHeaderView::section {{
     background: {item_surface};
     color: {TEXT_SECONDARY};
     border: none;
-    border-bottom: 1px solid {BORDER};
+    border-bottom: 1px solid {border};
     padding: 6px 8px;
     font-size: {FS_SMALL}px;
 }}
@@ -686,7 +765,7 @@ QHeaderView::section {{
 /* ---------- 实际模型自建条目 ---------- */
 #actualModelsScroll, #actualModelsContent {{ background: transparent; border: none; }}
 QFrame#actualModelRow {{
-    background: {card}; border: 1px solid {BORDER}; border-radius: {RADIUS_MD}px;
+    background: {card}; border: 1px solid {border}; border-radius: {RADIUS_MD}px;
 }}
 #actualModelRow QLabel, #actualModelRow QCheckBox {{ background: transparent; border: none; }}
 #actualModelsTitle {{ font-size: {FS_TITLE}px; font-weight: 600; border: none; }}
@@ -755,7 +834,7 @@ QTabBar#appearanceSubtabs::tab:selected:hover, QTabBar#endpointSubtabs::tab:sele
 }}
 
 /* ---------- 页签 ---------- */
-QTabWidget::pane {{ border: 1px solid {BORDER}; border-radius: {RADIUS_MD}px; top: -1px; }}
+QTabWidget::pane {{ border: 1px solid {border}; border-radius: {RADIUS_MD}px; top: -1px; }}
 QTabBar::tab {{
     background: transparent;
     color: {TEXT_SECONDARY};
@@ -788,10 +867,12 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0; }}
 /* ---------- 分隔条 ---------- */
 QSplitter::handle {{ background: {BORDER}; }}
 QSplitter::handle:horizontal {{ width: 1px; }}
+QSplitter#workspaceSplitter::handle {{ background: {qss_alpha(TEXT_PRIMARY, 0.04)}; }}
+QSplitter#workspaceSplitter::handle:hover {{ background: {qss_alpha(TEXT_PRIMARY, 0.12)}; }}
 
 /* ---------- 对话框与提示 ---------- */
 QDialog, QMessageBox {{ background: {BG_APP}; }}
-QMenu {{ background: {BG_SURFACE}; color: {TEXT_PRIMARY}; border: 1px solid {BORDER}; }}
+QMenu {{ background: {BG_SURFACE}; color: {TEXT_PRIMARY}; border: 1px solid {border}; }}
 QMessageBox QLabel {{ color: {TEXT_PRIMARY}; }}
 /* 指示器由 checkbox_style 的代理样式绘制（方框 + 勾选过渡）。
    不要在这里写 QCheckBox::indicator：样式表一旦有该规则就会自己画，过渡随之失效。 */

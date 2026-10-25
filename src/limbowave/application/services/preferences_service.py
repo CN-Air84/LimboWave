@@ -11,21 +11,98 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import asdict, dataclass
+import os
+import sys
+from contextlib import suppress
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-DEFAULT_THEME = "dark"
 DEFAULT_FONT_SCALE = 1.0
 SUPPORTED_THEMES = ("dark", "light")
 FONT_SCALES = (0.9, 1.0, 1.15, 1.3, 1.5)
+
+_captured_system_theme: str | None = None
+
+
+def _detect_from_os() -> str | None:
+    """Read OS-level color-scheme hints when Qt styleHints is unavailable or Unknown."""
+    gtk_theme = os.environ.get("GTK_THEME", "").strip().lower()
+    if gtk_theme:
+        if gtk_theme.endswith((":dark", "-dark")) or ":dark" in gtk_theme:
+            return "dark"
+        if gtk_theme.endswith((":light", "-light")) or ":light" in gtk_theme:
+            return "light"
+    if sys.platform == "win32":
+        import winreg
+
+        with (
+            suppress(OSError),
+            winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+            ) as key,
+        ):
+            value, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
+            if isinstance(value, int):
+                return "light" if value != 0 else "dark"
+    return None
+
+
+def capture_system_theme(app: object | None = None) -> str:
+    """Capture the native system theme before an application stylesheet overrides QPalette."""
+    global _captured_system_theme
+    detected = detect_system_theme(app)
+    _captured_system_theme = detected
+    return detected
+
+
+def detect_system_theme(app: object | None = None) -> str:
+    """Detect whether the operating system prefers ``'light'`` or ``'dark'`` mode."""
+    with suppress( Exception):
+        from PySide6.QtCore import Qt
+        from PySide6.QtGui import QGuiApplication, QPalette
+
+        gui_app = app if isinstance(app, QGuiApplication) else QGuiApplication.instance()
+        if isinstance(gui_app, QGuiApplication):
+            scheme = gui_app.styleHints().colorScheme()
+            if scheme == Qt.ColorScheme.Light:
+                return "light"
+            if scheme == Qt.ColorScheme.Dark:
+                return "dark"
+            if _captured_system_theme in SUPPORTED_THEMES:
+                return _captured_system_theme
+            os_hint = _detect_from_os()
+            if os_hint in SUPPORTED_THEMES:
+                return os_hint
+            stylesheet = getattr(gui_app, "styleSheet", lambda: "")()
+            if not stylesheet:
+                palette = gui_app.palette()
+                window_l = palette.color(QPalette.ColorRole.Window).lightness()
+                text_l = palette.color(QPalette.ColorRole.WindowText).lightness()
+                if window_l != text_l:
+                    return "light" if window_l > text_l else "dark"
+    if _captured_system_theme in SUPPORTED_THEMES:
+        return _captured_system_theme
+    os_hint = _detect_from_os()
+    if os_hint in SUPPORTED_THEMES:
+        return os_hint
+    return "dark"
+
+
+def default_theme() -> str:
+    """Return the default theme mode (``'light'`` or ``'dark'``) following system settings."""
+    return detect_system_theme()
+
+
+DEFAULT_THEME = detect_system_theme()
 
 
 @dataclass(frozen=True, slots=True)
 class Preferences:
     """界面偏好。不可变；改动走 :meth:`PreferencesService.save`。"""
 
-    theme: str = DEFAULT_THEME
+    theme: str = field(default_factory=default_theme)
     font_scale: float = DEFAULT_FONT_SCALE
     font_family: str = ""
     font_file: str = ""
@@ -37,9 +114,10 @@ class Preferences:
 
     @classmethod
     def from_json(cls, data: dict[str, Any]) -> Preferences:
-        theme = str(data.get("theme", DEFAULT_THEME))
+        fallback_theme = default_theme()
+        theme = str(data.get("theme", fallback_theme))
         if theme not in SUPPORTED_THEMES:
-            theme = DEFAULT_THEME
+            theme = fallback_theme
         try:
             scale = float(data.get("font_scale", DEFAULT_FONT_SCALE))
         except (TypeError, ValueError):

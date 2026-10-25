@@ -176,29 +176,18 @@ def test_active_indicator_marks_current_conversation(qtbot: QtBot) -> None:
     assert sidebar._list.item(0).data(ROLE_ACTIVE)
 
 
-def test_active_indicator_eases_between_conversations(qtbot: QtBot) -> None:
-    """当前会话竖条是独立控件，A→B 时连续缓动而不是瞬间重绘。"""
-    from PySide6.QtCore import QAbstractAnimation
+def test_active_selection_has_no_accent_rail(qtbot: QtBot) -> None:
+    """切换会话保留选中态，但不再创建抢眼的左侧竖条。"""
+    from PySide6.QtWidgets import QFrame
 
     sidebar = Sidebar()
     qtbot.addWidget(sidebar)
-    sidebar.resize(300, 500)
-    sidebar.show()
-    qtbot.waitExposed(sidebar)
     sidebar.show_conversations([("c1", "a", 1), ("c2", "b", 2)])
     sidebar.set_active("c1")
-    start = sidebar._active_indicator.geometry()
-
     sidebar.set_active("c2")
 
-    assert sidebar._indicator_animation.state() == QAbstractAnimation.State.Running
-    qtbot.waitUntil(
-        lambda: sidebar._indicator_animation.state() == QAbstractAnimation.State.Stopped
-    )
-    target = sidebar._indicator_target()
-    assert target is not None
-    assert sidebar._active_indicator.geometry() == target
-    assert target.top() > start.top()
+    assert sidebar._list.currentRow() == 1
+    assert sidebar.findChild(QFrame, "conversationActiveIndicator") is None
 
 
 def test_double_click_expands_branches_and_switches(qtbot: QtBot) -> None:

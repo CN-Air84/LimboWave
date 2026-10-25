@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
 import threading
@@ -97,6 +98,73 @@ def test_cli_discovery_uses_selected_node_prefix(tmp_path, monkeypatch) -> None:
     cli.touch()
     monkeypatch.setattr(pi_rpc.shutil, "which", lambda name: None)
     assert pi_rpc._locate_cli(str(node)) == cli
+
+
+@pytest.fixture
+def managed_install(tmp_path, monkeypatch):
+    agent = tmp_path / "agent"
+    shim = agent / "bin" / "pi.cmd"
+    shim.parent.mkdir(parents=True)
+    shim.write_text('@ECHO off\nnode "%~dp0pi-launcher.js" %*', encoding="utf-8")
+    install = agent / "install"
+    install.mkdir()
+    (install / "current-version").write_text("1.1.0\n", encoding="utf-8")
+    package = install / "releases/1.1.0/node_modules/@earendil-works/pi-coding-agent"
+    package.mkdir(parents=True)
+    monkeypatch.setattr(
+        pi_rpc.shutil, "which", lambda name: str(shim) if name == "pi.cmd" else None,
+    )
+    monkeypatch.setattr(pi_rpc.Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
+    return agent, package
+
+
+@pytest.mark.parametrize("bin_value", ["dist/custom-cli.js", {"pi": "dist/custom-cli.js"}])
+def test_cli_discovery_reads_active_managed_release(managed_install, bin_value):
+    agent, package = managed_install
+    (package / "package.json").write_text(json.dumps({"bin": bin_value}), encoding="utf-8")
+    cli = package / "dist/custom-cli.js"
+    cli.parent.mkdir()
+    cli.touch()
+    # A leftover global layout must not override the release selected by the launcher.
+    stale = agent / "bin/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js"
+    stale.parent.mkdir(parents=True)
+    stale.touch()
+    argv = pi_rpc.resolve_pi_argv(node="node", extra_args=["--mode", "rpc"])
+    assert argv == ["node", str(cli), "--mode", "rpc"]
+
+
+@pytest.mark.parametrize("version", ["", ".", "..", "../old", "old/release", "C:\\old", "/old"])
+def test_cli_discovery_rejects_invalid_managed_version(managed_install, version):
+    agent, _package = managed_install
+    (agent / "install/current-version").write_text(version, encoding="utf-8")
+    with pytest.raises(RuntimeError, match="Pi CLI"):
+        pi_rpc._locate_cli()
+
+
+@pytest.mark.parametrize("manifest", [
+    "{broken", "[]", '{"bin": null}', '{"bin": {"pi": 123}}',
+    '{"bin": "../../outside.js"}', '{"bin": "dist/missing.js"}',
+])
+def test_cli_discovery_rejects_invalid_managed_entry(managed_install, manifest):
+    _agent, package = managed_install
+    (package / "package.json").write_text(manifest, encoding="utf-8")
+    (package.parent.parent / "outside.js").touch()
+    with pytest.raises(RuntimeError, match="Pi CLI"):
+        pi_rpc._locate_cli()
+
+
+def test_cli_discovery_follows_changed_managed_release(managed_install):
+    agent, package = managed_install
+    (package / "package.json").write_text('{"bin": "cli.js"}', encoding="utf-8")
+    (package / "cli.js").touch()
+    assert pi_rpc._locate_cli() == package / "cli.js"
+    newer = agent / "install/releases/1.2.0/node_modules/@earendil-works/pi-coding-agent"
+    newer.mkdir(parents=True)
+    (newer / "package.json").write_text('{"bin": {"pi": "cli.js"}}', encoding="utf-8")
+    (newer / "cli.js").touch()
+    (agent / "install/current-version").write_text("1.2.0", encoding="utf-8")
+    assert pi_rpc._locate_cli() == newer / "cli.js"
 
 
 @pytest.mark.skipif(os.name == "nt", reason="native POSIX symlink installation layout")

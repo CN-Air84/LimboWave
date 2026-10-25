@@ -25,6 +25,7 @@ from limbowave.domain.permissions import (
     PermissionDecision,
     PermissionGrant,
     PermissionPreset,
+    RiskLevel,
     ToolRequest,
     evaluate,
 )
@@ -49,7 +50,9 @@ class PermissionService:
         command_classes: tuple[str, ...] = (),
         note: str = "",
     ) -> PermissionGrant:
-        """授予一项会话级权限。重开会话时自动恢复（授权在库里）。"""
+        """授予一项会话级权限。历史查询只支持逐次审批或完全访问，不可持久授权。"""
+        if capability is Capability.HISTORY_READ:
+            raise ValueError("跨会话聊天记录查询不支持本会话持久授权")
         record = PermissionGrant(
             id=f"grant_{uuid4().hex[:16]}",
             conversation_id=conversation_id,
@@ -107,6 +110,8 @@ class PermissionService:
         workspace_root: str,
     ) -> None:
         """用自定义面板的四个能力开关替换当前会话授权。"""
+        if Capability.HISTORY_READ in capabilities:
+            raise ValueError("跨会话聊天记录查询不支持本会话持久授权")
         for grant in self.list_grants(conversation_id):
             self.revoke(grant.id)
         for capability in Capability:
@@ -142,17 +147,32 @@ class PermissionService:
         *,
         mode: ExecutionMode = ExecutionMode.BUILTIN_TOOLS,
         user_confirmed: bool = False,
+        user_denied: bool = False,
     ) -> PermissionDecision:
         """对一个工具请求给出判定，并写审计。
 
         ``user_confirmed``：调用方在需要确认时已拿到用户答复（True=同意）。
         判定为 CONFIRM 且 ``user_confirmed=True`` 时，实际结果按 ALLOW 记录并执行；
         判定为 ALLOW 时直接执行。审计如实记录「是否用户确认」。
+        ``user_denied``：用户明确拒绝或审批已失效，返回并记录 DENY；优先于确认。
         """
         with self._uow_factory() as uow:
             grants = uow.permissions.list_grants(conversation_id)
+            conversation = (
+                uow.conversations.get(conversation_id)
+                if request.capability is Capability.HISTORY_READ else None
+            )
 
         decision = evaluate(request, grants, mode=mode)
+        if (request.capability is Capability.HISTORY_READ and conversation is not None
+                and conversation.permission_preset is PermissionPreset.FULL_ACCESS):
+            decision = PermissionDecision(
+                decision=Decision.ALLOW, risk=RiskLevel.NORMAL,
+                reason="完全访问允许查询既有聊天记录", matched_rule="history.full_access",
+            )
+        if user_denied:
+            user_confirmed = False
+            decision = replace(decision, decision=Decision.DENY, reason="用户拒绝了本次工具调用")
         recorded = decision.decision
         if recorded is Decision.CONFIRM and user_confirmed:
             recorded = Decision.ALLOW

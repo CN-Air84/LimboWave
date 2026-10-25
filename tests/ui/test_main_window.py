@@ -7,8 +7,7 @@ from PySide6.QtWidgets import QWidget
 from pytestqt.qtbot import QtBot
 
 from limbowave.ui.chat_view import ChatView
-from limbowave.ui.main_window import _ADVANCED_GAP, MainWindow
-from limbowave.ui.session_toolbar import TOOLBAR_WIDTH
+from limbowave.ui.main_window import MainWindow
 
 
 def test_window_title_identifies_app(qtbot: QtBot) -> None:
@@ -70,7 +69,8 @@ def test_all_three_panes_visible(qtbot: QtBot) -> None:
     """三栏（导航 / 聊天 / 工具栏）都在，且都能被压缩而不消失。"""
     window = MainWindow()
     qtbot.addWidget(window)
-    window.chat.add_user_message("hi")  # 有内容后高级栏展开
+    window.chat.add_user_message("hi")
+    window.chat._advanced_btn.click()  # 高级面板只按需打开
     assert window.sidebar.isVisibleTo(window)
     assert window.chat.isVisibleTo(window)
     assert window.toolbar.isVisibleTo(window)
@@ -113,11 +113,13 @@ def test_empty_session_centers_composer_and_collapses_advanced(qtbot: QtBot) -> 
 
     chat.add_user_message("hi")
     assert chat.docked
+    assert window.toolbar.collapsed
+    toggle.click()
     assert not window.toolbar.collapsed
     assert chat.advanced_expanded
     qtbot.waitUntil(_settled(chat, expanded=True), timeout=2000)
     assert window.toolbar.isVisible()
-    _assert_beside_composer(window)
+    _assert_over_composer(window)
 
     chat.clear_transcript()
     assert not chat.docked
@@ -147,7 +149,7 @@ def test_opening_history_from_empty_session_keeps_advanced_collapsed(qtbot: QtBo
 
 
 def _settled(chat: ChatView, *, expanded: bool) -> Callable[[], bool]:
-    """输入框已落到底部，高级栏的展开 / 收回动画也已播完。"""
+    """输入区域已落到底部，高级栏显隐状态也已同步。"""
     progress = 1.0 if expanded else 0.0
     return lambda: chat.composer_lift == 0 and chat.advanced_progress == progress
 
@@ -161,23 +163,26 @@ def _assert_centered(window: MainWindow, left: int, right: int) -> None:
     assert abs((left - host.left()) - (host.right() - right)) <= 1
 
 
-def _assert_beside_composer(window: MainWindow) -> None:
-    """高级栏并排在输入框右侧、上下对齐，两者作为一组在对话区里居中。"""
+def _assert_over_composer(window: MainWindow) -> None:
+    """高级区域叠盖输入框右半部，不挤窄或移动输入框。"""
     panel = _geometry_in_host(window, window.toolbar)
     composer = _geometry_in_host(window, window.chat._composer)
-    assert panel.left() == composer.right() + 1 + _ADVANCED_GAP
-    assert (panel.top(), panel.bottom()) == (composer.top(), composer.bottom())
-    _assert_centered(window, composer.left(), panel.right())
+    assert composer.contains(panel)
+    assert abs(panel.width() - composer.width() / 2) <= 1
+    assert panel.right() == composer.right()
+    assert panel.bottom() == composer.bottom()
+    _assert_centered(window, composer.left(), composer.right())
 
 
-def test_advanced_toggle_keeps_composer_width(qtbot: QtBot) -> None:
-    """展开/收起高级栏不改输入框宽度、不压窄消息区：收起时输入框居中，展开时与高级栏并排居中。"""
+def test_advanced_toggle_keeps_composer_and_transcript_geometry(qtbot: QtBot) -> None:
+    """展开仅叠盖输入框，不改变输入框、侧栏和消息区尺寸。"""
     window = MainWindow()
     qtbot.addWidget(window)
     window.show()
     window.resize(1200, 800)
     chat = window.chat
     chat.add_user_message("hi")
+    chat._advanced_btn.click()
     qtbot.waitUntil(_settled(chat, expanded=True), timeout=2000)
 
     # A user-adjusted sidebar must keep its width across both transitions.
@@ -197,40 +202,21 @@ def test_advanced_toggle_keeps_composer_width(qtbot: QtBot) -> None:
             composer = _geometry_in_host(window, chat._composer)
             _assert_centered(window, composer.left(), composer.right())
         else:
-            _assert_beside_composer(window)
+            _assert_over_composer(window)
 
 
-def test_advanced_bar_unfolds_rightward_from_composer(qtbot: QtBot) -> None:
-    """展开到一半：高级栏贴着输入框右侧只露出左半边，输入框同宽、正从中间往左让位。"""
+def test_advanced_slide_reverses_from_current_progress(qtbot: QtBot) -> None:
     window = MainWindow()
     qtbot.addWidget(window)
     window.show()
-    window.resize(1200, 800)
+    window.chat.add_user_message("hi")
     chat = window.chat
-    chat.add_user_message("hi")
-    qtbot.waitUntil(_settled(chat, expanded=True), timeout=2000)
-    width = chat._composer.width()
-    expanded_left = _geometry_in_host(window, chat._composer).left()
-
-    chat._on_advanced_progress(0.5)
-    panel = _geometry_in_host(window, window.toolbar)
-    composer = _geometry_in_host(window, chat._composer)
-    assert composer.width() == width
-    assert composer.left() > expanded_left
-    assert panel.left() == composer.right() + 1 + _ADVANCED_GAP
-    assert window.toolbar.mask().boundingRect().width() == TOOLBAR_WIDTH // 2
-
-
-def test_advanced_shadow_shares_animation_and_reverses_smoothly(qtbot: QtBot) -> None:
-    """快速反向切换时，阴影从当前进度续播，归零后才隐藏。"""
-    from limbowave.ui import soft_shadow
-
-    window = MainWindow()
-    qtbot.addWidget(window)
-    window.show()
-    qtbot.waitExposed(window)
-    chat = window.chat
-    shadow = window._toolbar_shadow
+    qtbot.waitUntil(lambda: chat._dock_anim is None and chat.composer_lift == 0)
+    # The lift can round to zero one tick before the final layout is applied.
+    # Record settled composer geometry, not the preceding docking frame.
+    chat.layout().activate()
+    before = chat._composer.geometry()
+    transcript = chat._scroll.geometry()
     previous = 0.0
     for expanded in (True, False, True):
         window.toolbar.set_collapsed(not expanded)
@@ -241,29 +227,46 @@ def test_advanced_shadow_shares_animation_and_reverses_smoothly(qtbot: QtBot) ->
         animation.setCurrentTime(animation.duration() // 2)
         progress = chat.advanced_progress
         assert min(previous, float(expanded)) < progress < max(previous, float(expanded))
-        assert shadow._progress == progress
-        visible = window.toolbar.geometry()
-        visible.setWidth(round(TOOLBAR_WIDTH * progress))
-        assert shadow.geometry() == soft_shadow.shadow_bounds(visible)
-        assert shadow.isVisible()
+        clip = chat._advanced_clip
+        assert clip is not None and clip.isVisible()
+        assert 0 < window.toolbar.x() < clip.width()
+        assert window.toolbar.x() == round(clip.width() * (1.0 - progress))
+        assert chat._composer.geometry() == before
+        assert chat._scroll.geometry() == transcript
+        assert clip.mask().boundingRect().width() < clip.width()
+        assert window.toolbar.graphicsEffect() is None
         previous = progress
-
     animation.setCurrentTime(animation.duration())
     assert chat.advanced_progress == 1.0
-    assert shadow._progress == 1.0
+    assert window.toolbar.x() == 0
+    _assert_over_composer(window)
     window.toolbar.set_collapsed(True)
     animation = chat._advanced_anim
     assert animation is not None
     animation.pause()
     animation.setCurrentTime(animation.duration() // 2)
-    assert 0.0 < shadow._progress < 1.0
-    assert shadow.isVisible()
+    assert window.toolbar.isVisible()
     animation.setCurrentTime(animation.duration())
-    assert not shadow.isVisible()
     assert not window.toolbar.isVisible()
+    assert not chat._advanced_clip.isVisible()
 
 
-def test_auto_collapse_reclaims_space_while_resizing(qtbot: QtBot) -> None:
+def test_advanced_overlay_tracks_growing_composer(qtbot: QtBot) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    window.chat.add_user_message("hi")
+    window.chat._advanced_btn.click()
+    qtbot.waitUntil(_settled(window.chat, expanded=True))
+    for text in ("short draft", "a line\n" * 12, "short again"):
+        window.chat._input.setPlainText(text)
+        qtbot.wait(80)
+        _assert_over_composer(window)
+        panel = _geometry_in_host(window, window.toolbar)
+        assert not panel.intersects(_geometry_in_host(window, window.chat._scroll))
+
+
+def test_narrow_window_does_not_auto_open_advanced(qtbot: QtBot) -> None:
     window = MainWindow()
     qtbot.addWidget(window)
     window.show()
@@ -277,8 +280,8 @@ def test_auto_collapse_reclaims_space_while_resizing(qtbot: QtBot) -> None:
     assert window.chat._advanced_btn.isVisible()
 
 
-def test_advanced_bar_keeps_latest_message_visible(qtbot: QtBot) -> None:
-    """长会话停在底部时，展开高级栏后最新消息仍完整可见，不被它遮住。"""
+def test_advanced_region_does_not_change_transcript_wrapping(qtbot: QtBot) -> None:
+    """叠盖区域不占布局空间，不影响消息换行，并保持贴底。"""
     window = MainWindow()
     qtbot.addWidget(window)
     window.show()
@@ -286,22 +289,16 @@ def test_advanced_bar_keeps_latest_message_visible(qtbot: QtBot) -> None:
     chat = window.chat
     chat.load_history([("user", f"消息 {index}", "", None) for index in range(40)])
     qtbot.waitUntil(lambda: chat.composer_lift == 0, timeout=2000)
-    chat._advanced_btn.click()
-    qtbot.waitUntil(_settled(chat, expanded=True), timeout=2000)
     bar = chat._scroll.verticalScrollBar()
-    assert bar.maximum() > 0
-
-    def latest_above_panel() -> bool:
-        last = chat._rows[-1]
-        bottom = last.mapTo(window._content_host, QPoint(0, last.height())).y()
-        return bar.value() == bar.maximum() and bottom <= window.toolbar.geometry().top()
-
-    qtbot.waitUntil(latest_above_panel, timeout=2000)
-    chat._advanced_btn.click()  # 收起
-    qtbot.waitUntil(lambda: bar.value() == bar.maximum(), timeout=2000)
-    chat._advanced_btn.click()  # 再展开
-    assert window.toolbar.isVisible()
-    qtbot.waitUntil(latest_above_panel, timeout=2000)
+    qtbot.waitUntil(lambda: bar.value() == bar.maximum())
+    qtbot.wait(50)
+    original = (chat._scroll.geometry(), chat._rows[-1].size(), bar.maximum())
+    for expanded in (True, False, True):
+        chat._advanced_btn.click()
+        qtbot.waitUntil(_settled(chat, expanded=expanded), timeout=2000)
+        qtbot.wait(50)
+        assert (chat._scroll.geometry(), chat._rows[-1].size(), bar.maximum()) == original
+        assert bar.value() == bar.maximum()
 
 
 def test_full_page_replaces_entire_workspace(qtbot: QtBot) -> None:
@@ -324,7 +321,7 @@ def test_full_page_replaces_entire_workspace(qtbot: QtBot) -> None:
     assert not window.showing_full_page
     assert window.sidebar.isVisibleTo(window)
     assert window.chat.isVisibleTo(window)
-    assert window.toolbar.isVisibleTo(window)
+    assert not window.toolbar.isVisibleTo(window)
 
 
 def test_settings_transition_fades_and_slides_both_directions(qtbot: QtBot) -> None:
@@ -445,7 +442,10 @@ def test_thinking_popup_follows_theme_switch(qtbot: QtBot) -> None:
         combo.showPopup()
         qtbot.wait(300)  # 上拉进场动效 150ms，等它播完再采样
         image = combo.view().grab().toImage()
-        color = image.pixelColor(4, image.height() // 2)
+        # Sample the empty right side of an unselected row, not its text.
+        row = (combo.currentIndex() + 1) % combo.count()
+        rect = combo.view().visualRect(combo.model().index(row, 0))
+        color = image.pixelColor(image.width() - 16, rect.center().y())
         combo.hidePopup()
         qtbot.wait(200)
         return color.name().upper()
@@ -469,6 +469,9 @@ def test_thinking_popup_follows_theme_switch(qtbot: QtBot) -> None:
         qtbot.addWidget(window)
         window.show()
         qtbot.wait(100)
+
+        window.chat._advanced_btn.click()
+        qtbot.waitUntil(lambda: window.chat.advanced_progress == 1.0)
 
         # 深色启动：弹层画主题的浮层底色，而不是系统擦除色/祖先烘死的底色
         assert popup_background() == theme.BG_ELEVATED.upper()

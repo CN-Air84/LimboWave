@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import pytest
-from PySide6.QtCore import QPoint, Qt
-from PySide6.QtGui import QColor, QPixmap
+from PySide6.QtCore import QPoint, QRectF, Qt
+from PySide6.QtGui import QColor, QPainter, QPixmap
 from PySide6.QtWidgets import QWidget
 from pytestqt.qtbot import QtBot
 
@@ -35,7 +35,8 @@ def _overlay(qtbot: QtBot, direction: int = 1) -> tuple[QWidget, _PageTransition
 
 def _pixel(overlay: _PageTransition, progress: float) -> QColor:
     overlay._set_progress(progress)
-    return overlay.grab().toImage().pixelColor(240, 160)
+    image = overlay.grab().toImage()
+    return image.pixelColor(image.width() // 2, image.height() // 2)
 
 
 @pytest.mark.parametrize("direction", [1, -1])
@@ -120,9 +121,11 @@ def test_exit_is_brisk_and_finishes_before_deferred_sidebar_refresh(qtbot):
     assert 160 <= leave.duration() < min(230, entry_duration)
 
 
+@pytest.mark.parametrize("size", [(1280, 800), (1537, 947)])
 @pytest.mark.parametrize("fraction", [0.15, 0.45, 0.8])
-def test_reversing_navigation_uses_current_composite(qtbot, fraction):
+def test_reversing_navigation_uses_current_composite(qtbot, fraction, size):
     window = _window(qtbot)
+    window.resize(*size)
     page = QWidget()
     page.setStyleSheet("background: #193452")
     window.show_full_page(page)
@@ -166,8 +169,6 @@ def test_login_entry_does_not_capture_or_freeze_live_logo(qtbot):
 
 @pytest.mark.parametrize("direction", [1, -1])
 def test_motion_is_reciprocal_and_restrained(qtbot, monkeypatch, direction):
-    from PySide6.QtGui import QPainter
-
     monkeypatch.setattr(theme, "BG_APP", "#000000")
     _host, overlay = _overlay(qtbot, direction)
     for attribute, color in (("_outgoing", "#ff0000"), ("_incoming_pixmap", "#0000ff")):
@@ -180,8 +181,9 @@ def test_motion_is_reciprocal_and_restrained(qtbot, monkeypatch, direction):
     image = overlay.grab().toImage()
     old_x = max(range(image.width()), key=lambda x: image.pixelColor(x, 160).red())
     new_x = max(range(image.width()), key=lambda x: image.pixelColor(x, 160).blue())
-    assert 0 < -direction * (old_x - 240) <= 24
-    assert 0 < direction * (new_x - 240) <= 24
+    dpr = image.devicePixelRatio()
+    assert 0 < -direction * (old_x / dpr - 240) <= 24
+    assert 0 < direction * (new_x / dpr - 240) <= 24
 
 
 def test_both_page_captures_respect_high_dpi_budget(qtbot):
@@ -333,3 +335,70 @@ def test_entry_overlay_filter_is_removed_when_navigation_finishes(qtbot, tmp_pat
     window.show_full_page(page)
     window._stop_transition()
     assert page.isVisibleTo(window)
+
+
+class _PatternPage(QWidget):
+    """Asymmetric landmarks reveal scaling/cropping hidden by solid-color tests."""
+
+    colors = ("#cf2020", "#20bf40", "#2040df", "#dfbf20")
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        width, height = self.width(), self.height()
+        painter.fillRect(self.rect(), QColor(self.colors[0]))
+        painter.fillRect(QRectF(width / 3, 0, width * 2 / 3, height), QColor(self.colors[1]))
+        painter.fillRect(QRectF(0, height / 3, width, height * 2 / 3), QColor(self.colors[2]))
+        painter.fillRect(
+            QRectF(width / 3, height / 3, width * 2 / 3, height * 2 / 3),
+            QColor(self.colors[3]),
+        )
+
+
+def _assert_pattern(image, colors):
+    for x, y, index in (
+        (0.0, 0.0, 0), (1.0, 0.0, 1), (0.0, 1.0, 2), (1.0, 1.0, 3),
+        (0.25, 0.25, 0), (0.4, 0.25, 1), (0.25, 0.4, 2), (0.4, 0.4, 3),
+    ):
+        pixel = image.pixelColor(round(x * (image.width() - 1)), round(y * (image.height() - 1)))
+        assert pixel == QColor(colors[index]), (x, y, pixel.name(), colors[index])
+
+
+@pytest.mark.parametrize("size", [(913, 617), (1280, 800), (1537, 947), (2003, 1201)])
+@pytest.mark.parametrize("mode", ["layered", "fade", "scroll"])
+def test_transition_maps_complete_snapshot_to_logical_page(qtbot, size, mode):
+    page = _PatternPage()
+    page.resize(*size)
+    qtbot.addWidget(page)
+    page.show()
+    old_frame = _page_snapshot(page)
+    _assert_pattern(old_frame.toImage(), page.colors)
+    old_colors = page.colors
+    page.colors = tuple(reversed(page.colors))
+    new_frame = _page_snapshot(page)
+    _assert_pattern(new_frame.toImage(), page.colors)
+    overlay = _PageTransition(
+        page, old_frame, new_frame, 1, layered=mode == "layered", scroll_down=mode == "scroll",
+    )
+    overlay.setGeometry(page.rect())
+    overlay.show()
+    for progress, colors in ((0.0, old_colors), (1.0, page.colors)):
+        overlay._set_progress(progress)
+        _assert_pattern(overlay.grab().toImage(), colors)
+
+
+@pytest.mark.parametrize("size", [(1103, 743), (1717, 1013)])
+def test_settings_snapshot_matches_page_after_window_resize(qtbot, size):
+    window = _window(qtbot)
+    window.resize(*size)
+    page = _PatternPage()
+    window.show_full_page(page)
+    entering = _pause_at(window, 0.0)
+    entering._set_progress(1.0)
+    _assert_pattern(entering.grab().toImage(), page.colors)
+    window._stop_transition()
+    # Returning after resizing settings must capture the new, not the old size.
+    window.resize(size[0] + 111, size[1] + 71)
+    assert page.size() == window._root_stack.size()
+    window.show_workspace(release_page=False)
+    leaving = _pause_at(window, 0.0)
+    _assert_pattern(leaving.grab().toImage(), page.colors)

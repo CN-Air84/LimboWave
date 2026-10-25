@@ -20,6 +20,7 @@ from PySide6.QtCore import (
     QObject,
     QPoint,
     QPropertyAnimation,
+    QRectF,
     Qt,
     QTimer,
     Signal,
@@ -28,10 +29,10 @@ from PySide6.QtGui import (
     QAction,
     QCloseEvent,
     QColor,
+    QKeyEvent,
     QPainter,
     QPaintEvent,
     QPixmap,
-    QRegion,
     QResizeEvent,
 )
 from PySide6.QtWidgets import (
@@ -53,9 +54,7 @@ from limbowave.ui.login_page import LoginPage
 from limbowave.ui.popup_material import PopupMaterials
 from limbowave.ui.session_toolbar import (
     TOOLBAR_RADIUS,
-    TOOLBAR_WIDTH,
     SessionToolbar,
-    ToolbarShadowLayer,
 )
 from limbowave.ui.sidebar import Sidebar
 
@@ -63,7 +62,6 @@ _MAX_TRANSITION_PIXELS = 1_400_000
 _FRAME_INTERVAL = 1 / 60
 _SETTINGS_ENTER_MS = 280
 _SETTINGS_EXIT_MS = 210
-_ADVANCED_GAP = 16  # 高级栏与输入框之间的间距（与输入框行的左右边距一致）
 
 
 def _page_snapshot(page: QWidget) -> QPixmap:
@@ -72,9 +70,14 @@ def _page_snapshot(page: QWidget) -> QPixmap:
     pixels = max(1, size.width() * size.height())
     ratio = min(page.devicePixelRatioF(), math.sqrt(_MAX_TRANSITION_PIXELS / pixels))
     frame = QPixmap(max(1, round(size.width() * ratio)), max(1, round(size.height() * ratio)))
-    frame.setDevicePixelRatio(ratio)
     frame.fill(QColor(theme.BG_APP))
-    page.render(frame)
+    # Raster dimensions round independently. Map the complete logical page into
+    # those exact pixels instead of using the budget ratio as a geometry scale.
+    painter = QPainter(frame)
+    painter.scale(frame.width() / max(1, size.width()), frame.height() / max(1, size.height()))
+    page.render(painter, QPoint())
+    painter.end()
+    frame.setDevicePixelRatio(ratio)
     return frame
 
 
@@ -150,6 +153,13 @@ class _PageTransition(QWidget):
         value = max(0.0, min(1.0, progress))
         return value * value * (3.0 - 2.0 * value)
 
+    def _draw_frame(self, painter: QPainter, frame: QPixmap, offset: int = 0) -> None:
+        # Snapshot DPR describes its bounded raster, not the destination size.
+        # A point-only draw uses rounded raster/DPR dimensions and can leave gaps
+        # or crop the page at fractional screen scales and non-default sizes.
+        target = QRectF(self.rect()).translated(offset, 0)
+        painter.drawPixmap(target, frame, QRectF(frame.rect()))
+
     def _paint_layered(self, painter: QPainter) -> None:
         incoming = self._incoming_pixmap
         if incoming is None:
@@ -163,15 +173,15 @@ class _PageTransition(QWidget):
         outgoing_distance, incoming_distance = (10, 24) if self._direction > 0 else (24, 10)
         if outgoing_opacity > 0.0:
             painter.setOpacity(outgoing_opacity)
-            painter.drawPixmap(
-                round(-self._direction * outgoing_distance * progress), 0, self._outgoing
+            self._draw_frame(
+                painter, self._outgoing, round(-self._direction * outgoing_distance * progress)
             )
         if incoming_opacity > 0.0:
             painter.setOpacity(incoming_opacity)
-            painter.drawPixmap(
-                round(self._direction * incoming_distance * (1.0 - progress) ** 3),
-                0,
+            self._draw_frame(
+                painter,
                 incoming,
+                round(self._direction * incoming_distance * (1.0 - progress) ** 3),
             )
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
@@ -206,22 +216,20 @@ class _PageTransition(QWidget):
         if incoming is not None:
             painter.setOpacity(self._progress)
             if self._scroll_down:
-                painter.drawPixmap(0, 0, incoming)
+                self._draw_frame(painter, incoming)
             else:
                 distance = 28
-                painter.drawPixmap(
-                    round(self._direction * distance * (1.0 - self._progress)),
-                    0,
-                    incoming,
+                self._draw_frame(
+                    painter, incoming, round(self._direction * distance * (1.0 - self._progress))
                 )
         painter.setOpacity(1.0 - self._progress)
         if self._scroll_down:
             distance = round(self.width() * 0.42)
-            painter.drawPixmap(round(distance * self._progress), 0, self._outgoing)
+            self._draw_frame(painter, self._outgoing, round(distance * self._progress))
         else:
             distance = 28
-            painter.drawPixmap(
-                round(-self._direction * distance * self._progress), 0, self._outgoing
+            self._draw_frame(
+                painter, self._outgoing, round(-self._direction * distance * self._progress)
             )
 
 
@@ -260,8 +268,7 @@ class MainWindow(QMainWindow):
         self._chat_view.message_submitted.connect(self.command_requested)
         self._chat_view.stop_requested.connect(self.stop_requested)
 
-        # 高级栏并排在输入框右侧，不参与布局：输入框限宽居中，展开时输入框向左让位、
-        # 高级栏向右展开；消息区宽度始终不变。
+        # 高级设置叠在输入框右半部，既不挤压输入框，也不覆盖消息区。
         content_host = QWidget()
         # 必须限定到自身：无选择器的 background 会级联进高级栏下拉的弹层窗口
         # （弹层是 combo 的子对象），把构造时的配色烘死在弹层上、压过全局 QSS 的
@@ -272,22 +279,17 @@ class MainWindow(QMainWindow):
         content_layout.setContentsMargins(0, 0, 0, 0)
         content_layout.setSpacing(0)
         content_layout.addWidget(self._chat_stack, 1)
-        self._toolbar.setParent(content_host)
-        # 高级栏的投影层：同父级的兄弟控件，垫在高级栏之下、消息区之上
-        self._toolbar_shadow = ToolbarShadowLayer(content_host)
-        self._toolbar_shadow.hide()
+        self._chat_view.set_advanced_panel(self._toolbar)
         self._content_host = content_host
         # 高级栏收起后整栏隐藏；展开/收起统一由输入框右上角的开关原地切换。
         self._toolbar.use_external_toggle()
-        self._chat_view.set_side_panel_width(TOOLBAR_WIDTH + _ADVANCED_GAP)
         self._chat_view.advanced_toggle_requested.connect(
             lambda: self._toolbar.set_collapsed(not self._toolbar.collapsed)
         )
-        # 展开进度逐帧变化，或输入框位移（居中↔停靠、让位）、缩放时，重新摆放高级栏。
-        self._chat_view.advanced_progress_changed.connect(lambda _progress: self._place_toolbar())
-        self._chat_view._composer.installEventFilter(self)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setObjectName("workspaceSplitter")
+        splitter.setHandleWidth(1)
         splitter.addWidget(self._sidebar)
         splitter.addWidget(content_host)
         splitter.setStretchFactor(0, 0)
@@ -295,8 +297,7 @@ class MainWindow(QMainWindow):
         splitter.setSizes([292, 988])
         self._splitter = splitter
         self._toolbar.collapse_toggled.connect(self._reflow_toolbar)
-        # 空会话输入框居中、高级栏收起；新消息让输入框落底并展开高级栏；
-        # 加载历史只切换输入框布局，保留用户当前的高级栏状态。
+        # 发送消息只改变输入框停靠位置，不自动打开高级面板。
         self._chat_view.docked_changed.connect(self._on_chat_docked)
         self._toolbar.set_collapsed(not self._chat_view.docked)
         # 左栏宽度锁在一个合理区间，避免被拖成极窄/极宽
@@ -311,6 +312,7 @@ class MainWindow(QMainWindow):
             self, splitter, self._backdrop_engine, self._appearance_theme
         )
         self._background_image = ""
+        self._backdrop_material_state: tuple[AppearanceTheme, bool, ChatView | None] | None = None
         self._backdrop_resize = QTimer(self)
         self._backdrop_resize.setSingleShot(True)
         self._backdrop_resize.setInterval(150)
@@ -324,61 +326,51 @@ class MainWindow(QMainWindow):
         self._transition: _PageTransition | None = None
         self._transition_animation: QPropertyAnimation | None = None
         self.setCentralWidget(self._root_stack)
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
 
     def _reflow_toolbar(self, collapsed: bool) -> None:
-        """同步输入框右上角开关，并开始展开 / 收回（输入框随之让位或回到中间）。"""
+        """切换右半部叠盖动画，并保持明确的键盘焦点归属。"""
+        focused = QApplication.focusWidget()
+        restore_focus = focused is not None and self._owns_advanced_widget(focused)
         self._chat_view.set_advanced_expanded(not collapsed)
-        self._place_toolbar()
+        if not collapsed:
+            self._toolbar._endpoint_value.setFocus(Qt.FocusReason.OtherFocusReason)
+        elif restore_focus:
+            self._chat_view._advanced_btn.setFocus(Qt.FocusReason.OtherFocusReason)
 
     def _on_chat_docked(self, docked: bool, reveal_advanced: bool) -> None:
-        if docked:
-            if reveal_advanced:
-                self._toolbar.set_collapsed(False)
-            self._toolbar.maybe_auto_collapse(self.width())
-        else:
+        # Sending or loading messages never opens advanced settings automatically.
+        if not docked:
             self._toolbar.set_collapsed(True)
 
-    def _place_toolbar(self) -> None:
-        """高级栏并排在输入框右侧、上下与输入框对齐，按展开进度从左向右露出。"""
-        toolbar = self._toolbar
-        if self._history_preview is not None and self._chat_stack.currentWidget() is not self.chat:
-            toolbar.hide()
-            self._toolbar_shadow.hide()
-            return
-        progress = self._chat_view.advanced_progress
-        if not self._chat_view.advanced_expanded and progress <= 0:
-            toolbar.hide()
-            self._toolbar_shadow.hide()
-            return
-        composer = self._chat_view._composer
-        origin = composer.mapTo(self._content_host, QPoint(0, 0))
-        height = composer.height()
-        if toolbar.height() != height:
-            toolbar.setFixedHeight(height)
-        toolbar.move(origin.x() + composer.width() + _ADVANCED_GAP, origin.y())
-        shown = round(TOOLBAR_WIDTH * progress)
-        if shown >= TOOLBAR_WIDTH:
-            toolbar.clearMask()
-        else:
-            # 空遮罩等于不裁剪，刚开始展开时至少留 1 像素
-            toolbar.setMask(QRegion(0, 0, max(1, shown), height))
-        # 投影层与高级栏同父级：先垫底、再摆位，最后把高级栏压上去
-        shadow = self._toolbar_shadow
-        shadow.sync_geometry(toolbar, progress)
-        shadow.raise_()
-        toolbar.show()
-        toolbar.raise_()
+    def _owns_advanced_widget(self, widget: QWidget) -> bool:
+        # isAncestorOf does not cross Qt.Popup boundaries; walk parentWidget instead.
+        owner: QWidget | None = widget
+        while owner is not None:
+            if owner in (self._toolbar, self._toolbar._endpoint_panel,
+                         self._chat_view._advanced_btn):
+                return True
+            owner = owner.parentWidget()
+        return False
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
-        if watched is self._chat_view._composer and event.type() in (
-            QEvent.Type.Move,
-            QEvent.Type.Resize,
-        ):
-            self._place_toolbar()
+        # Nested route panels / native combo popups handle their own Escape first.
+        if (not self._toolbar.collapsed and self._chat_view.isVisible()
+                and isinstance(watched, QWidget) and watched.window() is self
+                and isinstance(event, QKeyEvent) and event.type() == QEvent.Type.KeyPress
+                and event.key() == Qt.Key.Key_Escape
+                and QApplication.activePopupWidget() is None
+                and self._toolbar._endpoint_panel is None):
+            self._toolbar.set_collapsed(True)
+            self._chat_view._advanced_btn.setFocus(Qt.FocusReason.OtherFocusReason)
+            return True
         return super().eventFilter(watched, event)
 
     def show_full_page(self, page: QWidget) -> None:
         """让页面占满整个主窗口，暂时替换聊天工作区。"""
+        self._toolbar.set_collapsed(True)
         interrupted_frame = self._interrupt_transition()
         self._clear_login_exit()
         outgoing = self._root_stack.currentWidget()
@@ -544,7 +536,6 @@ class MainWindow(QMainWindow):
     def show_history_preview(self) -> None:
         if self._history_preview is not None:
             self._chat_stack.setCurrentWidget(self._history_preview)
-            self._place_toolbar()
 
     def clear_history_preview(self) -> None:
         preview, self._history_preview = self._history_preview, None
@@ -552,7 +543,6 @@ class MainWindow(QMainWindow):
         if preview is not None:
             self._chat_stack.removeWidget(preview)
             preview.deleteLater()
-        self._place_toolbar()
 
     @property
     def sidebar(self) -> Sidebar:
@@ -612,12 +602,19 @@ class MainWindow(QMainWindow):
         definition = self._appearance_theme
         materials = definition.materials
         engine = self._backdrop_engine
+        state = (definition, engine.active, self._history_preview)
+        if state == self._backdrop_material_state:
+            # A new wallpaper frame changes pixels, not styles or widget layout.
+            self._repaint_backdrop()
+            self._popup_materials.changed.emit()
+            return
+        self._backdrop_material_state = state
         sidebar_active = engine.active and materials.sidebar_enabled
         content_active = engine.active and materials.content_enabled
         self._sidebar.setStyleSheet(
             "Sidebar { background: transparent; }"
             if sidebar_active
-            else f"Sidebar {{ background: {definition.colors.card}; }}"
+            else f"Sidebar {{ background: {theme.sidebar_surface()}; }}"
         )
         self._sidebar.set_backdrop(
             engine if sidebar_active else None,
@@ -642,9 +639,11 @@ class MainWindow(QMainWindow):
             tint=self._tint(definition.colors.card, materials.content_opacity),
             radius=materials.content_blur_radius,
         )
+        self._toolbar.refresh_control_styles()
         toolbar_bg = "transparent" if content_active else theme.BG_SURFACE
         self._toolbar.setStyleSheet(
-            f"SessionToolbar {{ background: {toolbar_bg}; border: 1px solid {theme.BORDER};"
+            f"SessionToolbar {{ background: {toolbar_bg};"
+            f" border: 1px solid {theme.container_border()};"
             f" border-radius: {TOOLBAR_RADIUS}px; }}"
         )
         self._content_host.setStyleSheet(
@@ -652,9 +651,13 @@ class MainWindow(QMainWindow):
             if content_active
             else f"#contentHost {{ background: {theme.BG_APP}; }}"
         )
-        for pane in (self._sidebar, self._chat_view, self._toolbar):
-            pane.update()
+        self._repaint_backdrop()
         self._popup_materials.set_theme(definition)
+
+    def _repaint_backdrop(self) -> None:
+        for pane in (self._sidebar, self._chat_view, self._toolbar, self._history_preview):
+            if pane is not None:
+                pane.update()
 
     _close_guard: Callable[[], bool] | None = None
 
@@ -674,9 +677,11 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
     def resizeEvent(self, event: QResizeEvent) -> None:
-        """窗口缩小时自动收起工具栏（§8.2 响应式退化）。"""
+        """缩放时更新页面过渡与背景；输入区由布局自行重排。"""
         self._stop_transition()  # Snapshots no longer match after a resize.
         super().resizeEvent(event)
-        self._toolbar.maybe_auto_collapse(self.width())
         if self._background_image:
+            # Keep stretching the last frame until resize settles. Even a completed
+            # worker result queued for GUI delivery must not install an obsolete size.
+            self._backdrop_engine.discard_pending()
             self._backdrop_resize.start()

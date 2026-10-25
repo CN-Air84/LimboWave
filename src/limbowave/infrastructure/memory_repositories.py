@@ -12,7 +12,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Generator, Sequence
 from dataclasses import replace
 from datetime import datetime
 from heapq import nlargest
@@ -178,6 +178,17 @@ class _Messages:
         merged.update({m.id: m for m in self._staged.values()})
         rows = [m for m in merged.values() if m.branch_id == branch_id]
         return sorted(rows, key=lambda m: (m.created_at, m.id))
+
+    def iter_chat_history(
+        self, *, conversation_id: str | None = None, branch_id: str | None = None,
+    ) -> Generator[Message, None, None]:
+        merged = dict(self._store.messages)
+        merged.update({m.id: m for m in self._staged.values()})
+        rows = (m for m in merged.values()
+                if (conversation_id is None or m.conversation_id == conversation_id)
+                and (branch_id is None or m.branch_id == branch_id))
+        for message in sorted(rows, key=lambda m: (m.created_at, m.id), reverse=True):
+            yield replace(message, thinking="", tool_steps=(), segments=(), pi_entry_id=None)
 
     def history_position(self, message_id: str) -> tuple[str, str, datetime] | None:
         message = self.get(message_id)

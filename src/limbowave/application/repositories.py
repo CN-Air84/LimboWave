@@ -18,7 +18,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Generator, Sequence
 from datetime import datetime
 from types import TracebackType
 from typing import Protocol
@@ -73,6 +73,12 @@ class MessageRepository(Protocol):
     def get(self, message_id: str) -> Message | None: ...
 
     def list_for_branch(self, branch_id: str) -> list[Message]: ...
+
+    def iter_chat_history(
+        self, *, conversation_id: str | None = None, branch_id: str | None = None,
+    ) -> Generator[Message, None, None]:
+        """Newest-first stored visible content only; no thinking, tools or runtime payloads."""
+        ...
 
     def history_position(self, message_id: str) -> tuple[str, str, datetime] | None:
         """Conversation, owning branch, timestamp; never decrypt message payloads."""

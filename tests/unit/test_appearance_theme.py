@@ -165,3 +165,19 @@ def test_orphan_assets_are_only_deleted_on_explicit_cleanup(tmp_path: Path) -> N
     assert service.cleanup_orphan_assets() == (orphan,)
     assert not orphan.exists()
     assert service.resolve_asset(custom.background.asset) is not None
+
+
+def test_theme_service_defaults_to_system_mode_when_no_state_exists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from limbowave.application.services import appearance_theme_service
+    from limbowave.domain.appearance import DEFAULT_LIGHT_THEME_ID
+
+    monkeypatch.setattr(appearance_theme_service, "default_theme", lambda: "light")
+    light_service = AppearanceThemeService(tmp_path / "light-themes")
+    assert light_service.active_theme.id == DEFAULT_LIGHT_THEME_ID
+
+    monkeypatch.setattr(appearance_theme_service, "default_theme", lambda: "dark")
+    dark_service = AppearanceThemeService(tmp_path / "dark-themes")
+    assert dark_service.active_theme.id == DEFAULT_THEME_ID
+

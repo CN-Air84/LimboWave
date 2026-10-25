@@ -65,6 +65,9 @@ class _PanelShadow(QWidget):
         self.hide()
         panel.installEventFilter(self)
         panel._opacity.opacityChanged.connect(self._fade)
+        # The sibling shadow may survive until the next deferred-delete pass.
+        # Stop painting before its owner's opacity effect is destroyed.
+        panel.destroyed.connect(self.hide)
         panel.destroyed.connect(self.deleteLater)
 
     def _fade(self, opacity: float) -> None:
@@ -105,6 +108,7 @@ class FloatingPanel(QFrame):
     def __init__(self, parent: QWidget, title: str, *, width: int = 420) -> None:
         super().__init__(parent)
         self._outside_filter_installed = False
+        self._toggle_anchor: QWidget | None = None
         self._closing = False
         self._motion: QParallelAnimationGroup | None = None
         self._opacity = QGraphicsOpacityEffect(self)
@@ -158,8 +162,8 @@ class FloatingPanel(QFrame):
         # stays visible over wallpaper and follows live theme changes.
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        border = QColor(theme.TEXT_SECONDARY)
-        border.setAlphaF(0.65)
+        border = QColor("#FFFFFF" if theme.is_dark() else theme.TEXT_SECONDARY)
+        border.setAlphaF(0.06 if theme.is_dark() else 0.65)
         painter.setPen(QPen(border, 1.0))
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawRoundedRect(QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5), 9.5, 9.5)
@@ -167,10 +171,15 @@ class FloatingPanel(QFrame):
 
     # ---------- 生命周期 ----------
 
-    def popup(self, anchor: QWidget | None = None) -> None:
-        """显示面板。给 ``anchor``（通常是按钮）就贴着它下方弹出，否则居中。"""
+    def popup(self, anchor: QWidget | None = None, *, anchor_is_toggle: bool = False) -> None:
+        """贴着 ``anchor`` 弹出，否则居中。
+
+        ``anchor_is_toggle`` 将锚点点击交给按钮自身切换，避免按下时先被外部
+        点击过滤器关闭、随后 clicked 信号又重新打开。其他面板保持原关闭行为。
+        """
         if self._closing:
             return
+        self._toggle_anchor = anchor if anchor_is_toggle else None
         self._stop_motion()
         parent = self.parentWidget()
         if parent is not None:
@@ -278,9 +287,13 @@ class FloatingPanel(QFrame):
         """点击面板及其弹出菜单之外才关闭；Esc 由当前焦点控件处理。"""
         if event.type() == QEvent.Type.MouseButtonPress:
             widget = watched
-            if isinstance(widget, QWidget) and not self._owns_widget(widget):
-                self.close_panel()
-                return False
+            if isinstance(widget, QWidget):
+                anchor = self._toggle_anchor
+                if anchor is not None and (widget is anchor or anchor.isAncestorOf(widget)):
+                    return False
+                if not self._owns_widget(widget):
+                    self.close_panel()
+                    return False
         return super().eventFilter(watched, event)
 
     def mousePressEvent(self, event: QMouseEvent) -> None:

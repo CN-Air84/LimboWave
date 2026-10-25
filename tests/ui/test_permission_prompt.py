@@ -125,3 +125,23 @@ def test_ask_permission_dismiss_means_deny(qtbot: QtBot) -> None:
     closes = [b for b in panel.findChildren(QPushButton) if b.text() == "✕"]
     closes[0].click()
     assert answers == [DENY]
+
+
+def test_chat_history_prompt_only_allows_once_and_dismiss_denies(qtbot: QtBot) -> None:
+    from limbowave.domain.permissions import session_scope_for
+
+    host = _host(qtbot)
+    request = ToolRequest(
+        tool_name="query_chat_history", capability=Capability.HISTORY_READ,
+        raw_params={"query": "私人笔记 <b>并非按钮</b>", "conversation_id": "target"},
+    )
+    scope = session_scope_for(request, ROOT)
+    assert scope is None
+    title, detail = describe_request(request, "每次读取需确认", scope)
+    assert title == "权限请求：跨会话聊天记录查询"
+    assert "target" in detail and "<b>并非按钮</b>" in detail
+    answers: list[str] = []
+    panel = ask_permission(host, request, "每次读取需确认", scope, answers.append)
+    assert list(_buttons(panel)) == ["拒绝", "允许本次"]
+    next(b for b in panel.findChildren(QPushButton) if b.text() == "✕").click()
+    assert answers == [DENY]

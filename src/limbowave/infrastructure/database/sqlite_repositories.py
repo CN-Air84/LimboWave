@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Generator, Sequence
 from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
@@ -381,6 +381,30 @@ class _Messages:
             (branch_id,),
         ).fetchall()
         return [self._to_domain(r) for r in rows]
+
+    def iter_chat_history(
+        self, *, conversation_id: str | None = None, branch_id: str | None = None,
+    ) -> Generator[Message, None, None]:
+        clauses: list[str] = []
+        args: list[str] = []
+        for column, value in (("conversation_id", conversation_id), ("branch_id", branch_id)):
+            if value is not None:
+                clauses.append(f"{column} = ?")
+                args.append(value)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        cursor = self._conn.execute(
+            "SELECT id, conversation_id, branch_id, role, content_enc, created_at, status "
+            "FROM messages" + where + " ORDER BY created_at DESC, id DESC", args,
+        )
+        try:
+            for row in cursor:
+                yield Message(
+                    id=row[0], conversation_id=row[1], branch_id=row[2],
+                    role=MessageRole(row[3]), content=self._key.decrypt(row[4]),
+                    created_at=_parse_iso(row[5]), status=MessageStatus(row[6]),
+                )
+        finally:
+            cursor.close()
 
     def history_position(self, message_id: str) -> tuple[str, str, datetime] | None:
         row = self._conn.execute(

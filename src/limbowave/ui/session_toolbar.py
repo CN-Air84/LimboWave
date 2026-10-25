@@ -1,6 +1,6 @@
-"""右侧会话工具栏（Phase 10 / 设计计划 §三.1、Task 8.2/8.3）。
+"""会话高级设置：由输入框按钮打开的紧凑叠盖区域。
 
-**高级栏**（约占可用宽度 15%，默认展开、可收起，窗口缩小时自动收起）：
+**高级区域**（叠盖输入框右半部、紧凑内容高度）：
 
 - 实际调用站点（逻辑模型放在主输入框；这里是与「思考」同款的上拉下拉框，
   行序即回退顺序，当前站点打勾，切换即会话级覆盖）
@@ -57,12 +57,14 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QStyle,
     QStyledItemDelegate,
+    QStyleOptionButton,
     QStyleOptionViewItem,
+    QStylePainter,
     QVBoxLayout,
     QWidget,
 )
 
-from limbowave.ui import soft_shadow, theme
+from limbowave.ui import theme
 from limbowave.ui.backdrop import BackdropEngine
 from limbowave.ui.floating import FloatingPanel
 from limbowave.ui.popup_motion import UpwardComboBox
@@ -178,7 +180,7 @@ class _RouteComboBox(UpwardComboBox):
         self.candidate_picked.emit(item)
 
 
-TOOLBAR_WIDTH = 260  # 收起/展开的固定宽度（约可用宽度 15% 的常见值）
+TOOLBAR_WIDTH = 320  # 独立展示的默认宽度；嵌入输入框时由宿主适配为右半宽
 TOOLBAR_RADIUS = 18
 NOTICE_MS = 2500  # 模式/步骤切换提示停留多久
 NOTICE_MOVE_MS = 240  # 被点的按钮滑到行首/滑回原位
@@ -187,53 +189,21 @@ SLIDER_CONFIRM_MS = 5000  # 滑动确认的超时：5 秒内没滑到最右按�
 SLIDER_HINT = "向右滑动开始压缩"  # 滑块轨道里的提示文字
 
 
-class ToolbarShadowLayer(QWidget):
-    """垫在高级栏之下的投影层：画在栏外的柔和晕染，观感与输入框一致。
-
-    高级栏压在不透明的消息区上，``QGraphicsDropShadowEffect`` 之外的方案
-    需要一块能画出栏几何之外的画布，所以由宿主（``content_host``）摆成
-    高级栏的兄弟控件，垫在它下面。
-    """
-
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
-        self.setStyleSheet("background: transparent;")
-        # 与高级栏共用展开进度，投影范围与浓度一起过渡。
-        self._progress = 0.0
-
-    def sync_geometry(self, toolbar: SessionToolbar, progress: float) -> None:
-        """贴住高级栏当前露出的部分，复用展开进度渐显 / 渐隐。"""
-        self._progress = max(0.0, min(1.0, progress))
-        geometry = toolbar.geometry()
-        geometry.setWidth(round(geometry.width() * self._progress))
-        self.setGeometry(soft_shadow.shadow_bounds(geometry))
-        self.setVisible(self._progress > 0.0)
-        # 进度可能只改变透明度（宽度取整后没变），仍需逐帧重画。
-        self.update()
+class _EndpointButton(QPushButton):
+    """Long provider names must not widen the panel or silently clip mid-glyph."""
 
     def paintEvent(self, event: QPaintEvent) -> None:
-        if self._progress <= 0.0:
-            return
-        painter = QPainter(self)
-        painter.setOpacity(self._progress)
-        body = QRectF(
-            soft_shadow.SHADOW_SPREAD,
-            soft_shadow.SHADOW_SPREAD - soft_shadow.SHADOW_OFFSET,
-            float(self.width() - 2 * soft_shadow.SHADOW_SPREAD),
-            float(self.height() - 2 * soft_shadow.SHADOW_SPREAD),
+        option = QStyleOptionButton()
+        self.initStyleOption(option)
+        option.text = self.fontMetrics().elidedText(
+            self.text(), Qt.TextElideMode.ElideRight, max(0, self.width() - 14)
         )
-        soft_shadow.paint_soft_shadow(painter, body, TOOLBAR_RADIUS, QRectF(self.rect()))
-        painter.end()
+        painter = QStylePainter(self)
+        painter.drawControl(QStyle.ControlElement.CE_PushButton, option)
 
 
 class SessionToolbar(QFrame):
-    """右侧会话工具栏。默认展开、可收起。
-
-    栏上不画投影：控件画不出自身几何之外，柔和阴影由外置的
-    :class:`ToolbarShadowLayer` 垫在栏下绘制，观感与输入框一致。
-    """
+    """会话高级设置区域，宿主负责叠盖定位与显隐动画。"""
 
     collapse_toggled = Signal(bool)  # True = 收起
     thinking_level_changed = Signal(str)
@@ -265,7 +235,7 @@ class SessionToolbar(QFrame):
         self.setFixedWidth(TOOLBAR_WIDTH)
         self.setStyleSheet(
             f"SessionToolbar {{ background: {theme.BG_SURFACE};"
-            f" border: 1px solid {theme.BORDER}; border-radius: {TOOLBAR_RADIUS}px; }}"
+            f" border: 1px solid {theme.container_border()}; border-radius: {TOOLBAR_RADIUS}px; }}"
         )
         self._build()
 
@@ -297,21 +267,25 @@ class SessionToolbar(QFrame):
 
     def _build(self) -> None:
         root = QVBoxLayout(self)
-        root.setContentsMargins(10, 8, 10, 8)
-        root.setSpacing(5)
+        root.setContentsMargins(12, 10, 12, 10)
+        root.setSpacing(6)
 
         header = QHBoxLayout()
-        title = QLabel("高级")
-        title.setStyleSheet(
-            f"color: {theme.TEXT_SECONDARY}; font-size: {theme.FS_SMALL}px; border: none;"
-        )
-        header.addWidget(title)
+        header.setSpacing(6)
+        self._title = QLabel("高级设置")
+        self.setAccessibleName("高级设置")
+        header.addWidget(self._title)
         header.addStretch(1)
-        self._collapse_btn = QPushButton("⟩")
+        self._export_btn = QPushButton("导出会话")
+        self._export_btn.setToolTip("导出当前分支，或选择其他会话与分支")
+        self._export_btn.clicked.connect(self.export_requested.emit)
+        header.addWidget(self._export_btn)
+        self._collapse_btn = QPushButton("×")
         self._collapse_btn.setFixedSize(22, 22)
-        self._collapse_btn.setToolTip("收起工具栏")
+        self._collapse_btn.setToolTip("关闭高级设置（Esc）")
+        self._collapse_btn.setAccessibleName("关闭高级设置")
         self._collapse_btn.setStyleSheet(
-            f"QPushButton {{ background: transparent; border: none;"
+            f"QPushButton {{ background: transparent; border: none; padding: 0;"
             f" color: {theme.TEXT_SECONDARY}; }}"
             f"QPushButton:hover {{ color: {theme.TEXT_PRIMARY}; }}"
         )
@@ -327,38 +301,52 @@ class SessionToolbar(QFrame):
         self._body.setStyleSheet("#sessionToolbarBody { background: transparent; }")
         body = QVBoxLayout(self._body)
         body.setContentsMargins(0, 0, 0, 0)
-        body.setSpacing(5)
+        body.setSpacing(4)
 
         # 输入框展示逻辑模型；高级栏的「实际站点」是可点值，点击呼出独立
         # 悬浮窗——栏宽有限放不下完整绑定信息，下拉框放进悬浮窗里用整行宽度。
+        # 两个字段等分一行；短标签省出值的空间，完整含义保留在提示与可访问名称里。
+        selectors = QHBoxLayout()
+        selectors.setSpacing(8)
         endpoint_row = QHBoxLayout()
-        endpoint_row.setSpacing(6)
-        endpoint_row.addWidget(_section_label("实际站点"))
-        self._endpoint_value = QPushButton("—")
+        endpoint_row.setSpacing(4)
+        endpoint_label = _section_label("站点")
+        endpoint_label.setToolTip("实际站点")
+        endpoint_row.addWidget(endpoint_label)
+        self._endpoint_value = _EndpointButton("—")
         self._endpoint_value.setObjectName("value-实际站点")
         self._endpoint_value.setToolTip("当前实际调用的站点；点击在悬浮窗里切换")
-        self._endpoint_value.setStyleSheet(
-            f"QPushButton {{ background: transparent; border: none; padding: 0;"
-            f" text-align: left; color: {theme.TEXT_PRIMARY};"
-            f" font-size: {theme.FS_SMALL}px; }}"
-            f"QPushButton:hover {{ color: {theme.ACCENT}; }}"
-        )
+        self._endpoint_value.setMinimumWidth(0)
+        self._endpoint_value.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self._endpoint_value.setAccessibleName("实际站点")
         self._endpoint_value.clicked.connect(self._open_endpoint_panel)
+        endpoint_label.setBuddy(self._endpoint_value)
         endpoint_row.addWidget(self._endpoint_value, 1)
-        body.addLayout(endpoint_row)
+        selectors.addLayout(endpoint_row, 1)
 
         # 思考强度
         thinking_row = QHBoxLayout()
-        thinking_row.setSpacing(6)
-        thinking_row.addWidget(_section_label("思考"))
+        thinking_row.setSpacing(4)
+        thinking_label = _section_label("思考")
+        thinking_label.setToolTip("思考强度")
+        thinking_row.addWidget(thinking_label)
         self._thinking = ThinkingComboBox()
+        self._thinking.setMinimumWidth(0)
+        self._thinking.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self._thinking.force_requested.connect(self.thinking_force_requested.emit)
-        self._thinking.setStyleSheet("QComboBox { background: transparent; }")
+        self._thinking.setAccessibleName("思考强度")
+        self._thinking.setProperty("themeEffectDisabled", True)
         self._thinking.setItemDelegate(_ThinkingLevelDelegate(self._thinking))
         self._thinking.addItems(list(THINKING_LEVELS))
         self._thinking.currentTextChanged.connect(self.thinking_level_changed.emit)
+        thinking_label.setBuddy(self._thinking)
         thinking_row.addWidget(self._thinking, 1)
-        body.addLayout(thinking_row)
+        selectors.addLayout(thinking_row, 1)
+        body.addLayout(selectors)
+
+        self._divider = QFrame()
+        self._divider.setFixedHeight(1)
+        body.addWidget(self._divider)
 
         self._compress_btn = QPushButton("压缩")
         self._compress_btn.setProperty("flat", True)
@@ -398,13 +386,7 @@ class SessionToolbar(QFrame):
         self._refresh_compress_tooltip()
         body.addWidget(self._action_row)
 
-        self._export_btn = QPushButton("导出会话")
-        self._export_btn.setToolTip("导出当前分支，或选择其他会话与分支")
-        self._export_btn.clicked.connect(self.export_requested.emit)
-        body.addWidget(self._export_btn)
-
-        body.addStretch(1)
-        root.addWidget(self._body, 1)
+        root.addWidget(self._body)
 
         # 收起态：只留一个展开按钮
         self._expand_btn = QPushButton("⟨")
@@ -414,6 +396,66 @@ class SessionToolbar(QFrame):
         self._expand_btn.clicked.connect(self._on_collapse)
         self._expand_btn.setVisible(False)
         root.addWidget(self._expand_btn)
+        self.refresh_control_styles()
+
+    def refresh_control_styles(self) -> None:
+        """Quiet, aligned form controls; keep light themes and font scaling readable."""
+        ink = "#ffffff" if QColor(theme.BG_SURFACE).lightness() < 128 else "#000000"
+        label_color = theme.qss_alpha(ink, 0.5)
+        fill = theme.qss_alpha(ink, 0.05)
+        hover = theme.qss_alpha(ink, 0.09)
+        focus = theme.qss_alpha(theme.ACCENT, 0.55)
+        self._title.setStyleSheet(
+            f"color: {theme.TEXT_PRIMARY}; font-size: {theme.FS_BASE}px;"
+            " font-weight: 600; border: none; background: transparent;"
+        )
+        for label in self.findChildren(QLabel):
+            if label.property("advancedLabel"):
+                label.setFixedWidth(2 * theme.FS_SMALL)
+                label.setStyleSheet(
+                    f"color: {label_color}; font-size: {theme.FS_SMALL}px;"
+                    " border: none; background: transparent;"
+                )
+        control_height = max(28, self._thinking.fontMetrics().height() + 6)
+        self._thinking.setFixedHeight(control_height)
+        self._endpoint_value.setFixedHeight(control_height)
+        self._thinking.setStyleSheet(
+            f"QComboBox {{ background: {fill}; color: {theme.TEXT_PRIMARY};"
+            f" border: 1px solid transparent; border-radius: 8px;"
+            f" font-size: {theme.FS_SMALL}px; min-height: {control_height - 2}px;"
+            " padding: 0 20px 0 6px; }"
+            f"QComboBox:hover {{ background: {hover}; border-color: transparent; }}"
+            f"QComboBox:focus {{ border-color: {focus}; }}"
+            f"QComboBox:on {{ border-color: {focus}; }}"
+            f"QComboBox:disabled {{ color: {label_color}; border-color: transparent; }}"
+            "QComboBox::drop-down { background: transparent; border: none;"
+            " border-left: none; width: 18px; }"
+        )
+        button_style = (
+            f"QPushButton {{ background: {fill}; color: {theme.TEXT_PRIMARY};"
+            f" font-size: {theme.FS_SMALL}px; border: 1px solid transparent;"
+            " border-radius: 8px; padding: 0; margin: 0; }"
+            f"QPushButton:hover {{ background: {hover}; }}"
+            f"QPushButton:pressed {{ background: {theme.qss_alpha(ink, 0.13)}; }}"
+            f"QPushButton:focus {{ border-color: {focus}; }}"
+            f"QPushButton:disabled {{ color: {label_color}; background: transparent; }}"
+        )
+        self._endpoint_value.setStyleSheet(
+            button_style + "QPushButton { text-align: left; padding-left: 6px; }"
+        )
+        for button in self._action_buttons:
+            button.setFixedHeight(max(28, button.fontMetrics().height() + 6))
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.setStyleSheet(button_style)
+        self._export_btn.setFixedHeight(max(24, self._export_btn.fontMetrics().height() + 4))
+        self._export_btn.setStyleSheet(
+            button_style + f"QPushButton {{ background: transparent; color: {label_color};"
+            " text-align: center; padding: 0 4px; }"
+            f"QPushButton:hover {{ background: {hover}; color: {theme.TEXT_PRIMARY}; }}"
+        )
+        for button in (self._endpoint_value, self._export_btn, self._collapse_btn):
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._divider.setStyleSheet(f"background: {theme.qss_alpha(ink, 0.08)}; border: none;")
 
     # ---------- 展示更新（由上层驱动） ----------
 
@@ -421,6 +463,7 @@ class SessionToolbar(QFrame):
         # 保留 logical_model 参数以兼容上层现有调用；它只在主输入框展示。
         _ = logical_model
         self._endpoint_value.setText(endpoint or "—")
+        self._endpoint_value.setToolTip(f"{endpoint or '未配置站点'}\n点击切换本会话的实际站点")
 
     def set_route_candidates(
         self, candidates: Sequence[RouteCandidate], *, note: str | None = None
@@ -435,16 +478,14 @@ class SessionToolbar(QFrame):
 
     def _open_endpoint_panel(self) -> None:
         """「实际站点」→ 独立悬浮窗：栏宽有限放不下完整绑定信息，
-        下拉框放进悬浮窗用整行宽度展示。选完即关窗；点窗外部由悬浮窗收起。"""
+        下拉框放进悬浮窗用整行宽度展示。再次点击、选完或点窗外部即关窗。"""
         old = self._endpoint_panel
         if old is not None:
-            # 悬浮窗关闭即自毁（deleteLater）：包装可能还指着已销毁的 C++ 对象，
-            # 对死包装再调 deleteLater 会让整个槽炸掉——表现为之后再也点不开。
-            # 替换路径同样要先收掉可能还开着的下拉弹层（见下方 closed 接线）。
+            # 复用正常关闭流程，先收起下拉弹层再退场；本次点击不再重新创建。
+            # 若引用意外残留为已销毁的 C++ 包装，清掉引用后仍允许重新打开。
             with suppress(RuntimeError):
-                for combo in old.findChildren(UpwardComboBox):
-                    combo.hidePopup()
-                old.deleteLater()
+                old.close_panel()
+                return
             self._endpoint_panel = None
         panel = FloatingPanel(self.window(), "选择站点", width=420)
 
@@ -455,7 +496,8 @@ class SessionToolbar(QFrame):
             # 正好按「先弹层、后面板」的顺序收场。
             with suppress(RuntimeError):
                 combo.hidePopup()
-            self._endpoint_panel = None
+            if self._endpoint_panel is panel:
+                self._endpoint_panel = None
 
         panel.closed.connect(_on_closed)
         column = QVBoxLayout()
@@ -495,8 +537,8 @@ class SessionToolbar(QFrame):
         )
         column.addWidget(note)
         panel.content_layout.addLayout(column)
-        panel.popup(self._endpoint_value)
         self._endpoint_panel = panel
+        panel.popup(self._endpoint_value, anchor_is_toggle=True)
 
     def _on_panel_endpoint_picked(self, panel: FloatingPanel, item: QStandardItem) -> None:
         """选中候选行：外发 endpoint_id（空串 = 清除覆盖回默认）并关窗。
@@ -663,21 +705,30 @@ class SessionToolbar(QFrame):
 
     def set_collapsed(self, collapsed: bool) -> None:
         self._collapsed = collapsed
-        # 外部开关负责整栏的显隐与展开动画；收起时保持原样，才能完整地播完收回
+        if collapsed:
+            self._thinking.hidePopup()
+            self._thinking.cancel_hold()
+            self._cancel_slider_confirm()
+            self._end_notice()
+            if self._endpoint_panel is not None:
+                self._endpoint_panel.close_panel()
+        # 外部开关负责整栏显隐；保留内部布局，让再次展开时尺寸保持稳定。
         if self._own_toggle:
             self._body.setVisible(not collapsed)
             self._collapse_btn.setVisible(not collapsed)
+            self._export_btn.setVisible(not collapsed)
             self._expand_btn.setVisible(collapsed)
             self.setFixedWidth(44 if collapsed else TOOLBAR_WIDTH)
         self.collapse_toggled.emit(collapsed)
 
     def use_external_toggle(self) -> None:
-        """展开/收起改由外部开关（输入框右上角）负责时，隐藏栏内自带的按钮。
+        """输入框负责展开，面板保留关闭按钮。
 
-        此后收起不再缩成窄栏，整栏的显隐与动画交给外部。
+        收起不再缩成窄栏，整栏的显隐交给宿主布局。
         """
         self._own_toggle = False
-        self._collapse_btn.setVisible(False)
+        self._collapse_btn.setVisible(True)
+        self._export_btn.setVisible(True)
         self._expand_btn.setVisible(False)
         self._body.setVisible(True)
         self.setFixedWidth(TOOLBAR_WIDTH)
@@ -697,7 +748,7 @@ class _ActionRow(QWidget):
     压缩确认态：与提示态同一套位移 + 渐隐编排，右侧的提示文字换成滑动确认滑块。
     """
 
-    SPACING = 0
+    SPACING = 6
     NOTICE_GAP = 8  # 提示文字与行首按钮之间的留白
     SLIDER_ENTER_OFFSET = 14  # 滑块进场时从右侧滑入的距离（出场滑回同样距离）
 
@@ -737,7 +788,8 @@ class _ActionRow(QWidget):
     # ---------- 尺寸与摆放 ----------
 
     def sizeHint(self) -> QSize:
-        height = max(button.sizeHint().height() for button in self._buttons)
+        height = max(max(button.minimumHeight(), button.sizeHint().height())
+                     for button in self._buttons)
         width = sum(button.sizeHint().width() for button in self._buttons)
         return QSize(width + self.SPACING * (len(self._buttons) - 1), height)
 
@@ -1051,6 +1103,8 @@ def _candidate_item(candidate: RouteCandidate) -> QStandardItem:
 
 def _section_label(text: str) -> QLabel:
     label = QLabel(text)
+    label.setProperty("advancedLabel", True)
+    label.setFixedWidth(2 * theme.FS_SMALL)
     label.setStyleSheet(
         f"color: {theme.TEXT_SECONDARY}; font-size: {theme.FS_TINY}px; border: none;"
     )

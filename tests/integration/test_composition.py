@@ -115,7 +115,8 @@ async def test_kernel_from_config_without_env_vars(
     assert entries, "mock 侧应收到真实请求"
 
     # 密钥经环境变量注入、由 Pi 放进 Authorization 头
-    auth = entries[0]["headers"].get("Authorization", "")
+    headers = {name.lower(): value for name, value in entries[0]["headers"].items()}
+    auth = headers.get("authorization", "")
     assert SECRET in auth, f"密钥未正确送达：{auth!r}"
 
 

@@ -16,7 +16,6 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QComboBox, QPushButton
 from pytestqt.qtbot import QtBot
 
-from limbowave.ui import soft_shadow
 from limbowave.ui.main_window import MainWindow
 from limbowave.ui.session_toolbar import (
     NOTICE_MS,
@@ -25,7 +24,6 @@ from limbowave.ui.session_toolbar import (
     TOOLBAR_WIDTH,
     RouteCandidate,
     SessionToolbar,
-    ToolbarShadowLayer,
 )
 
 
@@ -69,72 +67,10 @@ def test_shows_endpoint_only_in_advanced_bar(qtbot: QtBot) -> None:
     assert bar.findChild(QPushButton, "value-逻辑模型") is None
 
 
-def test_advanced_bar_uses_composer_soft_shadow(qtbot: QtBot) -> None:
-    """高级栏的投影与输入框同款：栏上不再挂 QGraphicsDropShadowEffect，
-    柔和晕染由外置投影层绘制，参数与观感都来自 soft_shadow。"""
-    from PySide6.QtCore import QRect
-    from PySide6.QtWidgets import QGraphicsDropShadowEffect, QWidget
-
+def test_advanced_region_has_no_floating_shadow_effect(qtbot: QtBot) -> None:
     bar = SessionToolbar()
     qtbot.addWidget(bar)
-    assert bar.graphicsEffect() is None or not isinstance(
-        bar.graphicsEffect(), QGraphicsDropShadowEffect
-    )
-
-    host = QWidget()
-    qtbot.addWidget(host)
-    host.show()
-    bar.setParent(host)
-    bar.setGeometry(100, 100, TOOLBAR_WIDTH, 200)
-    layer = ToolbarShadowLayer(host)
-    qtbot.addWidget(layer)
-    layer.sync_geometry(bar, 1.0)
-
-    assert layer.isVisibleTo(host)
-    # 投影层的几何 = 栏几何外扩 soft_shadow 的扩散范围
-    expected = QRect(100, 100, TOOLBAR_WIDTH, 200).adjusted(
-        -soft_shadow.SHADOW_SPREAD,
-        soft_shadow.SHADOW_OFFSET - soft_shadow.SHADOW_SPREAD,
-        soft_shadow.SHADOW_SPREAD,
-        soft_shadow.SHADOW_OFFSET + soft_shadow.SHADOW_SPREAD,
-    )
-    assert layer.geometry() == expected
-
-    # 展开到一半：投影跟着当前露出的宽度，右缘也保留柔和扩散。
-    bar.setMask(QRect(0, 0, TOOLBAR_WIDTH // 2, 200))
-    layer.sync_geometry(bar, 0.5)
-    assert layer.geometry() == soft_shadow.shadow_bounds(QRect(100, 100, TOOLBAR_WIDTH // 2, 200))
-
-
-def test_advanced_shadow_fades_and_retracts_with_progress(qtbot: QtBot) -> None:
-    """实际像素随进度渐显 / 渐隐，而不只检查控件的动画属性。"""
-    from PySide6.QtGui import QImage, QRegion
-    from PySide6.QtWidgets import QWidget
-
-    host = QWidget()
-    qtbot.addWidget(host)
-    host.resize(600, 400)
-    bar = SessionToolbar(host)
-    bar.setGeometry(100, 100, TOOLBAR_WIDTH, 200)
-    layer = ToolbarShadowLayer(host)
-    host.show()
-    alphas = []
-    for progress in (0.25, 0.5, 1.0, 0.5, 0.25):
-        layer.sync_geometry(bar, progress)
-        image = QImage(layer.size(), QImage.Format.Format_ARGB32_Premultiplied)
-        image.fill(Qt.GlobalColor.transparent)
-        layer.render(image, QPoint(), QRegion(), QWidget.RenderFlag.DrawChildren)
-        # 下沿中央：避开圆角，几何宽度变化不应改变采样点的叠层数。
-        alphas.append(image.pixelColor(image.width() // 2, image.height() - 6).alpha())
-        assert layer.width() == round(TOOLBAR_WIDTH * progress) + 2 * soft_shadow.SHADOW_SPREAD
-        # 投影只在表面之外；右边缘仍有柔和晕染，不被垂直切断。
-        assert image.pixelColor(image.width() // 2, image.height() // 2).alpha() == 0
-        assert image.pixelColor(image.width() - 6, image.height() // 2).alpha() > 0
-
-    assert 0 < alphas[0] < alphas[1] < alphas[2]
-    assert alphas[3:] == alphas[1::-1]
-    layer.sync_geometry(bar, 0.0)
-    assert layer.isHidden()
+    assert bar.graphicsEffect() is None
 
 
 def test_thinking_levels_are_contract_values(qtbot: QtBot) -> None:
@@ -728,13 +664,14 @@ def test_toolbar_never_nests_parent_graphics_effect(qtbot: QtBot) -> None:
     """嵌套图形效果是「动画后按钮视觉隐形」的根因：工具栏（父）一旦挂上
     QGraphicsDropShadowEffect 之类，子按钮自己的 QGraphicsOpacityEffect 在
     hide/show 之后不再触发父级重绘，按钮 isVisible()=True 却画不出来。
-    投影由外置 ToolbarShadowLayer 绘制，栏上永远不许有图形效果。"""
+    固定区域不使用悬浮投影，栏上永远不许有图形效果。"""
     from PySide6.QtWidgets import QGraphicsEffect
 
     window = MainWindow()
     qtbot.addWidget(window)
     window.show()
     window.chat.add_user_message("hi")
+    window.chat._advanced_btn.click()
     qtbot.waitUntil(
         lambda: window.chat.composer_lift == 0 and window.chat.advanced_progress == 1.0,
         timeout=2000,
@@ -760,6 +697,7 @@ def test_buttons_render_pixels_after_notice_animation(qtbot: QtBot) -> None:
     chat = window.chat
     chat.add_user_message("看下部署顺序")
     chat.begin_assistant()
+    chat._advanced_btn.click()
     qtbot.waitUntil(lambda: chat.composer_lift == 0 and chat.advanced_progress == 1.0, timeout=2000)
     chat.end_assistant("先起数据库，再起应用。")
     toolbar = window.toolbar

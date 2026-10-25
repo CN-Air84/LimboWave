@@ -265,7 +265,12 @@ def test_material_panel_keeps_outline_and_external_shadow(
     for point in (QPoint(0, 90), QPoint(299, 90), QPoint(150, 0), QPoint(150, 179)):
         actual = image.pixelColor(round(point.x() * scale), round(point.y() * scale))
         surface = _expected(workspace, panel, point, card=True)
-        assert max(abs(actual.getRgb()[i] - surface.getRgb()[i]) for i in range(3)) > 15
+        contrast = max(abs(actual.getRgb()[i] - surface.getRgb()[i]) for i in range(3))
+        if theme.is_dark():
+            # A 6% white boundary remains detectable without a bright frame.
+            assert 0 < contrast <= 20
+        else:
+            assert contrast > 15
     # The material's inside pixels remain unchanged; only the outside is shadowed.
     inside = QPoint(18, 162)
     _assert_pixel(

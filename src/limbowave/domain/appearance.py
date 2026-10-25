@@ -253,9 +253,9 @@ class AppearanceTheme:
 
 
 DARK_COLORS = ThemeColors(
-    "#0F1115",
-    "#171A21",
-    "#22262F",
+    "#0B0C0E",
+    "#16181D",
+    "#1C1F25",
     "#5B6CFF",
     "#E6E9EF",
     "#263B55",
@@ -385,7 +385,14 @@ BUILTIN_THEMES = (
 )
 BUILTIN_BY_ID = {theme.id: theme for theme in BUILTIN_THEMES}
 DEFAULT_THEME_ID = BUILTIN_THEMES[0].id
+DEFAULT_LIGHT_THEME_ID = "builtin:clear-day"
+
+
+def default_theme_id_for_mode(mode: str) -> str:
+    """Return the built-in appearance theme ID matching ``'light'`` or ``'dark'``."""
+    return DEFAULT_LIGHT_THEME_ID if mode == "light" else DEFAULT_THEME_ID
 
 
 def replace_controls(settings: MaterialSettings, **changes: bool) -> MaterialSettings:
     return replace(settings, controls=replace(settings.controls, **changes))
+

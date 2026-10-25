@@ -29,24 +29,13 @@ def _release_test_clipboard(qapp):
 
 
 @pytest.mark.parametrize(
-    ("available", "collapsed", "expanded"),
-    [
-        # 放得下：两态同宽；收起时居中，展开时与右侧高级栏并排占满
-        (876, (600, 138), (600, 0)),
-        # 很宽：输入框封顶 800，收起、展开都居中
-        (1596, (800, 398), (800, 260)),
-        # 很窄：收起时放宽到 480，不为不在场的高级栏白白让位
-        (526, (480, 23), (250, 0)),
-    ],
+    ("available", "expected"),
+    [(876, (800, 38)), (1596, (800, 398)), (526, (526, 0)), (0, (0, 0))],
 )
 def test_composer_span_keeps_width_and_centers(
-    available: int, collapsed: tuple[int, int], expanded: tuple[int, int]
+    available: int, expected: tuple[int, int]
 ) -> None:
-    panel = 276  # 高级栏 260 + 间距 16
-    assert _composer_span(available, panel, 0.0) == collapsed
-    assert _composer_span(available, panel, 1.0) == expanded
-
-
+    assert _composer_span(available) == expected
 
 
 def test_attachment_chips_do_not_widen_composer(qtbot: QtBot) -> None:
@@ -350,8 +339,10 @@ def test_assistant_bubble_renders_markdown_on_finalize(qtbot: QtBot) -> None:
     assert "<span" in html or "<pre" in html  # 高亮或代码块结构
 
 
-def test_assistant_reply_has_background_panel(qtbot: QtBot) -> None:
-    """模型回复的正文和动作栏位于同一块主题背景板中。"""
+def test_assistant_reply_has_rounded_background_and_padding(qtbot: QtBot) -> None:
+    """流式回复也有背景板，正文与动作栏共享留白。"""
+    from limbowave.ui import theme
+    from limbowave.ui.chat_view import _BUBBLE_PAD_X, _BUBBLE_PAD_Y
     view = ChatView()
     qtbot.addWidget(view)
 
@@ -361,9 +352,14 @@ def test_assistant_reply_has_background_panel(qtbot: QtBot) -> None:
 
     assert row is not None
     assert row._assistant_panel.objectName() == "assistantMessagePanel"
-    assert "background:" in row._assistant_panel.styleSheet()
-    assert "border-radius:" in row._assistant_panel.styleSheet()
-    # 正文经分段容器落在背景板里（一轮 run 一卡，分段是卡的内部结构）
+    css = row._assistant_panel.styleSheet()
+    assert f"background: {theme.card_surface()};" in css
+    assert f"border-radius: {theme.RADIUS_BUBBLE}px;" in css
+    assert "border: none;" in css
+    margins = row._column_layout.contentsMargins()
+    assert margins.left() == margins.right() == _BUBBLE_PAD_X
+    assert margins.top() == margins.bottom() == _BUBBLE_PAD_Y
+    # 正文仍经分段容器归入同一轮 run，不额外创建气泡。
     assert row.label is not None
     assert row._assistant_panel.isAncestorOf(row.label)
 
@@ -744,13 +740,14 @@ def test_copy_puts_markdown_source_on_clipboard(qtbot: QtBot) -> None:
     qtbot.waitUntil(lambda: button.icon_name == "copy", timeout=3000)
 
 
-def test_user_and_assistant_messages_use_distinct_panels(qtbot: QtBot) -> None:
-    """用户消息用收窄气泡；助手回复用铺满消息栏的背景板。"""
+@pytest.mark.parametrize("width", [600, 1200])
+def test_user_and_assistant_messages_use_distinct_panels(qtbot: QtBot, width: int) -> None:
+    """用户消息收窄，助手背景铺满栏宽；正文和动作栏对齐背景板内缘。"""
     from PySide6.QtWidgets import QFrame
 
     view = ChatView()
     qtbot.addWidget(view)
-    view.resize(1200, 800)
+    view.resize(width, 800)
     view.show()
     view.load_history([("user", "问", "", "m1"), ("assistant", "答" * 10, "", "m2")])
     user_row, assistant_row = view._rows
@@ -760,7 +757,19 @@ def test_user_and_assistant_messages_use_distinct_panels(qtbot: QtBot) -> None:
     panel = assistant_row.findChild(QFrame, "assistantMessagePanel")
     assert panel is not None
     qtbot.waitUntil(lambda: panel.width() == view._column_width)
-    assert assistant_row.label.width() < panel.width()
+    margins = assistant_row._column_layout.contentsMargins()
+    qtbot.waitUntil(
+        lambda: assistant_row.label.width() == panel.width() - margins.left() - margins.right()
+    )
+    body = assistant_row.label
+    actions = assistant_row._actions
+    assert actions is not None and actions.isVisible()
+    body_origin = body.mapTo(panel, QPoint(0, 0))
+    action_origin = actions.mapTo(panel, QPoint(0, 0))
+    assert body_origin.x() == action_origin.x() == margins.left() > 0
+    assert body_origin.y() == margins.top() > 0
+    assert actions.geometry().bottom() < panel.height() - margins.bottom()
+    assert 0 < action_origin.y() - (body_origin.y() + body.height()) <= 12
 
 
 def test_user_bubble_width_follows_text(qtbot: QtBot) -> None:
@@ -1352,3 +1361,30 @@ def test_compression_failure_returns_to_start_percent(qtbot: QtBot) -> None:
 
     qtbot.waitUntil(lambda: not view.compressing, timeout=3000)
     assert view.compression_progress == 40.0
+
+
+@pytest.mark.parametrize("width", [1400, 1401, 1001, 801, 600])
+def test_actual_message_rows_stay_in_centered_reading_column(qtbot: QtBot, width: int) -> None:
+    from limbowave.ui.chat_view import _MESSAGE_SIDE_MIN
+
+    view = ChatView()
+    qtbot.addWidget(view)
+    view.resize(width, 800)
+    view.show()
+    view.load_history([
+        ("user", "你好", "", "m1"),
+        ("assistant", "可以帮你：\n\n- 阅读、搜索资料\n- 整理要点", "", "m2"),
+    ])
+    user, assistant = view._rows
+    for target_width in (width, 601, width):
+        view.resize(target_width, 800)
+        qtbot.waitUntil(lambda: assistant.width() == min(
+            _COMPOSER_MAX_WIDTH, view._scroll.viewport().width() - 2 * _MESSAGE_SIDE_MIN
+        ))
+        viewport = view._scroll.viewport()
+        assert user.width() == assistant.width() <= 800
+        left = assistant.mapTo(viewport, QPoint(0, 0)).x()
+        right = viewport.width() - left - assistant.width()
+        assert abs(left - right) <= 1
+        assert min(left, right) >= _MESSAGE_SIDE_MIN
+        assert assistant.label.document().indentWidth() == 20

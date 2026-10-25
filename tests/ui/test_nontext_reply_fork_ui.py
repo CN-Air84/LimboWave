@@ -11,6 +11,7 @@ from limbowave.infrastructure import shell
 from limbowave.ui.main_window import MainWindow
 from tests.unit.test_branch_path import TreeKernel
 from tests.unit.test_nontext_reply_fork import emit_nontext_reply
+from tests.unit.test_runtime_message_anchors import NormalizingKernel
 
 
 @pytest.mark.parametrize("kind", ["tools", "thinking"])
@@ -51,5 +52,40 @@ async def test_nontext_card_fork_preserves_visible_content(qtbot, monkeypatch, t
         assert restored_card.content_text() == ""
         assert not restored_card._fork_btn.isHidden()
         assert not restored_card._regenerate_btn.isHidden()
+    finally:
+        await shutdown()
+
+
+async def test_normalized_prompt_card_buttons_can_fork_and_regenerate(qtbot, monkeypatch, tmp_path):
+    kernel = NormalizingKernel()
+    monkeypatch.setattr(
+        app, "_build_kernel", lambda *_a, **_kw: KernelSetup(kernel, "fake", "fake", "test")
+    )
+    monkeypatch.setattr(shell, "probe_shell", lambda *_a: None)
+    window = MainWindow()
+    qtbot.addWidget(window)
+    controller, _ipc, _warm, _startup, shutdown = app._wire(
+        window, AppPaths(tmp_path, tmp_path / "logs"), None
+    )
+    try:
+        await controller.send("image question")
+        kernel.say("original answer")
+        kernel.emit("run.settled", {})
+        await controller.wait_idle()
+        original_branch = controller.coordinator().branch_id
+        window.chat._rows[-1]._fork_btn.click()
+        async with asyncio.timeout(10):
+            while controller.coordinator().branch_id == original_branch:
+                await asyncio.sleep(0.01)
+        assert kernel.sent == ["image question"]
+        window.chat._rows[-1]._regenerate_btn.click()
+        async with asyncio.timeout(10):
+            while len(kernel.sent) < 2:
+                await asyncio.sleep(0.01)
+        kernel.say("new answer")
+        kernel.emit("run.settled", {})
+        await controller.wait_idle()
+        assert window.chat._rows[-1].content_text() == "new answer"
+        assert kernel.sent == ["image question", "image question"]
     finally:
         await shutdown()

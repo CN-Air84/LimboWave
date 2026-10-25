@@ -1,4 +1,4 @@
-# LimboWave On Web 部署手册
+# LimbowaveOnServer 部署手册
 
 > 更新日期：2026-10-13。本文依据当前仓库的实际入口、配置、认证和备份实现编写。
 > 主线为 **Ubuntu 24.04 x86_64 + Python 源码部署 + Nginx HTTPS + systemd**。
@@ -28,7 +28,7 @@
 
 ## 1. 选择部署方式
 
-“On Web”是浏览器界面，不是只有静态文件的网站。网页通过同源 API 使用 Python 后端，
+LimbowaveOnServer 提供浏览器界面，但不是只有静态文件的网站。网页通过同源 API 使用 Python 后端，
 真实模型请求还需要 Node.js 和 Pi Runtime。
 
 | 方式 | 适用情况 | 必须保持运行 | 认证与重启行为 |
