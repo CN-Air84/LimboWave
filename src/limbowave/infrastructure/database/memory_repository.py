@@ -20,6 +20,15 @@ class SqliteMemoryRepository:
             return None
         return MemoryDocument(row[0], self._key.decrypt(row[1]), row[2], row[3])
 
+    def list_current(self) -> list[MemoryDocument]:
+        # Exact IDs avoid decrypting snapshots, archives, policies or tool receipts.
+        rows = self._conn.execute(
+            "SELECT id, payload, conversation_id, branch_id FROM memory_documents "
+            "WHERE id='global' OR (branch_id IS NOT NULL AND id='branch:' || branch_id) "
+            "ORDER BY id"
+        ).fetchall()
+        return [MemoryDocument(r[0], self._key.decrypt(r[1]), r[2], r[3]) for r in rows]
+
     def put(self, document: MemoryDocument) -> None:
         self._conn.execute(
             "INSERT INTO memory_documents (id, payload, conversation_id, branch_id) "

@@ -40,8 +40,11 @@ CAPABILITY_TEXT = {
     Capability.FILE_READ: "文件读取",
     Capability.FILE_WRITE: "文件写入",
     Capability.TERMINAL: "终端执行",
-    Capability.MEMORY_WRITE: "会话记忆",
+    Capability.MEMORY_WRITE: "记忆写入（会话 / 全局）",
+    Capability.MEMORY_READ: "当前会话记忆检索",
+    Capability.SCRATCHPAD: "当前分支透明便签",
     Capability.CLOCK_READ: "当前日期和时间",
+    Capability.REMINDERS: "定时提醒",
     Capability.HISTORY_READ: "跨会话聊天记录查询",
     Capability.NETWORK: "联网访问",
 }

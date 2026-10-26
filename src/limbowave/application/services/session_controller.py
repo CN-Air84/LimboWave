@@ -29,6 +29,7 @@ from limbowave.application.services.run_coordinator import (
     RunContext,
     RunCoordinator,
 )
+from limbowave.domain.conversation import Message
 from limbowave.domain.memory import MemoryRunContext
 from limbowave.infrastructure.memory_repositories import in_memory_uow_factory
 
@@ -90,6 +91,9 @@ class SessionController:
         return self._coordinator.conversation_id
 
     # ---------- 订阅与权限 ----------
+
+    def notify_reminder(self, message: Message) -> None:
+        self._coordinator.notify_reminder(message)
 
     def subscribe(self, handler: ChatEventHandler) -> Callable[[], None]:
         return self._coordinator.subscribe(handler)

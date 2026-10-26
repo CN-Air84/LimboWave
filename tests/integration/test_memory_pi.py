@@ -194,3 +194,41 @@ async def test_actual_pi_session_global_override_isolation(
             assert text.count("ORIGINAL_GLOBAL_UNIQUE") == 1
             assert text.count("REMOVED_GLOBAL_UNIQUE") == 1
     assert service.list() == [first, second]
+
+
+async def test_actual_pi_builtin_preset_uses_edits_and_respects_deletion(
+    mock_models, mock_provider, tmp_path, memory_stack,
+):
+    service, _ = memory_stack
+    service.ensure_builtin_preset()
+    preset, = service.list()
+    _, log = mock_provider
+    adapter = PiKernelAdapter(
+        build_spawn_spec(provider="mock", model_id="mock-model", cwd=tmp_path)
+    )
+    try:
+        await adapter.start()
+        for n in range(1, 4):
+            if n == 2:
+                service.save("CUSTOM_READER_PRESET_UNIQUE", item_id=preset.id)
+            elif n == 3:
+                service.delete(preset.id)
+                assert not service.ensure_builtin_preset()
+            context = MemoryRunContext(f"r{n}", "c", "b", f"msg{n}")
+            await adapter.set_memory_context(service.prompt_context(context, n))
+            await adapter.send_message(f"USER_READER_{n}")
+            await _wait_settled(adapter)
+    finally:
+        await adapter.shutdown()
+    requests = [
+        json.loads(line)["body"] for line in log.read_text(encoding="utf-8").splitlines()
+        if "body" in json.loads(line)
+    ]
+    assert len(requests) == 3
+    first, edited, deleted = [json.dumps(body["messages"], ensure_ascii=False) for body in requests]
+    assert first.count("忠实的阅读者 · 内置预设") == 1
+    assert "USER_READER_1" in first
+    assert "忠实的阅读者 · 内置预设" not in edited
+    assert edited.count("CUSTOM_READER_PRESET_UNIQUE") == 1
+    assert "忠实的阅读者 · 内置预设" not in deleted
+    assert "CUSTOM_READER_PRESET_UNIQUE" not in deleted

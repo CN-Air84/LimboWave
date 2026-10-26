@@ -35,6 +35,7 @@ class MemoryItem:
     content: str
     source: str
     created_at: str
+    updated_at: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,3 +52,18 @@ class MemoryRunContext:
     conversation_id: str
     branch_id: str
     user_message_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryMutation:
+    tool_name: str
+    original: MemoryItem
+    updated_content: str | None = None
+    archive: bool = True
+    scope: Literal["session", "global"] = "session"
+
+
+@dataclass(frozen=True, slots=True)
+class Scratchpad:
+    content: str = ""
+    revision: int = 0

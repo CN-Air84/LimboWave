@@ -33,6 +33,7 @@ from limbowave.application.repositories import (
     MemoryRepository,
     MessageRepository,
     PermissionRepository,
+    ReminderRepository,
     RunRepository,
     RuntimeMirrorRepository,
     SnapshotRepository,
@@ -62,6 +63,7 @@ from limbowave.domain.tool_step import ToolStep
 from limbowave.infrastructure.crypto.vault import VaultKey
 from limbowave.infrastructure.database.memory_repository import SqliteMemoryRepository
 from limbowave.infrastructure.database.migrations import migrate
+from limbowave.infrastructure.database.reminder_repository import SqliteReminderRepository
 
 
 def _dump_tool_steps(steps: tuple[ToolStep, ...]) -> str:
@@ -126,6 +128,7 @@ class SqliteUnitOfWork:
         self.image_attachments: ImageAttachmentRepository = _ImageAttachments(conn, key)
         self.compressions: CompressionVersionRepository = _Compressions(conn, key)
         self.permissions: PermissionRepository = _Permissions(conn, key)
+        self.reminders: ReminderRepository = SqliteReminderRepository(conn, key)
         self.memories: MemoryRepository = SqliteMemoryRepository(conn, key)
 
     # ---------- 事务 ----------

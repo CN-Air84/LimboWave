@@ -75,6 +75,21 @@ class MemoryPanel(QWidget):
         root.addWidget(self._stack, 1)
         self._build_injection_page()
         self._build_editor_page()
+        if conversation_id is not None and branch_id is not None:
+            from limbowave.ui.scratchpad_panel import ArchivedMemoryPanel, ScratchpadPanel
+
+            notes = self._add_page(
+                "透明便签", "AI 的短期上下文，不是正式记忆或隐藏推理。仅当前分支可用，"
+                "每轮提供给模型；你可以查看、编辑和清空，切勿存放密钥。",
+            )
+            self.scratchpad = ScratchpadPanel(service, conversation_id, branch_id)
+            notes.addWidget(self.scratchpad, 1)
+            archive = self._add_page(
+                "归档记忆", "已结束事项的记忆不再注入对话。可主动检索，或恢复到当前分支。",
+            )
+            self.archive = ArchivedMemoryPanel(service, conversation_id, branch_id)
+            archive.addWidget(self.archive, 1)
+            self.archive.changed.connect(self.reload)
         self.status = QLabel()
         self.status.setWordWrap(True)
         self.status.setTextFormat(Qt.TextFormat.PlainText)
@@ -151,7 +166,8 @@ class MemoryPanel(QWidget):
     def _build_editor_page(self) -> None:
         layout = self._add_page(
             "记忆编辑",
-            "双栏滚动浏览记忆，首行为标题；双击卡片或按 Enter 编辑正文。",
+            "双栏滚动浏览记忆，首行为标题；双击卡片或按 Enter 编辑正文。"
+            "内置预设也可修改或删除，修改不会被自动覆盖，删除后不会自动补回。",
             scrollable=True,
         )
         # 先绑定父级再设置可见性，避免加入布局前短暂弹成独立窗口。

@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 from difflib import SequenceMatcher
+from typing import TYPE_CHECKING
 
 from PySide6.QtCore import QEvent, QObject, QSize, QStringListModel, Qt, Signal
 from PySide6.QtGui import QDropEvent, QMouseEvent, QStandardItemModel
@@ -38,7 +39,6 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from limbowave.application.services.model_probe import ModelProbeResult
 from limbowave.application.services.routing_service import RoutingService
 from limbowave.application.services.settings_service import SettingsService
 from limbowave.domain.configuration import AppConfiguration
@@ -49,7 +49,9 @@ from limbowave.domain.models import LogicalModel, ModelBinding
 from limbowave.domain.routing import RoutingError
 from limbowave.ui.animated_stack import AnimatedPageStack, AnimatedTabBar
 from limbowave.ui.marquee_list import MarqueeListWidget
-from limbowave.ui.model_probe_page import ModelProbeTask
+
+if TYPE_CHECKING:
+    from limbowave.application.services.model_probe import ModelProbeResult
 
 _THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
 _NEW_MODEL_GUIDE = (
@@ -925,6 +927,8 @@ class LogicalModelsTab(QWidget):
         self.reload()
 
     def _on_probe(self) -> None:
+        from limbowave.ui.model_probe_page import ModelProbeTask
+
         binding = self._selected_binding()
         if binding is None:
             self._probe_status.setText("请先选择一条绑定")

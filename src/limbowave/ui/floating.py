@@ -247,6 +247,16 @@ class FloatingPanel(QFrame):
         self.hide()
         self.deleteLater()
 
+    def suspend(self) -> None:
+        """Temporarily hide without closing or losing content; popup resumes it."""
+        self._stop_motion()
+        if self._outside_filter_installed:
+            app = QApplication.instance()
+            if app is not None:
+                app.removeEventFilter(self)
+            self._outside_filter_installed = False
+        self.hide()
+
     def close_panel(self) -> None:
         if self._closing:
             return

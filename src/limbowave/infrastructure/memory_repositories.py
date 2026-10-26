@@ -24,6 +24,7 @@ from limbowave.domain.conversation import Branch, Conversation, Message
 from limbowave.domain.files import FileDocument, ImageAttachment
 from limbowave.domain.memory import MemoryDocument
 from limbowave.domain.permissions import PermissionAudit, PermissionGrant
+from limbowave.domain.reminder import Reminder, ReminderStatus
 from limbowave.domain.run import RunLogSummary, RunRecord, RunStatus
 from limbowave.domain.runtime_mirror import RuntimeEntryMetadata, RuntimeEntryMirror
 from limbowave.domain.snapshots import RequestIntentSnapshot, TransportSnapshot
@@ -33,6 +34,7 @@ class InMemoryStore:
     """backing store：只有 ``commit()`` 才会被写入。"""
 
     def __init__(self) -> None:
+        self.reminders: dict[str, Reminder] = {}
         self.memories: dict[str, MemoryDocument] = {}
         self.conversations: dict[str, Conversation] = {}
         self.branches: dict[str, Branch] = {}
@@ -533,8 +535,50 @@ class _Memories:
     def get(self, document_id: str) -> MemoryDocument | None:
         return self._staged.get(document_id) or self._store.memories.get(document_id)
 
+    def list_current(self) -> list[MemoryDocument]:
+        merged = dict(self._store.memories)
+        merged.update({doc.id: doc for doc in self._staged.values()})
+        return [doc for key, doc in sorted(merged.items())
+                if key == "global" or (doc.branch_id and key == f"branch:{doc.branch_id}")]
+
     def put(self, document: MemoryDocument) -> None:
         self._staged.put(document.id, document)
+
+
+class _Reminders:
+    def __init__(self, store: InMemoryStore, staged: _Staged[Reminder]) -> None:
+        self._store = store
+        self._staged = staged
+
+    def add(self, reminder: Reminder) -> None:
+        self._staged.put(reminder.id, reminder)
+
+    def get(self, reminder_id: str) -> Reminder | None:
+        return self._staged.get(reminder_id) or self._store.reminders.get(reminder_id)
+
+    def _all(self) -> list[Reminder]:
+        merged = dict(self._store.reminders)
+        merged.update({r.id: r for r in self._staged.values()})
+        return sorted(merged.values(), key=lambda r: (r.target_time, r.id))
+
+    def list_for_conversation(
+        self, conversation_id: str, *, status: str = "pending", limit: int = 50, offset: int = 0,
+    ) -> list[Reminder]:
+        return [r for r in self._all() if r.conversation_id == conversation_id
+                and (status == "all" or r.status == status)][offset:offset + limit]
+
+    def list_due(self, now: datetime, *, limit: int = 100) -> list[Reminder]:
+        return [r for r in self._all()
+                if r.status is ReminderStatus.PENDING and r.target_time <= now][:limit]
+
+    def transition(
+        self, reminder_id: str, status: ReminderStatus, completed_at: datetime,
+    ) -> bool:
+        item = self.get(reminder_id)
+        if item is None or item.status is not ReminderStatus.PENDING:
+            return False
+        self.add(replace(item, status=status, completed_at=completed_at))
+        return True
 
 
 class InMemoryUnitOfWork:
@@ -542,6 +586,8 @@ class InMemoryUnitOfWork:
 
     def __init__(self, store: InMemoryStore) -> None:
         self._store = store
+        self._staged_reminders: _Staged[Reminder] = _Staged()
+        self.reminders = _Reminders(store, self._staged_reminders)
         self._staged_memories: _Staged[MemoryDocument] = _Staged()
         self.memories = _Memories(store, self._staged_memories)
         self._staged_conversations: _Staged[Conversation] = _Staged()
@@ -573,6 +619,7 @@ class InMemoryUnitOfWork:
 
     def _all_staged(self) -> list[tuple[dict[str, Any], _Staged[Any]]]:
         return [
+            (self._store.reminders, self._staged_reminders),
             (self._store.memories, self._staged_memories),
             (self._store.conversations, self._staged_conversations),
             (self._store.branches, self._staged_branches),
@@ -596,6 +643,11 @@ class InMemoryUnitOfWork:
             for item in staged.values():
                 target[item.id] = item
         self._apply_cascade_deletes()
+        self._store.reminders = {
+            k: r for k, r in self._store.reminders.items()
+            if (r.conversation_id in self._store.conversations
+                and r.branch_id in self._store.branches)
+        }
         for key, doc in list(self._store.memories.items()):
             if (doc.conversation_id and doc.conversation_id not in self._store.conversations) or (
                 doc.branch_id and doc.branch_id not in self._store.branches

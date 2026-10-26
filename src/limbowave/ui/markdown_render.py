@@ -157,11 +157,12 @@ def render(text: str) -> str:
 
 def _restyle(html: str) -> str:
     """给渲染产物补主题相关的内联样式（代码块背景、引用条、表格边框）。"""
-    # 代码块背景板：markdown-it 产出的 <pre> 只来自围栏代码块
+    # 围栏与缩进代码块共用背景板；pre-wrap 保留缩进和原始换行，允许长行软换行。
+    # 否则 Qt 将 <pre> 标为不可折行，撑宽表格后被隐藏横向滚动条的消息区截断。
     html = html.replace(
         "<pre>",
         f'<table width="100%" cellpadding="8" cellspacing="0" bgcolor="{theme.CODE_BG}">'
-        f'<tr><td><pre style="font-family: {theme.FONT_MONO};">',
+        f'<tr><td><pre style="font-family: {theme.FONT_MONO}; white-space: pre-wrap;">',
     )
     html = html.replace("</pre>", "</pre></td></tr></table>")
     # 引用块

@@ -132,7 +132,8 @@ def history_payload(
                 m.id == last_user_id
                 and (m.id in retryable_users or m.run_id in retryable_runs)
             ),
-            can_fork=m.status is MessageStatus.COMPLETE and m.run_id not in retryable_runs,
+            can_fork=(m.status is MessageStatus.COMPLETE and m.run_id not in retryable_runs
+                      and not m.id.startswith("notice_reminder_")),
             segments=m.segments,
             compressions=tuple(compressions.get(m.id, ())),
         )

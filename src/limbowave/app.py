@@ -27,7 +27,7 @@ from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
 from time import perf_counter
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import shiboken6
 from PySide6.QtCore import QLockFile, QObject, Qt, QTimer, Signal, qVersion
@@ -43,6 +43,10 @@ from limbowave.application.events import FIRST_RESPONSE_COMPLETED
 from limbowave.application.history_view_payload import HistoryViewPayload, load_history_view
 from limbowave.application.kernel import AgentKernel, KernelEvent, KernelSetup
 from limbowave.application.services.history_reader import HistoryReader
+from limbowave.application.services.memory_service import (
+    MEMORY_CONTEXT_TOOLS,
+    MEMORY_MUTATION_TOOLS,
+)
 from limbowave.application.services.run_coordinator import (
     DEFAULT_CONVERSATION_TITLE,
     RunContext,
@@ -464,8 +468,13 @@ async def _ask_memory_user(window: MainWindow, title: str, detail: str) -> bool:
     text = QPlainTextEdit()
     text.setReadOnly(True)
     text.setPlainText(detail)
-    text.setMinimumHeight(220)
     panel.content_layout.addWidget(text)
+    text.ensurePolished()
+    # Keep short before/after proposals visible together, with scrolling for long memory.
+    # A local QSS minimum is necessary: the app's input QSS overrides QWidget's minimum.
+    desired_height = max(220, min(260, (detail.count("\n") + 3) * text.fontMetrics().lineSpacing()))
+    available_height = max(160, window.height() - 180)
+    text.setStyleSheet(f"min-height: {min(desired_height, available_height)}px;")
     row = QHBoxLayout()
     reject, accept = QPushButton("拒绝"), QPushButton("允许本次")
     row.addWidget(reject)
@@ -573,6 +582,64 @@ def _make_permission_handler(
             return False
         gate = _parse_gate_request(title, detail)
         conversation_id = conversation_provider() if conversation_provider else None
+        if gate is not None and gate.get("tool") in MEMORY_CONTEXT_TOOLS - {"add_session_memory"}:
+            context = memory_context() if memory_context else None
+            if (memory_service is None or context is None or gate.get("run_id") != context.run_id
+                    or (conversation_id is not None
+                        and conversation_id != context.conversation_id)):
+                return False
+            call_id, params, tool = gate.get("call_id"), gate.get("input"), gate["tool"]
+            if (not isinstance(call_id, str) or not call_id.strip() or len(call_id) > 200
+                    or not isinstance(params, dict) or "call_id" in params or "run_id" in params):
+                return False
+            memory_service.discard_approval(context, call_id)
+            stage = "validate_params"
+            try:
+                from limbowave.application.services.tool_gateway import validate_params
+
+                validate_params(tool, {**params, "call_id": call_id, "run_id": context.run_id})
+                if tool not in MEMORY_MUTATION_TOOLS:
+                    # Execution rechecks current-branch scope and origin.
+                    return True
+                stage = "resolve_target"
+                change = await run_blocking(
+                    memory_service.prepare_mutation, context, tool, params["memory_id"],
+                    params.get("updated_content"), archive=params.get("archive", True),
+                )
+                action = ("更新" if tool == "update_memory"
+                          else "归档" if change.archive else "删除")
+                scope_label = "全局记忆" if change.scope == "global" else "会话记忆"
+                impact = (
+                    "修改全局原文：会影响所有继承这条记忆的会话。\n"
+                    "已有会话的自定义覆盖或停用设置不会被改写；本会话如有定制仍使用定制内容。\n\n"
+                    if change.scope == "global" else "仅修改当前分支的会话记忆。\n\n"
+                )
+                detail_text = (f"范围：{scope_label}\n{impact}"
+                               f"发起会话 {context.conversation_id} · 分支 {context.branch_id}\n\n"
+                               f"原文：\n{change.original.content}")
+                if change.updated_content is not None:
+                    detail_text += f"\n\n更新为：\n{change.updated_content}"
+                else:
+                    detail_text += ("\n\n归档后不再主动注入，可在记忆面板恢复。" if change.archive
+                                    else "\n\n从当前记忆删除；已有历史快照不会物理清除。")
+                stage = "show_confirmation"
+                allowed = await _ask_memory_user(window, f"{action}{scope_label}？", detail_text)
+                allowed = allowed and memory_context is not None and memory_context() == context
+                stage = "record_decision"
+                await run_blocking(memory_service.record_mutation_decision,
+                                   context, call_id, change, allowed=allowed)
+                if not allowed or memory_context is None or memory_context() != context:
+                    return False
+                memory_service.approve_mutation(context, call_id, change)
+                return True
+            except Exception as exc:
+                # Never log memory bodies or exception text; distinguish pre-dialog failures.
+                _LOG.warning("memory.gate_failed", extra={
+                    "tool_name": tool, "stage": stage, "error_type": type(exc).__name__,
+                    "run_id": context.run_id, "branch_id": context.branch_id,
+                })
+                return False
+
         if gate is not None and gate.get("tool") == "add_session_memory":
             from limbowave.domain.memory import MemoryPolicy
 
@@ -684,6 +751,28 @@ def _make_permission_handler(
             if preset is PermissionPreset.CHAT_ONLY:
                 await run_blocking(permissions.authorize, request, conversation_id)
                 return False
+
+            if request.capability is Capability.REMINDERS:
+                from limbowave.ui.permission_prompt import ONCE
+
+                decision = await run_blocking(permissions.authorize, request, conversation_id)
+                allowed = decision.decision is Decision.ALLOW
+                if not allowed:
+                    allowed = preset is PermissionPreset.FULL_ACCESS or (
+                        await _ask_permission(window, request, decision.reason, None) == ONCE
+                    )
+                allowed = (
+                    allowed and conversation_provider is not None
+                    and conversation_provider() == conversation_id
+                    and not remote_tools_denied(
+                        gateway.origin_provider if gateway is not None else None
+                    )
+                )
+                await run_blocking(
+                    permissions.authorize, request, conversation_id,
+                    user_confirmed=allowed, user_denied=not allowed,
+                )
+                return allowed
 
             if preset is PermissionPreset.FULL_ACCESS:
                 await run_blocking(
@@ -902,10 +991,12 @@ def _wire_impl(
     shell_env = _run_startup_task(partial(probe_shell, paths.data_root))
     terminal = TerminalTools(create_executor(shell_env)) if shell_env is not None else None
     from limbowave.application.services.chat_history_service import ChatHistoryService
+    from limbowave.infrastructure.environment import create_environment_service
 
+    environment_service = create_environment_service()
     tool_gateway = ToolGateway(
         permissions, paths.data_root, documents=files, terminal=terminal,
-        chat_history=ChatHistoryService(uow_factory),
+        chat_history=ChatHistoryService(uow_factory), environment=environment_service,
     )
     # 装配可观测：read_document 报「文档服务未配置」时，先看这条日志——
     # documents=False 意味着这个进程跑在未解锁状态，或是修复前的旧进程。
@@ -923,7 +1014,7 @@ def _wire_impl(
         未标记为已确认时，需要确认的请求被拒（确认已在扩展的 tool_call 闸门做过）。"""
         if shutting_down:
             return {"ok": False, "error": "应用正在关闭，工具调用已停止"}
-        if tool_name == "add_session_memory":
+        if tool_name in MEMORY_CONTEXT_TOOLS:
             context = tool_gateway.memory_context()
             if context is None:
                 return {"ok": False, "error": "记忆调用没有活动运行"}
@@ -1061,9 +1152,23 @@ def _wire_impl(
     memories = MemoryService(
         uow_factory, ConfigurationService(JsonConfigRepository(paths.data_root / "config.json"))
     )
+    _run_startup_task(memories.ensure_builtin_preset)
     controller.set_memory_service(memories)
     tool_gateway.memory_service = memories
     tool_gateway.memory_context = lambda: controller.memory_context
+    from limbowave.application.services.reminder_service import ReminderService
+    from limbowave.domain.reminder import ReminderContext
+
+    reminders = ReminderService(uow_factory) if storage is not None else None
+    tool_gateway.reminder_service = reminders
+
+    def _reminder_context() -> ReminderContext | None:
+        context = controller.memory_context
+        if context is None or shutting_down or resetting or restoring:
+            return None
+        return ReminderContext(context.conversation_id, context.branch_id)
+
+    tool_gateway.reminder_context = _reminder_context
     history = HistoryService(uow_factory)
     history_reader = HistoryReader()
     history_list_generation = 0
@@ -1098,6 +1203,20 @@ def _wire_impl(
     from limbowave.application.services.preferences_service import PreferencesService
 
     preferences = PreferencesService(paths.data_root / "preferences.json")
+    from limbowave.ui.gentle_presence import GentlePresenceController
+
+    gentle_presence = GentlePresenceController(
+        window, preferences,
+        allowed=lambda: key is not None and not resetting and not shutting_down,
+    )
+    rollback.callback(gentle_presence.shutdown)
+    from limbowave.ui.reminder_notifications import ReminderNotifications
+
+    reminder_notifications = ReminderNotifications(
+        window, preferences,
+        allowed=lambda: key is not None and not resetting and not restoring and not shutting_down,
+    )
+    rollback.callback(reminder_notifications.shutdown)
 
     def _load_appearance_themes() -> AppearanceThemeService:
         legacy = preferences.load()
@@ -2499,11 +2618,13 @@ def _wire_impl(
                 item.setData(Qt.ItemDataRole.UserRole, target)
                 results.addItem(item)
 
-    async def _open_search_target(target: tuple[str, str | None, str | None, str]) -> None:
+    async def _open_search_target(
+        target: tuple[str, str | None, str | None, str], *, preview_only: bool = False,
+    ) -> None:
         conversation_id, branch_id, message_id, query = target
         if chat.history_loading or chat.compressing or shutting_down:
             return
-        await _open_history(conversation_id, branch_id)
+        await _open_history(conversation_id, branch_id, preview_only=preview_only)
         displayed_conversation, displayed_branch = _display_scope()
         if displayed_conversation != conversation_id or (
             branch_id is not None and displayed_branch != branch_id
@@ -2512,11 +2633,40 @@ def _wire_impl(
         surface = window.history_preview if preview_scope is not None else chat
         if surface is not None:
             if message_id is not None:
-                if not surface.show_search_match(query, message_id):
-                    surface.set_status("未能定位搜索消息，请重新搜索")
+                located = (
+                    surface.show_search_match(query, message_id)
+                    if query else surface.focus_message(message_id)
+                )
+                if not located:
+                    surface.set_status(
+                        "未能定位搜索消息，请重新搜索" if query
+                        else "来源消息暂时无法定位，对应对话已打开。"
+                    )
             else:
                 surface.clear_search_matches()
 
+    def _open_reminder_notification(target: tuple[str, str, str]) -> None:
+        if shutting_down or resetting or restoring:
+            return
+        window._companion.restore()
+        if window.isMinimized():
+            window.setWindowState(window.windowState() & ~Qt.WindowState.WindowMinimized)
+        window.show()
+        window.raise_()
+        window.activateWindow()
+        if (QApplication.activeModalWidget() is not None
+                or QApplication.activePopupWidget() is not None
+                or any(panel.isVisible() for panel in window.findChildren(FloatingPanel))):
+            return  # Never dismiss or navigate away from an outstanding permission prompt.
+        if window.showing_full_page:
+            resolver = getattr(window._full_page, "resolve_pending_changes", None)
+            if callable(resolver) and not resolver():
+                return
+            window.show_workspace(release_page=False)
+        # A click is navigation, not consent to resume/switch a model runtime.
+        _spawn(_open_search_target((*target, ""), preview_only=True))
+
+    reminder_notifications.open_requested.connect(_open_reminder_notification)
     sidebar.search_hit_selected.connect(lambda target: _spawn(_open_search_target(target)))
     search_timer.timeout.connect(lambda: _spawn(_search_history()))
 
@@ -2575,8 +2725,8 @@ def _wire_impl(
                 return
             settings_page = None
 
-        # Optional settings are created once, on demand, on the GUI thread.
-        # Building hundreds of hidden controls must not delay chat readiness.
+        # Create the retained settings shell on demand, on the GUI thread.
+        # Hidden categories stay lazy, both here and in the service wiring below.
         from limbowave.ui.settings_panel import SettingsPage
 
         page = SettingsPage(
@@ -2590,11 +2740,34 @@ def _wire_impl(
             conversation_id=controller.conversation_id,
             memories=memories,
             diagnostics_available=diagnostics_available,
-            lan_panel=lan_access.panel(),
+            lan_panel=lan_access.panel,
         )
         page.diagnostics_requested.connect(window.diagnostics_requested.emit)
         settings_page = page
-        page.endpoints_tab.configuration_changed.connect(
+        page.reminder_notifications_changed.connect(reminder_notifications.configure)
+        page.reminder_sound_preview_requested.connect(reminder_notifications.preview_sound)
+        page.presence_changed.connect(gentle_presence.configure)
+
+        def _bind_settings_tab(title: str, _widget: QWidget) -> None:
+            # Do not instantiate hidden categories merely to wire their services.
+            # This signal fires once, after the lazy tab has been registered.
+            if title == "提醒通知":
+                reminder_tab = page.reminder_notifications_tab
+                assert reminder_tab is not None
+                reminder_tab.reload(reminder_notifications.settings)
+                reminder_tab.show_error(reminder_notifications.error)
+                reminder_notifications.settings_changed.connect(reminder_tab.reload)
+                reminder_notifications.error_changed.connect(reminder_tab.show_error)
+            elif title == "低压在场":
+                presence_tab = page.presence_tab
+                assert presence_tab is not None
+                presence_tab.reload(gentle_presence.service.settings)
+                presence_tab.show_error(gentle_presence.error)
+                gentle_presence.settings_changed.connect(presence_tab.reload)
+                gentle_presence.error_changed.connect(presence_tab.show_error)
+
+        page.tab_created.connect(_bind_settings_tab)
+        page.configuration_changed.connect(
             lambda: request_limiter.configure(settings.load().endpoints)
         )
 
@@ -2964,6 +3137,42 @@ def _wire_impl(
     sidebar.branch_rename_requested.connect(_on_rename_branch)
     sidebar.branch_delete_requested.connect(_on_delete_branch)
     sidebar.search_requested.connect(_open_search)
+    def _open_footprints() -> None:
+        from limbowave.ui.memory_timeline import MemoryTimelinePage
+
+        if shutting_down or credentials is None:
+            chat.set_status("资料库未解锁：足迹不可用")
+            return
+        page = MemoryTimelinePage(memories, window)
+
+        def _refresh_footprints(event: Any) -> None:
+            from shiboken6 import isValid
+
+            if event.kind == "settled" and isValid(page) and page.isVisible():
+                page.reload()
+
+        stop_observing = controller.subscribe(_refresh_footprints)
+        page.destroyed.connect(lambda: stop_observing())
+
+        def _close_footprints() -> None:
+            stop_observing()
+            window.show_workspace()
+            page.dispose()
+
+        def _manage_footprints() -> None:
+            _close_footprints()
+            _open_settings("记忆")
+
+        def _open_footprint_source(target: object) -> None:
+            _close_footprints()
+            _spawn(_open_search_target(cast(tuple[str, str | None, str | None, str], target)))
+
+        page.close_requested.connect(_close_footprints)
+        page.manage_requested.connect(_manage_footprints)
+        page.source_requested.connect(_open_footprint_source)
+        window.show_full_page(page)
+
+    sidebar.footprints_requested.connect(_open_footprints)
     sidebar.settings_requested.connect(_open_settings)
 
     # ---------- 导出与备份（Phase 8） ----------
@@ -4160,6 +4369,19 @@ def _wire_impl(
         nonlocal branch_render_task, detached_scope
         kind = event.kind
         data = event.data
+        if kind == "reminder":
+            reminder_scope = (data["conversation_id"], data["branch_id"])
+            live_scope = detached_scope or (controller.conversation_id, controller.branch_id)
+            if live_scope == reminder_scope:
+                chat.add_reminder(data["text"], data["message_id"])
+            if preview_scope == reminder_scope and window.history_preview is not None:
+                window.history_preview.add_reminder(data["text"], data["message_id"])
+            _refresh_conversations()
+            QApplication.alert(window, 3000)
+            reminder_notifications.notify(
+                data["conversation_id"], data["branch_id"], data["message_id"],
+            )
+            return
         if (
             kind == "user"
             and queue_active is not None
@@ -4385,6 +4607,8 @@ def _wire_impl(
     async def _shutdown() -> None:
         nonlocal shutting_down
         shutting_down = True
+        gentle_presence.shutdown()
+        reminder_notifications.shutdown()
         send_queue.clear()
         _LOG.info("application.services_stopping")
         await lan_access.close()
@@ -4419,6 +4643,7 @@ def _wire_impl(
 
                 await drain_background_tasks()
                 await drain_blocking()
+                environment_service.clear_cache()
                 if can_collect and key is not None:
                     from limbowave.application.services.attachment_gc import (
                         AttachmentGarbageCollector,
@@ -4442,6 +4667,21 @@ def _wire_impl(
                 if storage is not None:
                     storage.close()
                 _LOG.info("application.storage_closed", extra={"persistent": storage is not None})
+
+    # Queue long-lived tasks only after all synchronous startup work is finished.
+    # _run_startup_task pumps a Qt-only nested loop: it can dispatch qasync timers
+    # before asyncio has a running loop. In particular, history loading above must
+    # finish before the reminder coroutine is scheduled.
+    if reminders is not None:
+        from limbowave.application.services.reminder_scheduler import ReminderScheduler
+
+        reminder_scheduler = ReminderScheduler(
+            reminders, controller.notify_reminder,
+            enabled=lambda: not shutting_down and not resetting and not restoring,
+        )
+        # Start independently of Pi: reminders must work without a provider or network.
+        # _shutdown cancels/drains this task before closing any storage connection.
+        _spawn(reminder_scheduler.run())
 
     return controller, tool_ipc, _warm_settings, _finish_startup, _shutdown
 

@@ -318,7 +318,7 @@ export function adaptEvent(value: unknown): ChatEvent {
   }
   if (e.kind === "assistant_start" || e.kind === "assistant_end")
     return { ...base, kind: "resync_required" };
-  if (e.kind === "user")
+  if (e.kind === "user" || e.kind === "reminder")
     return {
       ...base,
       kind: "message.updated",

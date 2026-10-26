@@ -287,6 +287,7 @@ class RuntimeFacade:
         kind, data = event.kind, event.data
         allowed = {
             "user": ("text",),
+            "reminder": ("text", "created_at"),
             "assistant_start": (),
             "assistant_delta": ("text", "delta"),
             "thinking_delta": ("text", "delta"),
@@ -308,6 +309,12 @@ class RuntimeFacade:
             if key in data and isinstance(data[key], (str, int, float, bool, type(None)))
         }
         scope = self._coordinator.event_scope()
+        if kind == "reminder":
+            # A timer may belong to a completely different conversation than the live run.
+            scope = {
+                "run_origin": "local", "run_id": None, "message_id": data["message_id"],
+                "conversation_id": data["conversation_id"], "branch_id": data["branch_id"],
+            }
         scope["message_id"] = data.get("message_id") or scope["message_id"]
         self.events.publish(kind, payload, **scope)
 

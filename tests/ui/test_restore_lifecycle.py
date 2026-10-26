@@ -12,6 +12,7 @@ SCRIPT = r'''
 import asyncio
 import sys
 from pathlib import Path
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QFileDialog
 from limbowave import app
 from limbowave.application.kernel import KernelSetup
@@ -40,6 +41,10 @@ storages = []
 ipcs = []
 
 class Kernel(FakeKernel):
+    async def set_memory_context(self, context):
+        from limbowave.domain.memory_presets import BUILTIN_READER_PRESET_CONTENT
+        assert BUILTIN_READER_PRESET_CONTENT in context["global"]
+        await super().set_memory_context(context)
     async def abort(self):
         events.append('abort')
         await super().abort()
@@ -60,6 +65,11 @@ QFileDialog.getOpenFileName = lambda *a, **kw: (str(archive), '')
 app.ask_prompt = lambda parent, heading, prompt, callback, **kw: callback('backup password')
 
 def confirm(parent, heading, text, callback, **kwargs):
+    if heading == '停止生成并退出？':
+        assert scenario == 'cancel'
+        events.append('close-confirm')
+        QTimer.singleShot(0, lambda: callback(True))
+        return
     assert '自动保留' in text and '备份密码解锁' in text
     events.append('confirm')
     callback(scenario != 'cancel')
@@ -149,11 +159,16 @@ print('RESTORE_LIFECYCLE_OK')
     'success', 'cancel', 'shutdown-fails', 'install-fails', 'launch-fails',
 ])
 def test_restore_lifecycle(tmp_path: Path, scenario: str) -> None:
-    result = subprocess.run(
-        [sys.executable, '-c', SCRIPT, str(tmp_path), scenario],
-        cwd=Path(__file__).resolve().parents[2],
-        env={**os.environ, 'QT_QPA_PLATFORM': 'offscreen', 'PYTHONIOENCODING': 'utf-8'},
-        capture_output=True, encoding='utf-8', errors='replace', timeout=45, check=False,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert 'RESTORE_LIFECYCLE_OK' in result.stdout
+    # Storage workers can inherit stdout; a file keeps timeout cleanup from waiting
+    # forever for a surviving worker to close a captured pipe after a failed GUI exit.
+    log = tmp_path / 'restore-process.log'
+    with log.open('w', encoding='utf-8') as output:
+        result = subprocess.run(
+            [sys.executable, '-c', SCRIPT, str(tmp_path), scenario],
+            cwd=Path(__file__).resolve().parents[2],
+            env={**os.environ, 'QT_QPA_PLATFORM': 'offscreen', 'PYTHONIOENCODING': 'utf-8'},
+            stdout=output, stderr=subprocess.STDOUT, timeout=45, check=False,
+        )
+    transcript = log.read_text(encoding='utf-8', errors='replace')
+    assert result.returncode == 0, transcript
+    assert 'RESTORE_LIFECYCLE_OK' in transcript

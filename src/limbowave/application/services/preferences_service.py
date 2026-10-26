@@ -18,6 +18,9 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from limbowave.domain.presence import PresenceSettings
+from limbowave.domain.reminder_notifications import ReminderNotificationSettings
+
 DEFAULT_FONT_SCALE = 1.0
 SUPPORTED_THEMES = ("dark", "light")
 FONT_SCALES = (0.9, 1.0, 1.15, 1.3, 1.5)
@@ -108,6 +111,10 @@ class Preferences:
     font_file: str = ""
     background_image: str = ""
     blur_radius: int = 0
+    presence: PresenceSettings = field(default_factory=PresenceSettings)
+    reminder_notifications: ReminderNotificationSettings = field(
+        default_factory=ReminderNotificationSettings,
+    )
 
     def to_json(self) -> dict[str, Any]:
         return asdict(self)
@@ -140,6 +147,10 @@ class Preferences:
             font_file=text("font_file"),
             background_image=text("background_image"),
             blur_radius=max(0, min(32, radius)),
+            presence=PresenceSettings.from_json(data.get("presence")),
+            reminder_notifications=ReminderNotificationSettings.from_json(
+                data.get("reminder_notifications"),
+            ),
         )
 
 
@@ -167,7 +178,9 @@ class PreferencesService:
 
     def save(self, preferences: Preferences) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._path.write_text(
+        temporary = self._path.with_suffix(self._path.suffix + ".tmp")
+        temporary.write_text(
             json.dumps(preferences.to_json(), ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
+        temporary.replace(self._path)

@@ -181,6 +181,7 @@ class PiKernelAdapter(AgentKernel):
         self._control_token = secrets.token_hex(16)
         base_env = spec.env if spec.env is not None else dict(os.environ)
         spec.env = {**base_env, CONTROL_TOKEN_ENV: self._control_token}
+        spec.env.pop("LIMBOWAVE_MSN_WEATHER_API_KEY", None)
         # 本适配器物化的会话文件目录（进程退出时整体清理）
         self._session_dir = Path(spec.cwd or ".") / "runtime" / "pi-sessions" / uuid4().hex[:12]
         self._rpc = PiRpcProcess(spec)
@@ -791,6 +792,7 @@ def build_spawn_spec(
     full_env = dict(os.environ)
     if env:
         full_env.update(env)
+    full_env.pop("LIMBOWAVE_MSN_WEATHER_API_KEY", None)
     full_env.setdefault("PI_SKIP_VERSION_CHECK", "1")
     full_env.setdefault("PI_OFFLINE", "1")
 

@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Any
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any, cast
 
 from PySide6.QtCore import (
     QAbstractAnimation,
@@ -25,20 +26,32 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from limbowave.application.services.model_probe import (
-    DiscoveryResult,
-    ModelProbeProgress,
-    ModelProbeResult,
-)
 from limbowave.domain.models import ActualModel
 from limbowave.domain.providers import EndpointConfig
 from limbowave.ui import theme
-from limbowave.ui.about_page import AboutPage
 from limbowave.ui.animated_stack import AnimatedPageStack, AnimatedTabBar
-from limbowave.ui.model_probe_page import ActualModelsPage, ModelCapabilityChange, ModelProbeTask
-from limbowave.ui.settings_dialog import _AppearanceTab, _EndpointsTab, _ModelsTab, _SecurityTab
 
-_HINT_STYLE = f"color: {theme.TEXT_SECONDARY}; font-size: {theme.FS_SMALL}px;"
+if TYPE_CHECKING:
+    from limbowave.application.services.model_probe import (
+        DiscoveryResult,
+        ModelProbeProgress,
+        ModelProbeResult,
+    )
+    from limbowave.ui.about_page import AboutPage
+    from limbowave.ui.gentle_presence import PresenceSettingsPage
+    from limbowave.ui.logical_models_tab import LogicalModelsTab
+    from limbowave.ui.model_probe_page import (
+        ActualModelsPage,
+        ModelCapabilityChange,
+        ModelProbeTask,
+    )
+    from limbowave.ui.reminder_notifications import ReminderNotificationSettingsPage
+    from limbowave.ui.session_memory_panel import MemoryPanel
+    from limbowave.ui.settings_dialog import _AppearanceTab, _EndpointsTab
+
+def _hint_style() -> str:
+    # Lazy pages may be created after a theme/font change.
+    return f"color: {theme.TEXT_SECONDARY}; font-size: {theme.FS_SMALL}px;"
 
 
 _AnimatedPageStack = AnimatedPageStack
@@ -155,6 +168,8 @@ class _DataSecurityTab(QScrollArea):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(10)
         if vault is not None:
+            from limbowave.ui.settings_dialog import _SecurityTab
+
             security = _SecurityTab(vault, content)
             security_layout = security.layout()
             assert security_layout is not None
@@ -170,7 +185,7 @@ class _DataSecurityTab(QScrollArea):
             "重启后使用备份密码解锁，无需手动操作文件夹。"
         )
         note.setWordWrap(True)
-        note.setStyleSheet(_HINT_STYLE)
+        note.setStyleSheet(_hint_style())
         layout.addWidget(note)
         row = QHBoxLayout()
         backup = QPushButton("生成加密备份…")
@@ -212,7 +227,7 @@ class _RequestLogTab(QWidget):
         if conversation_id is None or request_logs is None:
             hint = QLabel("当前没有打开的会话：先聊一轮，或选择一个历史会话。")
             hint.setWordWrap(True)
-            hint.setStyleSheet(_HINT_STYLE)
+            hint.setStyleSheet(_hint_style())
             layout.addWidget(hint)
             layout.addStretch(1)
             return
@@ -298,12 +313,17 @@ class _EndpointWorkspace(QWidget):
 class SettingsPage(QWidget):
     """占满主窗口的设置页。业务动作仍通过信号交给应用层。"""
 
+    tab_created = Signal(str, object)
+    configuration_changed = Signal()
     close_requested = Signal()
     diagnostics_requested = Signal()
     backup_requested = Signal()
     restore_requested = Signal()
     reset_requested = Signal()
     appearance_changed = Signal(object)
+    presence_changed = Signal(object)
+    reminder_notifications_changed = Signal(object)
+    reminder_sound_preview_requested = Signal()
     model_discovery_requested = Signal(object)  # EndpointConfig
     # ModelProbeTask：实际模型页勾选 / 手动添加，或逻辑模型页「重新检测能力」
     model_probe_requested = Signal(object)
@@ -323,12 +343,29 @@ class SettingsPage(QWidget):
         conversation_id: str | None = None,
         memories: Any = None,
         diagnostics_available: bool = False,
-        lan_panel: QWidget | None = None,
+        lan_panel: QWidget | Callable[[], QWidget] | None = None,
     ) -> None:
         super().__init__(parent)
         self.setObjectName("settingsPage")
         self._discovery_cache: dict[str, tuple[EndpointConfig, DiscoveryResult]] = {}
         self._settings = settings
+        self._credentials = credentials
+        self._preferences = preferences
+        self._appearance_themes = appearance_themes
+        self._vault = vault
+        self._memories = memories
+        self._lan_panel = lan_panel
+        self._pending_pages: dict[int, Callable[[], QWidget]] = {}
+        self._stale_pages: set[int] = set()
+        self._models_tab: LogicalModelsTab | None = None
+        self._endpoints_tab: _EndpointsTab | None = None
+        self._actual_models: ActualModelsPage | None = None
+        self._endpoint_workspace: _EndpointWorkspace | None = None
+        self._appearance_tab: _AppearanceTab | None = None
+        self._reminder_notifications_tab: ReminderNotificationSettingsPage | None = None
+        self._presence_tab: PresenceSettingsPage | None = None
+        self._memory_tab: MemoryPanel | None = None
+        self._about_tab: AboutPage | None = None
         self._probe_tasks: dict[tuple[str, str], ModelProbeTask] = {}
         self._probe_progress: dict[tuple[str, str], ModelProbeProgress] = {}
         self._request_logs = request_logs
@@ -377,83 +414,225 @@ class SettingsPage(QWidget):
         body_layout.addWidget(content, 1)
         root.addWidget(body, 1)
 
-        self.models_tab = _ModelsTab(settings, self)
-        self.models_tab.probe_requested.connect(self._request_model_probe)
-        self._add_page("逻辑模型", self.models_tab)
-        self.endpoints_tab = _EndpointsTab(settings, credentials, self)
-        self.endpoints_tab.configuration_changed.connect(self.models_tab.reload)
-        self.endpoints_tab.discovery_requested.connect(self.model_discovery_requested.emit)
-        self.endpoints_tab.endpoint_saved.connect(self._on_endpoint_saved)
-        self.actual_models = ActualModelsPage(self)
-        self.actual_models.discovery_requested.connect(self.model_discovery_requested.emit)
-        self.actual_models.probe_requested.connect(self._request_model_probe)
-        self.actual_models.manual_save_requested.connect(self.manual_model_save_requested.emit)
-        self.actual_models.capability_save_requested.connect(
-            self.model_capability_save_requested.emit
-        )
-        self.endpoint_workspace = _EndpointWorkspace(self.endpoints_tab, self.actual_models, self)
-        self.endpoints_tab.endpoint_selecting.connect(
-            self.endpoint_workspace._stack.capture_refresh
-        )
-        self.endpoints_tab.endpoint_selected.connect(self._on_endpoint_selected)
-        self._add_page("站点端点", self.endpoint_workspace)
-        self.appearance_tab = None
+        self._add_lazy_page("逻辑模型", self._build_models)
+        self._add_lazy_page("站点端点", self._build_endpoints)
         self._appearance_index = -1
         if preferences is not None:
-            self.appearance_tab = _AppearanceTab(preferences, self, theme_service=appearance_themes)
-            self.appearance_tab.appearance_changed.connect(self.appearance_changed.emit)
-            self._add_page("外观", self.appearance_tab)
-            self._appearance_index = self._rail.index_of("外观")
-        self.memory_tab = None
+            self._appearance_index = self._add_lazy_page("外观", self._build_appearance)
+            self._add_lazy_page("提醒通知", self._build_reminders)
+            self._add_lazy_page("低压在场", self._build_presence)
         if memories is not None:
-            from limbowave.ui.session_memory_panel import MemoryPanel
-
-            self.memory_tab = MemoryPanel(memories, self)
-            self._add_page("记忆", self.memory_tab)
-        data_tab = _DataSecurityTab(vault, self)
-        data_tab.backup_requested.connect(self.backup_requested.emit)
-        data_tab.restore_requested.connect(self.restore_requested.emit)
-        data_tab.reset_requested.connect(self.reset_requested.emit)
-        self._add_page("数据与安全", data_tab)
+            self._add_lazy_page("记忆", self._build_memory)
+        self._add_lazy_page("数据与安全", self._build_data_security)
         if lan_panel is not None:
-            lan_scroll = QScrollArea()
-            lan_scroll.setWidgetResizable(True)
-            lan_scroll.setFrameShape(QFrame.Shape.NoFrame)
-            lan_scroll.setWidget(lan_panel)
-            self._add_page("局域网访问", lan_scroll)
-        # The log viewer can query and lay out many rows. Build it only when selected.
+            self._add_lazy_page("局域网访问", self._build_lan)
         self._request_log_index = self._add_page("请求日志", _RequestLogTab(None, None, self))
-        self.about_tab = AboutPage(self)
-        self._add_page("关于", self.about_tab)
+        self._add_lazy_page("关于", self._build_about)
         self._rail.tab_selected.connect(self._on_tab_selected)
+        # Install inherited QSS before building controls, not after polishing a
+        # full tree. Hidden categories stay as lightweight placeholders.
         self.restyle()
+        self._ensure_page(0)
+
+    def _add_lazy_page(self, title: str, factory: Callable[[], QWidget]) -> int:
+        index = self._add_page(title, QWidget())
+        self._pending_pages[index] = factory
+        return index
+
+    def _ensure_page(self, index: int) -> QWidget | None:
+        factory = self._pending_pages.get(index)
+        if factory is not None:
+            page = factory()
+            old = self._pages.replace_page(index, page)
+            if old is not None:
+                old.deleteLater()
+            del self._pending_pages[index]
+            self._stale_pages.discard(index)  # constructors read current data
+            self.tab_created.emit(self._rail._buttons[index].text(), page)
+        return self._pages._stack.widget(index) if index >= 0 else None
+
+    def _build_models(self) -> QWidget:
+        from limbowave.ui.logical_models_tab import LogicalModelsTab
+
+        self._models_tab = LogicalModelsTab(self._settings, self._pages._stack)
+        self._models_tab.probe_requested.connect(self._request_model_probe)
+        return self._models_tab
+
+    def _build_endpoints(self) -> QWidget:
+        from limbowave.ui.model_probe_page import ActualModelsPage
+        from limbowave.ui.settings_dialog import _EndpointsTab
+
+        endpoints = _EndpointsTab(self._settings, self._credentials)
+        actual = ActualModelsPage()
+        workspace = _EndpointWorkspace(endpoints, actual, self._pages._stack)
+        self._endpoints_tab = endpoints
+        self._actual_models = actual
+        self._endpoint_workspace = workspace
+        endpoints.configuration_changed.connect(self._configuration_changed)
+        endpoints.discovery_requested.connect(self.model_discovery_requested.emit)
+        endpoints.endpoint_saved.connect(self._on_endpoint_saved)
+        endpoints.endpoint_selecting.connect(workspace._stack.capture_refresh)
+        endpoints.endpoint_selected.connect(self._on_endpoint_selected)
+        actual.discovery_requested.connect(self.model_discovery_requested.emit)
+        actual.probe_requested.connect(self._request_model_probe)
+        actual.manual_save_requested.connect(self.manual_model_save_requested.emit)
+        actual.capability_save_requested.connect(self.model_capability_save_requested.emit)
+        return workspace
+
+    def _configuration_changed(self) -> None:
+        if self._models_tab is not None:
+            self._models_tab.reload()
+        self.configuration_changed.emit()
+
+    def _build_appearance(self) -> QWidget:
+        from limbowave.ui.settings_dialog import _AppearanceTab
+
+        self._appearance_tab = _AppearanceTab(
+            self._preferences, self._pages._stack, theme_service=self._appearance_themes,
+        )
+        self._appearance_tab.appearance_changed.connect(self.appearance_changed.emit)
+        return self._appearance_tab
+
+    def _scroll_page(self, widget: QWidget) -> QScrollArea:
+        scroll = QScrollArea(self._pages._stack)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidget(widget)
+        return scroll
+
+    def _build_reminders(self) -> QWidget:
+        from limbowave.ui.reminder_notifications import ReminderNotificationSettingsPage
+
+        self._reminder_notifications_tab = ReminderNotificationSettingsPage(self._preferences)
+        self._reminder_notifications_tab.changed.connect(self.reminder_notifications_changed.emit)
+        self._reminder_notifications_tab.preview_requested.connect(
+            self.reminder_sound_preview_requested.emit,
+        )
+        return self._scroll_page(self._reminder_notifications_tab)
+
+    def _build_presence(self) -> QWidget:
+        from limbowave.ui.gentle_presence import PresenceSettingsPage
+
+        self._presence_tab = PresenceSettingsPage(self._preferences)
+        self._presence_tab.changed.connect(self.presence_changed.emit)
+        return self._scroll_page(self._presence_tab)
+
+    def _build_memory(self) -> QWidget:
+        from limbowave.ui.session_memory_panel import MemoryPanel
+
+        self._memory_tab = MemoryPanel(self._memories, self._pages._stack)
+        return self._memory_tab
+
+    def _build_data_security(self) -> QWidget:
+        page = _DataSecurityTab(self._vault, self._pages._stack)
+        page.backup_requested.connect(self.backup_requested.emit)
+        page.restore_requested.connect(self.restore_requested.emit)
+        page.reset_requested.connect(self.reset_requested.emit)
+        return page
+
+    def _build_lan(self) -> QWidget:
+        panel = self._lan_panel() if callable(self._lan_panel) else self._lan_panel
+        assert panel is not None
+        return self._scroll_page(panel)
+
+    def _build_about(self) -> QWidget:
+        from limbowave.ui.about_page import AboutPage
+
+        self._about_tab = AboutPage(self._pages._stack)
+        return self._about_tab
+
+    # Keep the public accessors used by model callbacks and integrations. Access
+    # creates a category, but does not navigate to it or replace an existing tab.
+    @property
+    def models_tab(self) -> LogicalModelsTab:
+        self._ensure_page(self._rail.index_of("逻辑模型"))
+        assert self._models_tab is not None
+        return self._models_tab
+
+    @property
+    def endpoints_tab(self) -> _EndpointsTab:
+        self._ensure_page(self._rail.index_of("站点端点"))
+        assert self._endpoints_tab is not None
+        return self._endpoints_tab
+
+    @property
+    def actual_models(self) -> ActualModelsPage:
+        self._ensure_page(self._rail.index_of("站点端点"))
+        assert self._actual_models is not None
+        return self._actual_models
+
+    @property
+    def endpoint_workspace(self) -> _EndpointWorkspace:
+        return cast(_EndpointWorkspace, self._ensure_page(self._rail.index_of("站点端点")))
+
+    @property
+    def appearance_tab(self) -> _AppearanceTab | None:
+        self._ensure_page(self._appearance_index)
+        return self._appearance_tab
+
+    @property
+    def reminder_notifications_tab(self) -> ReminderNotificationSettingsPage | None:
+        self._ensure_page(self._rail.index_of("提醒通知"))
+        return self._reminder_notifications_tab
+
+    @property
+    def presence_tab(self) -> PresenceSettingsPage | None:
+        self._ensure_page(self._rail.index_of("低压在场"))
+        return self._presence_tab
+
+    @property
+    def memory_tab(self) -> MemoryPanel | None:
+        self._ensure_page(self._rail.index_of("记忆"))
+        return self._memory_tab
+
+    @property
+    def about_tab(self) -> AboutPage:
+        self._ensure_page(self._rail.index_of("关于"))
+        assert self._about_tab is not None
+        return self._about_tab
 
     def _on_tab_selected(self, index: int) -> None:
         current = self._pages.current_index
         if (
             current == self._appearance_index
             and index != current
-            and self.appearance_tab is not None
-            and not self.appearance_tab.resolve_pending_changes()
+            and self._appearance_tab is not None
+            and not self._appearance_tab.resolve_pending_changes()
         ):
             self._rail.set_current(current, animated=False)
             return
+        self._ensure_page(index)
+        self._refresh_page(index)
         if index == self._request_log_index:
             self._rebuild_request_log()
         self._pages.set_index(index)
 
     def prepare_open(self, conversation_id: str | None, initial_tab: str | None = None) -> None:
-        """Refresh cheap mutable data while keeping the expensive page tree alive."""
+        """Refresh the destination only; hidden categories catch up on selection."""
         self._conversation_id = conversation_id
-        if self.memory_tab is not None:
-            self.memory_tab.reload()
-        self.models_tab.reload()
-        self.endpoints_tab.reload()
-        self.actual_models.apply_saved_models(tuple(self._settings.load().actual_models))
+        self._stale_pages.update(
+            self._rail.index_of(title) for title in ("逻辑模型", "站点端点", "记忆")
+            if self._rail.index_of(title) >= 0
+        )
         if initial_tab:
             self.select_tab(initial_tab)
-        elif self._pages.current_index == self._request_log_index:
-            self._rebuild_request_log()
+        else:
+            index = self._pages.current_index
+            self._refresh_page(index)
+            if index == self._request_log_index:
+                self._rebuild_request_log()
+
+    def _refresh_page(self, index: int) -> None:
+        if index not in self._stale_pages:
+            return
+        self._stale_pages.discard(index)
+        if index == self._rail.index_of("逻辑模型"):
+            self.models_tab.reload()
+        elif index == self._rail.index_of("站点端点"):
+            self.endpoints_tab.reload()
+            self.actual_models.apply_saved_models(tuple(self._settings.load().actual_models))
+        elif index == self._rail.index_of("记忆") and self._memory_tab is not None:
+            self._memory_tab.reload()
 
     def _rebuild_request_log(self) -> None:
         from limbowave.ui.request_log_dialog import RequestLogDialog
@@ -470,10 +649,10 @@ class SettingsPage(QWidget):
             old.deleteLater()
 
     def resolve_pending_changes(self) -> bool:
-        return self.appearance_tab is None or self.appearance_tab.resolve_pending_changes()
+        return self._appearance_tab is None or self._appearance_tab.resolve_pending_changes()
 
     def _request_close(self) -> None:
-        if self.appearance_tab is not None and not self.appearance_tab.resolve_pending_changes():
+        if not self.resolve_pending_changes():
             return
         self.close_requested.emit()
 
@@ -582,6 +761,8 @@ class SettingsPage(QWidget):
         index = self._rail.index_of(title)
         if index < 0:
             return
+        self._ensure_page(index)
+        self._refresh_page(index)
         self._rail.set_current(index, animated=animated)
         if index == self._request_log_index:
             self._rebuild_request_log()
@@ -593,7 +774,8 @@ class SettingsPage(QWidget):
         指示器浓度随材质设置（不透明度滑杆）变化，``theme.refresh_inline_styles``
         只换调色板令牌追不上，所以主题/材质变化后由上层调用这里整体重建。
         """
-        self.about_tab.restyle()
+        if self._about_tab is not None:
+            self._about_tab.restyle()
         css = f"""
             #settingsPage {{ background: {theme.BG_APP}; }}
             #settingsHeader {{ background: {theme.BG_SURFACE};

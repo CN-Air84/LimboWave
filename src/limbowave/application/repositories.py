@@ -28,6 +28,7 @@ from limbowave.domain.conversation import Branch, Conversation, Message
 from limbowave.domain.files import FileDocument, ImageAttachment
 from limbowave.domain.memory import MemoryDocument
 from limbowave.domain.permissions import PermissionAudit, PermissionGrant
+from limbowave.domain.reminder import Reminder, ReminderStatus
 from limbowave.domain.run import RunLogSummary, RunRecord
 from limbowave.domain.runtime_mirror import RuntimeEntryMetadata, RuntimeEntryMirror
 from limbowave.domain.snapshots import RequestIntentSnapshot, TransportSnapshot
@@ -236,9 +237,27 @@ class CompressionVersionRepository(Protocol):
 
 
 class MemoryRepository(Protocol):
+    def list_current(self) -> list[MemoryDocument]: ...
+
     def get(self, document_id: str) -> MemoryDocument | None: ...
 
     def put(self, document: MemoryDocument) -> None: ...
+
+
+class ReminderRepository(Protocol):
+    def add(self, reminder: Reminder) -> None: ...
+
+    def get(self, reminder_id: str) -> Reminder | None: ...
+
+    def list_for_conversation(
+        self, conversation_id: str, *, status: str = "pending", limit: int = 50, offset: int = 0,
+    ) -> list[Reminder]: ...
+
+    def list_due(self, now: datetime, *, limit: int = 100) -> list[Reminder]: ...
+
+    def transition(
+        self, reminder_id: str, status: ReminderStatus, completed_at: datetime,
+    ) -> bool: ...
 
 
 class UnitOfWork(Protocol):
@@ -254,6 +273,7 @@ class UnitOfWork(Protocol):
     image_attachments: ImageAttachmentRepository
     compressions: CompressionVersionRepository
     permissions: PermissionRepository
+    reminders: ReminderRepository
     memories: MemoryRepository
 
     def begin_read(self) -> object:

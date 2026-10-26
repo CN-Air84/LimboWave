@@ -32,6 +32,7 @@ SETTLED = "settled"
 # 新会话首轮成功回复完成；供隔离的后台命名流程使用，不改变 settled 的空载荷契约。
 FIRST_RESPONSE_COMPLETED = "first_response_completed"
 ERROR = "error"
+REMINDER = "reminder"
 # 运行生命周期（Phase 1B 新增：让 GUI 知道这轮落在哪种终态）
 RUN_FAILED = "run_failed"
 RUN_INTERRUPTED = "run_interrupted"

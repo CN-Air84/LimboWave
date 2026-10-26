@@ -50,6 +50,7 @@ from limbowave.application.events import (
     BRANCHED,
     ERROR,
     FIRST_RESPONSE_COMPLETED,
+    REMINDER,
     RUN_FAILED,
     RUN_INTERRUPTED,
     SETTLED,
@@ -445,6 +446,13 @@ class RunCoordinator:
             branch_id=self.branch_id,
             target_conversation_id=conversation_id,
             target_branch_id=branch_id,
+        )
+
+    def notify_reminder(self, message: Message) -> None:
+        """Publish a committed timer message without changing the current run/session."""
+        self._emit(
+            REMINDER, conversation_id=message.conversation_id, branch_id=message.branch_id,
+            message_id=message.id, text=message.content, created_at=message.created_at.isoformat(),
         )
 
     def event_scope(self) -> dict[str, Any]:

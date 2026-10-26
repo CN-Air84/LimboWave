@@ -1,6 +1,7 @@
 """A new chat can configure its memories before sending any message."""
 
 import asyncio
+import threading
 
 import pytest
 
@@ -9,6 +10,7 @@ from limbowave.application.kernel import KernelSetup
 from limbowave.application.services.configuration_service import ConfigurationService
 from limbowave.application.services.memory_service import MemoryService
 from limbowave.bootstrap import AppPaths
+from limbowave.domain.memory_presets import BUILTIN_READER_PRESET_CONTENT
 from limbowave.infrastructure import shell
 from limbowave.infrastructure.configuration.json_config_repository import JsonConfigRepository
 from limbowave.infrastructure.memory_repositories import in_memory_uow_factory
@@ -47,6 +49,15 @@ async def test_new_chat_memory_opens_before_first_send(
         factory, ConfigurationService(JsonConfigRepository(tmp_path / "config.json")),
     )
     original = service.save("global original")
+    gui_thread = threading.get_ident()
+    initialization_threads = []
+    initialize = MemoryService.ensure_builtin_preset
+
+    def track_initialization(self):
+        initialization_threads.append(threading.get_ident())
+        return initialize(self)
+
+    monkeypatch.setattr(MemoryService, "ensure_builtin_preset", track_initialization)
     stylesheet = qapp.styleSheet()
     window = MainWindow()
     qtbot.addWidget(window)
@@ -56,6 +67,11 @@ async def test_new_chat_memory_opens_before_first_send(
     window.resize(1000, window_height)
     window.show()
     try:
+        assert len(initialization_threads) == 1
+        assert initialization_threads[0] != gui_thread
+        assert len(service.list()) == 2
+        preset = service.list()[1]
+        assert preset.content == BUILTIN_READER_PRESET_CONTENT
         assert controller.conversation_id is None
         window.chat._input.setPlainText("unsent draft")
         window._toolbar._memory_btn.click()
@@ -94,7 +110,7 @@ async def test_new_chat_memory_opens_before_first_send(
             controller.subscribe(events.append)
             assert await controller.send("first message")
             assert controller.conversation_id == conversation_id
-            assert kernel.memory_prompt["global"] == ["before-first-message"]
+            assert kernel.memory_prompt["global"] == ["before-first-message", preset.content]
             kernel.say("reply")
             kernel.emit("run.settled", {})
             await controller.wait_idle()
@@ -104,8 +120,8 @@ async def test_new_chat_memory_opens_before_first_send(
         window._toolbar._memory_btn.click()
         await wait_for(qapp, lambda: controller.conversation_id is not None)
         assert controller.conversation_id != conversation_id
-        assert service.effective_global(controller.conversation_id) == [original]
-        assert service.list() == [original]
+        assert service.effective_global(controller.conversation_id) == [original, preset]
+        assert service.list() == [original, preset]
     finally:
         await shutdown()
         qapp.setStyleSheet(stylesheet)

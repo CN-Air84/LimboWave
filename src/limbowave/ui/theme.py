@@ -300,6 +300,24 @@ def ambient_background_active() -> bool:
     return is_dark() and not _background_active
 
 
+def footprint_background_colors() -> tuple[str, str, str]:
+    """Lift the gallery canvas, keeping its colors derived from the active palette."""
+    if is_dark():
+        base = _blend(BG_APP, BG_ELEVATED, 0.85)
+        return _blend(base, ACCENT, 0.12), _blend(base, BG_SURFACE, 0.15), base
+    base = _blend(BG_APP, BG_SURFACE, 0.12)
+    return _blend(base, ACCENT, 0.025), base, _blend(base, BG_SURFACE, 0.2)
+
+
+def footprint_panel_surface() -> str:
+    """Reading boards remain opaque even when wallpaper materials are transparent."""
+    return _blend(BG_ELEVATED, TEXT_PRIMARY, 0.01) if is_dark() else BG_SURFACE
+
+
+def footprint_card_surface() -> str:
+    return _blend(footprint_panel_surface(), TEXT_PRIMARY, 0.025) if is_dark() else BG_SURFACE
+
+
 def card_surface() -> str:
     if _background_active and _current_materials.cards_enabled:
         return qss_alpha(BG_SURFACE, _current_materials.content_opacity)
@@ -536,6 +554,7 @@ QPushButton[iconOnly="true"] {{ padding: 0px; margin: 0px; }}
 /* Sidebar actions share quiet neutral surfaces, not the primary-action accent. */
 QPushButton#sidebarNewConversation,
 QPushButton#sidebarSearch,
+QPushButton#sidebarFootprints,
 QPushButton#sidebarSettings {{
     border: 1px solid transparent;
     padding: 0px 12px;
@@ -546,28 +565,91 @@ QPushButton#sidebarNewConversation {{
     text-align: left;
 }}
 QPushButton#sidebarSearch {{ background: {qss_alpha(TEXT_PRIMARY, 0.08)}; }}
+QPushButton#sidebarFootprints,
 QPushButton#sidebarSettings {{
     background: transparent;
     text-align: left;
 }}
 QPushButton#sidebarNewConversation:hover,
 QPushButton#sidebarSearch:hover,
+QPushButton#sidebarFootprints:hover,
 QPushButton#sidebarSettings:hover {{
     background: {qss_alpha(TEXT_PRIMARY, 0.12)};
     border-color: transparent;
 }}
 QPushButton#sidebarNewConversation:pressed,
 QPushButton#sidebarSearch:pressed,
+QPushButton#sidebarFootprints:pressed,
 QPushButton#sidebarSettings:pressed {{ background: {qss_alpha(TEXT_PRIMARY, 0.16)}; }}
 QPushButton#sidebarNewConversation:focus,
 QPushButton#sidebarSearch:focus,
+QPushButton#sidebarFootprints:focus,
 QPushButton#sidebarSettings:focus {{ border-color: {qss_alpha(TEXT_PRIMARY, 0.35)}; }}
 QPushButton#sidebarNewConversation:disabled,
 QPushButton#sidebarSearch:disabled,
+QPushButton#sidebarFootprints:disabled,
 QPushButton#sidebarSettings:disabled {{
     background: {qss_alpha(TEXT_PRIMARY, 0.03)};
     color: {TEXT_SECONDARY};
     border-color: transparent;
+}}
+
+/* ---------- 足迹时间线 ---------- */
+/* Page painting owns a single continuous canvas; descendants must not mask it. */
+QWidget#memoryTimelinePage, QWidget#footprintBody, QWidget#footprintHeaderViewport,
+QScrollArea#footprintScroll, QWidget#footprintViewport {{ background: transparent; }}
+QLabel[footprintLabel="true"], QWidget#footprintTitleRegion {{ background: transparent; }}
+QFrame#footprintHeaderPanel {{
+    background: {footprint_panel_surface()};
+    border: 1px solid {border}; border-radius: {RADIUS_LG}px;
+}}
+QFrame#footprintReadingPanel {{ background: transparent; border: none; }}
+QFrame#footprintHeaderPanel QLineEdit, QFrame#footprintHeaderPanel QComboBox {{
+    background: {BG_APP}; color: {TEXT_PRIMARY};
+}}
+QFrame#footprintHeaderPanel QPushButton[flat="true"] {{ color: {TEXT_PRIMARY}; }}
+QLabel#footprintCompactTitle {{ font-size: {FS_TITLE}px; font-weight: 600; }}
+QWidget#footprintDay {{
+    background: transparent;
+    border-left: 1px solid {qss_alpha(TEXT_SECONDARY, 0.28)};
+}}
+QFrame#footprintCard {{
+    background: {footprint_card_surface()};
+    border: 1px solid {border};
+    border-radius: {RADIUS_LG}px;
+}}
+QFrame#footprintCard QLabel {{ background: transparent; border: none; }}
+QLabel#footprintEyebrow {{
+    color: {TEXT_SECONDARY}; font-size: {FS_TINY}px; letter-spacing: 2px;
+}}
+QLabel#footprintTitle {{
+    font-size: {round(FS_TITLE * 2)}px; font-weight: 600;
+    font-family: 'Microsoft YaHei UI', 'Noto Sans CJK SC', sans-serif;
+}}
+QLabel#footprintSubtitle {{ color: {TEXT_SECONDARY}; font-size: {FS_BASE}px; }}
+QLabel#footprintSummary {{ color: {TEXT_SECONDARY}; font-size: {FS_SMALL}px; }}
+QLabel#footprintSource {{ color: {TEXT_PRIMARY}; font-size: {FS_SMALL}px; font-weight: 600; }}
+QLabel#footprintContent {{ font-size: {FS_TITLE}px; line-height: 150%; }}
+QLabel#footprintMeta, QLabel#footprintLocalHint {{
+    color: {TEXT_SECONDARY}; font-size: {FS_SMALL}px;
+}}
+QLabel#footprintDayHeading {{
+    color: {TEXT_SECONDARY}; font-size: {FS_TITLE}px; font-weight: 600;
+    background: transparent; border: none; padding: 0px 0px 8px 0px;
+}}
+QLabel#footprintStatus {{ color: {TEXT_SECONDARY}; padding: 24px; }}
+QLabel#footprintPrivacy {{
+    color: {TEXT_SECONDARY}; background: {footprint_card_surface()};
+    padding: 14px 18px; border: 1px solid {border}; border-radius: {RADIUS_MD}px;
+}}
+QPushButton#footprintPrivacyBadge {{
+    background: {qss_alpha(TEXT_SECONDARY, 0.08)};
+    color: {TEXT_PRIMARY}; border: 1px solid {qss_alpha(TEXT_SECONDARY, 0.25)};
+    font-size: {FS_SMALL}px;
+}}
+QPushButton#footprintPrivacyBadge:focus {{ border-color: {ACCENT}; }}
+QPushButton#footprintOpenSource, QPushButton#footprintExpand {{
+    background: transparent; font-size: {FS_SMALL}px; padding: 4px 8px;
 }}
 
 /* ---------- 输入 ---------- */

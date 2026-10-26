@@ -49,6 +49,7 @@ class FakeKernel(AgentKernel):
         self.entries: list[dict[str, Any]] = []
         self.send_error: Exception | None = None
         self.permission_handler: PermissionHandler | None = None
+        self.memory_context: dict[str, object] = {}
 
     # --- AgentKernel ---
 
@@ -64,6 +65,9 @@ class FakeKernel(AgentKernel):
             raise self.send_error
         self.sent.append(text)
         self.sent_images.append(images)
+
+    async def set_memory_context(self, context: dict[str, object]) -> None:
+        self.memory_context = context
 
     async def set_attachment_context(self, context: dict[str, object]) -> None:
         self.attachment_context = context

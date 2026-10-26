@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QPoint, Qt, QTimer
 from PySide6.QtWidgets import QApplication
 from pytestqt.qtbot import QtBot
 from qasync import QEventLoop
@@ -50,7 +50,7 @@ def test_loading_animation_preserves_draft_and_availability(qtbot: QtBot) -> Non
     assert view._input.toPlainText() == "未发送的草稿"
     assert len(view._rows) == 1
     view.resize(1000, 760)
-    qtbot.waitUntil(lambda: overlay.geometry() == view._scroll.viewport().rect())
+    qtbot.waitUntil(lambda: overlay.geometry() == view.rect())
     view.set_available(False)
     view.set_history_loading(False)
     qtbot.waitUntil(overlay.isHidden)
@@ -60,6 +60,49 @@ def test_loading_animation_preserves_draft_and_availability(qtbot: QtBot) -> Non
     assert not view._send_btn.isEnabled()
     view.set_available(True)
     assert view._send_btn.isEnabled()
+
+
+@pytest.mark.parametrize("zen", [False, True])
+def test_loading_covers_header_transcript_and_composer(qtbot: QtBot, zen: bool) -> None:
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.resize(1000, 760)
+    window.show()
+    view = window.chat
+    view.load_history([HistoryEntry("user", "原会话", "", "u1")])
+    view.set_zen_mode(zen)
+    view._input.setPlainText("保留草稿")
+    view.set_history_loading(True)
+    overlay = view._history_loading_overlay
+    qtbot.waitUntil(lambda: overlay._opacity == 1.0)
+
+    assert overlay.parentWidget() is view
+    assert overlay.geometry() == view.rect()
+    for widget in (view._zen_btn, view._scroll.viewport(), view._composer,
+                   view._input, view._attach_btn, view._send_btn):
+        point = widget.mapTo(view, widget.rect().center())
+        assert overlay.geometry().contains(point)
+        assert view.childAt(point) is overlay
+    assert view.childAt(QPoint(view.width() // 2, 5)) is overlay
+    if not zen:
+        assert window.sidebar.isVisible()
+        point = overlay.mapFromGlobal(window.sidebar.mapToGlobal(QPoint(10, 10)))
+        assert not overlay.rect().contains(point)
+
+    point = overlay.mapFromGlobal(view._zen_btn.mapToGlobal(view._zen_btn.rect().center()))
+    qtbot.mouseClick(overlay, Qt.MouseButton.LeftButton, pos=point)
+    assert view.zen_mode is zen
+    assert view._input.toPlainText() == "保留草稿"
+    window.resize(1100, 820)
+    qtbot.waitUntil(lambda: overlay.geometry() == view.rect())
+    assert view.childAt(view._input.mapTo(view, view._input.rect().center())) is overlay
+
+    view.set_history_loading(False)
+    qtbot.waitUntil(overlay.isHidden)
+    assert view._input.isEnabled()
+    assert view._input.toPlainText() == "保留草稿"
+    qtbot.mouseClick(view._zen_btn, Qt.MouseButton.LeftButton)
+    assert view.zen_mode is not zen
 
 
 def test_loading_waits_for_composer_to_finish_docking(qtbot: QtBot) -> None:
@@ -85,7 +128,7 @@ def test_loading_waits_for_composer_to_finish_docking(qtbot: QtBot) -> None:
     qtbot.waitUntil(overlay.isVisible)
     assert view._dock_anim is None
     assert view.composer_lift == 0
-    assert overlay.geometry() == view._scroll.viewport().rect()
+    assert overlay.geometry() == view.rect()
     assert overlay._opacity < 1.0
     qtbot.waitUntil(lambda: overlay._opacity == 1.0)
 

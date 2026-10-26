@@ -115,6 +115,20 @@ export function applyEvent(state: ChatState, event: ChatEvent): ChatState {
       ),
     };
   }
+  // Timer notices are persisted messages, not a synthetic model run.
+  if (event.kind === "message.updated" && event.run_id === null) {
+    const notice = MessageSchema.parse(event.payload);
+    if (
+      notice.message_id !== event.message_id ||
+      notice.conversation_id !== event.conversation_id ||
+      notice.branch_id !== event.branch_id ||
+      notice.run_id !== null ||
+      notice.role !== "assistant" ||
+      notice.status !== "completed"
+    )
+      return { ...next, resync: true };
+    return { ...next, messages: mergeMessages(state.messages, [notice]) };
+  }
   if (!event.message_id || !event.run_id) return { ...next, resync: true };
   if (state.terminalRuns.includes(event.run_id)) return next;
   let message = state.messages.find((m) => m.message_id === event.message_id);

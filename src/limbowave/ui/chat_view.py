@@ -118,6 +118,7 @@ from limbowave.ui.compression_widgets import (
     CompressionDivider,
     CompressionThinkingPanel,
 )
+from limbowave.ui.gentle_presence import PresenceBar
 from limbowave.ui.history_loading import HistoryLoadingOverlay
 from limbowave.ui.message_motion import MessageSendEffect
 from limbowave.ui.model_selector import ModelSelector, ModelSite
@@ -129,6 +130,13 @@ from limbowave.ui.sent_attachments import SentAttachment, SentAttachmentStrip
 from limbowave.ui.streaming_text import StreamingTextBuffer
 from limbowave.ui.thinking_block import ThinkingBlock as _ThinkingBlock
 from limbowave.ui.tool_steps import ToolStepsView, make_tool_steps
+from limbowave.ui.zen_button import ModeCapsule
+from limbowave.ui.zen_mode import (
+    ZEN_COLUMN_WIDTH,
+    ZEN_MESSAGE_SPACING,
+    apply_zen_typography,
+)
+from limbowave.ui.zen_motion import ZenControlFade, ZenMotion, ZenPanelSnapshot
 
 # 一次物化多少条历史消息。每条消息是一个富文本组件，全量物化会卡死长会话。
 HISTORY_PAGE = 60
@@ -154,6 +162,7 @@ _ADVANCED_SLIDE_MS = 240
 # 消息排在居中的一栏里，最宽与输入框一致（_COMPOSER_MAX_WIDTH）；对话区再宽只加大两侧留白。
 _MESSAGE_SIDE_MIN = 32  # 消息栏与对话区左右边缘的最小留白
 _MESSAGE_COLUMN_MIN = 240  # 视口还没排版（很窄）时，气泡宽度按这个栏宽估算
+_TRANSCRIPT_TOP = 44  # Initial breathing room below the capsule; scrolls with messages.
 _MESSAGE_SPACING = 20  # 相邻两条消息的间距
 _USER_BUBBLE_RATIO = 0.78  # 用户气泡最宽占栏宽的比例；短消息按文字收窄
 _BUBBLE_PAD_X = 16  # 气泡内文字与左右边缘的间距
@@ -179,6 +188,7 @@ class _ComposingHint(QLabel):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__("正在构思……0秒", parent)
         self._seconds = 0
+        self._zen_mode = False
         self.setWordWrap(True)
         self.setTextFormat(Qt.TextFormat.PlainText)
         self.setStyleSheet(
@@ -205,8 +215,12 @@ class _ComposingHint(QLabel):
         self._seconds += 1
         self._show_seconds()
 
+    def set_zen_mode(self, enabled: bool) -> None:
+        self._zen_mode = enabled
+        self._show_seconds()
+
     def _show_seconds(self) -> None:
-        self.setText(f"正在构思……{self._seconds}秒")
+        self.setText("正在回应…" if self._zen_mode else f"正在构思……{self._seconds}秒")
 
 
 class _AssistantSegment(QWidget):
@@ -431,7 +445,8 @@ class _ActionButton(QPushButton):
 
     def paintEvent(self, event: QPaintEvent) -> None:
         super().paintEvent(event)
-        color = theme.TEXT_PRIMARY if self.underMouse() else theme.TEXT_SECONDARY
+        color = (theme.ACCENT if self.isChecked() else
+                 theme.TEXT_PRIMARY if self.underMouse() else theme.TEXT_SECONDARY)
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setPen(
@@ -480,6 +495,10 @@ class _BubbleRow(QWidget):
     ) -> None:
         super().__init__(parent)
         self._role = role
+        self._zen_mode = False
+        self._final = False
+        self._zen_row_hidden = False
+        self._run_state_text = ""
         self._stream_buffer = (
             StreamingTextBuffer(self, self._append_stream_text) if role == "assistant" else None
         )
@@ -627,7 +646,9 @@ class _BubbleRow(QWidget):
         """完整回复定稿且有 ID 后，才显示 Fork 与重新生成。"""
         for button in (self._fork_btn, self._regenerate_btn):
             if button is not None:
-                button.setVisible(self._message_id is not None and self._can_fork)
+                button.setVisible(
+                    self._message_id is not None and self._can_fork and not self._zen_mode
+                )
 
     def set_fork_available(self, available: bool) -> None:
         self._can_fork = available
@@ -646,12 +667,13 @@ class _BubbleRow(QWidget):
             )
             and self._edit_btn is not None
             and self._message_id is not None
+            and not self._zen_mode
         ):
             self._edit_btn.setVisible(True)
         return super().eventFilter(watched, event)
 
     def enterEvent(self, event: QEnterEvent) -> None:
-        if self._edit_btn is not None and self._message_id is not None:
+        if self._edit_btn is not None and self._message_id is not None and not self._zen_mode:
             self._edit_btn.setVisible(True)
         super().enterEvent(event)
 
@@ -697,6 +719,8 @@ class _BubbleRow(QWidget):
         self._raw_text = ""
         self._message_id = None
         self._run_error = None
+        self._final = False
+        self._run_state_text = ""
         self.set_fork_available(False)
         if self._actions is not None:
             self._actions.hide()
@@ -821,6 +845,7 @@ class _BubbleRow(QWidget):
         browser.document().documentLayout().documentSizeChanged.connect(
             lambda size, b=browser: self._fit_browser_height(b, size)
         )
+        apply_zen_typography(browser.document(), self._zen_mode)
         return browser
 
     # ----- 访问器（测试与视图逻辑用） -----
@@ -944,6 +969,7 @@ class _BubbleRow(QWidget):
         self._raw_text = text
         assert segment.content is not None
         segment.content.setHtml(html if html is not None else markdown_render.render(text))
+        apply_zen_typography(segment.content.document(), self._zen_mode)
         segment.stop_composing()
         self._sync_segment_presentation()
         if message_id is not None:
@@ -967,10 +993,15 @@ class _BubbleRow(QWidget):
         """显示这张卡在当前 Agent run 中所处的阶段（卡级状态行）。"""
         if self._run_state is None:
             return
-        if self._run_state.text() != text:
-            self._run_state.setText(text)
+        self._run_state_text = text
+        display = "正在回应…" if self._zen_mode and self._run_error is None else text
+        if self._run_state.text() != display:
+            self._run_state.setText(display)
         self._run_state.set_animated(True)
         self._run_state.setVisible(True)
+        if self._zen_row_hidden:
+            self._zen_row_hidden = False
+            self.show()
 
     def set_run_error(self, message: str) -> None:
         """失败属于当前回复，直接复用状态行，不另建错误气泡。"""
@@ -984,6 +1015,7 @@ class _BubbleRow(QWidget):
 
     def mark_final(self) -> None:
         """整轮 run 收敛后，这张卡才成为可操作的最终回复。"""
+        self._final = True
         if self._stream_buffer is not None:
             self._stream_buffer.flush()  # stop/error may arrive without message.end
         if self._run_state is not None:
@@ -1104,6 +1136,30 @@ class _BubbleRow(QWidget):
                 segment.column.addWidget(view)
         self._sync_segment_presentation()
 
+    def set_zen_mode(self, enabled: bool) -> None:
+        if self._zen_mode == enabled:
+            return
+        self._zen_mode = enabled
+        # A mode switch must not leave an in-flight tool animation half visible.
+        self._settle_tool_steps_visibility()
+        for segment in self._segments:
+            if segment.content is not None:
+                apply_zen_typography(segment.content.document(), enabled)
+        if self._role == "user" and isinstance(self._content, QLabel):
+            size = f" font-size: {theme.FS_BASE + 1}px;" if enabled else ""
+            self._content.setStyleSheet("background: transparent; border: none;" + size)
+            self._fit_bubble()
+        if self._edit_btn is not None:
+            self._edit_btn.hide()
+        if not enabled and self._actions is not None:
+            self._actions.setVisible(self._final and self.has_content())
+        if self._run_state is not None:
+            self._run_state.setText(
+                "正在回应…" if enabled and self._run_error is None else self._run_state_text
+            )
+        self._sync_actions()
+        self._sync_segment_presentation()
+
     def set_tool_steps_visible(self, visible: bool, *, animate: bool = True) -> None:
         """工具区滑入/滑出并淡化，背景板高度和段间距同步过渡。"""
         if self._parent_hides_steps == (not visible):
@@ -1111,6 +1167,7 @@ class _BubbleRow(QWidget):
         self._parent_hides_steps = not visible
         if (
             not animate
+            or self._zen_mode
             or not self.isVisible()
             or not any(segment.tool_steps_view is not None for segment in self._segments)
             or not QApplication.isEffectEnabled(Qt.UIEffect.UI_General)
@@ -1189,10 +1246,19 @@ class _BubbleRow(QWidget):
         """隐藏工具时收起纯工具分段和段间分割线；空正文浏览器不占位。"""
         previous_visible = False
         # 淡出期间保持纯工具段可见，避免父段提前隐藏而截断子元素动画。
-        tools_visible = not self._parent_hides_steps or self._tool_steps_progress > 0.0
+        tools_visible = not self._zen_mode and (
+            not self._parent_hides_steps or self._tool_steps_progress > 0.0
+        )
         for index, segment in enumerate(self._segments):
             has_text = bool(segment.raw_text.strip())
-            has_thinking = segment.thinking is not None and segment.thinking.has_content()
+            has_thinking = (
+                not self._zen_mode and segment.thinking is not None
+                and segment.thinking.has_content()
+            )
+            if segment.thinking is not None:
+                segment.thinking.setVisible(not self._zen_mode)
+            if segment.hint is not None:
+                segment.hint.set_zen_mode(self._zen_mode)
             is_composing = segment.hint is not None and not segment.hint.isHidden()
             segment._tool_motion_has_body = has_text or has_thinking or is_composing
             has_visible_tools = tools_visible and bool(segment.live_tool_steps)
@@ -1212,6 +1278,17 @@ class _BubbleRow(QWidget):
         for leftover in self._segment_dividers[max(0, len(self._segments) - 1):]:
             leftover.hide()
         self._sync_tool_steps_motion()
+        if self._role == "assistant":
+            has_body = any(segment.raw_text.strip() for segment in self._segments)
+            if self._zen_mode and self._actions is not None:
+                self._actions.setVisible(self._final and has_body)
+            # Technical-only completed turns take no space, but a live status or
+            # failure remains visible even before the first body token arrives.
+            has_status = self._run_state is not None and not self._run_state.isHidden()
+            hidden = self._zen_mode and not previous_visible and not has_status
+            if hidden != self._zen_row_hidden:
+                self._zen_row_hidden = hidden
+                self.setVisible(not hidden)
 
     def set_message_id(self, message_id: str) -> None:
         """定稿后补挂 message_id（流式行创建时还没有 ID），Fork 随之可用。"""
@@ -1795,9 +1872,9 @@ class _ComposerFrame(QFrame):
         event.ignore()
 
 
-def _composer_span(available: int) -> tuple[int, int]:
-    """输入框占满分配到的宽度（最多 800px）。"""
-    width = max(0, min(_COMPOSER_MAX_WIDTH, available))
+def _composer_span(available: int, maximum: int = _COMPOSER_MAX_WIDTH) -> tuple[int, int]:
+    """输入框按当前模式的最大宽度居中（常规 800px / 纯净 720px）。"""
+    width = max(0, min(maximum, available))
     return width, max(0, (available - width) // 2)
 
 
@@ -1807,6 +1884,7 @@ class _ComposerRowLayout(QLayout):
     def __init__(self) -> None:
         super().__init__()
         self._item: QLayoutItem | None = None
+        self.maximum_width = _COMPOSER_MAX_WIDTH
 
     def addItem(self, item: QLayoutItem) -> None:
         self._item = item
@@ -1838,7 +1916,7 @@ class _ComposerRowLayout(QLayout):
         if self._item is None:
             return
         area = self.contentsRect()
-        width, offset = _composer_span(area.width())
+        width, offset = _composer_span(area.width(), self.maximum_width)
         self._item.setGeometry(QRect(area.x() + offset, area.y(), width, area.height()))
 
     def _with_margins(self, size: QSize) -> QSize:
@@ -1886,6 +1964,9 @@ class ChatView(QWidget):
     # 输入框停靠：空会话居中，有内容后落到底部。第二个参数表示是否同时展开高级栏；
     # 加载历史只改变布局，不应覆盖用户当前的展开 / 收起状态。
     docked_changed = Signal(bool, bool)
+    companion_requested = Signal()  # Open the existing companion window.
+    zen_mode_changed = Signal(bool)  # Local presentation only; never changes execution.
+    presence_context_changed = Signal()  # Local presentation eligibility changed.
     advanced_toggle_requested = Signal()  # 输入框右上角的高级栏开关被点击
     # 高级栏叠盖进度（0 = 收起，1 = 展开），动画中逐帧通知订阅方
     advanced_progress_changed = Signal(float)
@@ -1894,6 +1975,10 @@ class ChatView(QWidget):
         self, parent: QWidget | None = None, *, read_only: bool = False, draft_only: bool = False
     ) -> None:
         super().__init__(parent)
+        self._zen_mode = False
+        self._zen_motion = ZenMotion(self)
+        self._zen_motion.changed.connect(self._on_zen_progress)
+        self._zen_motion.finished.connect(self._finish_zen_transition)
         self._queue_mode = False
         self._draft_restore_failed = False
         self._draft_only = draft_only
@@ -2013,6 +2098,13 @@ class ChatView(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
+        self._zen_action = QAction("切换纯净模式", self)
+        self._zen_action.setShortcut("Ctrl+Shift+F")
+        self._zen_action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
+        self._zen_action.setAutoRepeat(False)
+        self._zen_action.triggered.connect(lambda: self.set_zen_mode(not self._zen_mode))
+        self.addAction(self._zen_action)
+
         self._search_query = ""
         self._search_ids: list[str] = []
         self._search_index = -1
@@ -2038,6 +2130,14 @@ class ChatView(QWidget):
         self._scroll = QScrollArea()
         self._scroll.setWidgetResizable(True)
         self._scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        # A single paired overlay; no header row or transcript relayout on hover.
+        self._mode_capsule = ModeCapsule(self._scroll.viewport())
+        self._companion_btn = self._mode_capsule.companion_button
+        self._zen_btn = self._mode_capsule.zen_button
+        self._mode_capsule.extent_changed.connect(self._place_mode_capsule)
+        self._companion_btn.clicked.connect(self.companion_requested)
+        self._zen_btn.toggled.connect(self.set_zen_mode)
+
         # 对话页与每段 Markdown 正文都不显示横向滚动条。
         self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._transcript_host = _BackdropHost()
@@ -2045,13 +2145,15 @@ class ChatView(QWidget):
         self._transcript = QVBoxLayout(self._transcript_host)
         # 左右留白由 _fit_column 按视口宽度算：消息栏居中，两侧至少 _MESSAGE_SIDE_MIN
         self._transcript.setContentsMargins(
-            _MESSAGE_SIDE_MIN, 24, _MESSAGE_SIDE_MIN, _TRANSCRIPT_BOTTOM
+            _MESSAGE_SIDE_MIN, _TRANSCRIPT_TOP, _MESSAGE_SIDE_MIN, _TRANSCRIPT_BOTTOM
         )
         self._transcript.setSpacing(_MESSAGE_SPACING)
         self._transcript.addStretch(1)
         self._scroll.setWidget(self._transcript_host)
         root.addWidget(self._scroll, 1)
-        self._history_loading_overlay = HistoryLoadingOverlay(self._scroll.viewport())
+        # Cover the entire conversation, including the Zen entry and composer.
+        # A viewport child is clipped to the transcript and leaves those controls uncovered.
+        self._history_loading_overlay = HistoryLoadingOverlay(self)
         # 贴底跟随：用户停在底部时流式输出自动跟随；一旦往上滚就不再强拉回底部，
         # 滚回底部后恢复跟随。内容增高靠 rangeChanged 跟进（布局是延迟的，
         # 追加内容当下读到的 maximum() 还是旧值）。
@@ -2267,6 +2369,8 @@ class ChatView(QWidget):
         tools.addWidget(self._send_btn)
         composer.addLayout(tools)
         self._composer_row.addWidget(self._composer)
+        self._presence_bar = PresenceBar()
+        root.addWidget(self._presence_bar)
         root.addLayout(self._composer_row)
         # 空会话时底部垫一块可变高度的空白，把输入框抬到对话区正中。
         # 这块空白属于对话区：和消息区一样直接透出背景图，不铺输入栏的模糊底板。
@@ -2275,6 +2379,11 @@ class ChatView(QWidget):
         root.addWidget(self._composer_lift)
         self._composer.height_changed.connect(lambda _height: self._apply_lift())
         self._sync_send_button()
+        self._place_mode_capsule()
+        self._mode_capsule.raise_()
+        self._zen_controls = ZenControlFade((self._logical_model, self._permission_btn,
+                                              self._usage_bar, self._advanced_btn))
+        self._zen_panel_snapshot = ZenPanelSnapshot(self._composer)
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
         """输入框的 Ctrl+Enter 发送（Enter 换行）。
@@ -2284,6 +2393,7 @@ class ChatView(QWidget):
         if watched is self._scroll.viewport() and event.type() == QEvent.Type.Resize:
             self._fit_column()
             self._place_jump_button()
+            self._place_mode_capsule()
         if watched is self._composer and event.type() in (QEvent.Type.Move, QEvent.Type.Resize):
             # 阴影画在输入框外面，跟着挪动时旧位置和新位置都要重画
             bounds = self._composer_shadow_bounds()
@@ -2301,6 +2411,129 @@ class ChatView(QWidget):
                 self._on_send()
                 return True  # 已处理，不要再插入换行
         return super().eventFilter(watched, event)
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        # Child dialogs and popups get Escape first; only unhandled workspace
+        # input reaches here. This also works in a standalone/read-only view.
+        if (self._zen_mode and event.key() == Qt.Key.Key_Escape
+                and QApplication.activePopupWidget() is None
+                and QApplication.activeModalWidget() is None):
+            self.set_zen_mode(False)
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    @property
+    def zen_mode(self) -> bool:
+        return self._zen_mode
+
+    def set_zen_mode(self, enabled: bool) -> None:
+        """Change presentation in place, preserving draft, stream and display preferences."""
+        if self._zen_mode == enabled:
+            return
+        if self._user_scrolled_up and self._history_scroll_anchor is None:
+            viewport = self._scroll.viewport()
+            anchor = next((row for row in self._rows if row.isVisible()
+                           and row.mapTo(viewport, QPoint()).y() + row.height() > 0), None)
+            if anchor is not None:
+                self._history_scroll_anchor = (anchor, anchor.mapTo(viewport, QPoint()).y())
+        self._zen_mode = enabled
+        self.presence_context_changed.emit()
+        if enabled:
+            self._presence_bar.clear()
+        if enabled:
+            self._logical_model.hidePopup()
+            self._permission_menu.hide()
+        self._zen_btn.setChecked(enabled)
+        label = "退出倾诉模式" if enabled else "倾诉模式"
+        self._zen_btn.setAccessibleName(label)
+        self._zen_btn.setToolTip(
+            "退出倾诉模式（纯净模式）：恢复完整界面（Ctrl+Shift+F / Esc）" if enabled
+            else "倾诉模式（纯净模式）：隐藏技术信息，专注对话（Ctrl+Shift+F）"
+        )
+        animate = self.isVisible() and QApplication.isEffectEnabled(Qt.UIEffect.UI_General)
+        if animate:
+            focused = QApplication.focusWidget()
+            if focused is not None and any(
+                widget is not None and (focused is widget or widget.isAncestorOf(focused))
+                for widget in (*self._zen_controls.widgets, self._advanced_clip)
+            ):
+                self._zen_btn.setFocus(Qt.FocusReason.OtherFocusReason)
+            self._zen_controls.prepare()
+            self._zen_controls.apply(self._zen_motion.value)
+            if self._advanced_expanded and self._advanced_clip is not None:
+                if self._zen_panel_snapshot.isHidden():
+                    self._place_advanced_panel(for_snapshot=True)
+                    self._zen_panel_snapshot.capture(self._advanced_clip)
+                self._advanced_clip.hide()
+        else:
+            self._zen_controls.finish(enabled)
+            self._place_advanced_panel()
+        if self._thinking_panel is not None:
+            if enabled:
+                self._thinking_panel.suspend()
+            elif self._compressing:
+                self._thinking_panel.popup()
+        for divider in self.findChildren(CompressionDivider):
+            divider.setVisible(not enabled)
+        for row in self._rows:
+            row.set_zen_mode(enabled)
+        self._transcript.setSpacing(ZEN_MESSAGE_SPACING if enabled else _MESSAGE_SPACING)
+        margins = self._transcript.contentsMargins()
+        margins.setTop(_TRANSCRIPT_TOP)
+        margins.setBottom(24 if enabled else _TRANSCRIPT_BOTTOM)
+        self._transcript.setContentsMargins(margins)
+        self.zen_mode_changed.emit(enabled)
+        self._zen_motion.set_target(enabled, animate=animate)
+        layout = self.layout()
+        if layout is not None:
+            layout.activate()
+        self._transcript.activate()
+        if self._history_scroll_anchor is not None:
+            self._restore_history_anchor()
+            self._history_anchor_timer.start()
+        else:
+            self._scroll_to_bottom()
+        focused = QApplication.focusWidget()
+        if focused is not None and not focused.isVisible():
+            self._zen_btn.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def _on_zen_progress(self, progress: float) -> None:
+        self._zen_controls.apply(progress)
+        self._composer_row.maximum_width = round(
+            _COMPOSER_MAX_WIDTH + (ZEN_COLUMN_WIDTH - _COMPOSER_MAX_WIDTH) * progress
+        )
+        self._composer_row.invalidate()
+        layout = self.layout()
+        if layout is not None:
+            layout.activate()
+        self._fit_column()
+        snapshot = self._zen_panel_snapshot
+        if not snapshot.isHidden():
+            snapshot.opacity = 1.0 - progress
+            snapshot.move(self._composer.width() - snapshot.width(),
+                          self._composer.height() - snapshot.height())
+            snapshot.update()
+        if self._history_scroll_anchor is not None:
+            self._restore_history_anchor()
+            self._history_anchor_timer.start()
+
+    def _finish_zen_transition(self) -> None:
+        self._zen_controls.finish(self._zen_mode)
+        self._zen_panel_snapshot.clear()
+        self._place_advanced_panel()
+        layout = self.layout()
+        if layout is not None:
+            layout.activate()
+        self._fit_column()
+        if self._history_scroll_anchor is not None:
+            self._restore_history_anchor()
+            self._history_anchor_timer.start()
+
+    def hideEvent(self, event: QHideEvent) -> None:
+        if self._zen_motion.running:
+            self._zen_motion.settle()
+        super().hideEvent(event)
 
     def _on_image_paste_busy(self, busy: bool) -> None:
         self._pending_pastes = max(0, self._pending_pastes + (1 if busy else -1))
@@ -2418,6 +2651,9 @@ class ChatView(QWidget):
             self._send_btn.setToolTip(hint)
         elif not self._draft_only:
             self._send_btn.setToolTip("发送（Ctrl+Enter）")
+        if not self.presence_allowed:
+            self._presence_bar.clear()
+        self.presence_context_changed.emit()
 
     def _can_queue(self) -> bool:
         return bool(
@@ -2441,6 +2677,21 @@ class ChatView(QWidget):
             self.logical_model_changed.emit(model_id)
 
     # ---------- 展示更新（由控制器驱动）----------
+
+    @property
+    def presence_bar(self) -> PresenceBar:
+        return self._presence_bar
+
+    @property
+    def presence_allowed(self) -> bool:
+        """Only idle, unlocked, editable chat presentation may host a gentle cue."""
+        return bool(
+            self._available and not self._read_only and not self._busy
+            and not self._compressing and not self._history_loading and not self._zen_mode
+            and not self._pending_pastes and self._editing_id is None
+            and not self._input.toPlainText().strip() and not self.attachments.attachment_ids()
+            and self._queue_panel.isHidden()
+        )
 
     @property
     def attachments(self) -> AttachmentBar:
@@ -2749,7 +3000,8 @@ class ChatView(QWidget):
         panel = CompressionThinkingPanel(self.window())
         panel.closed.connect(lambda: self._on_thinking_panel_closed(panel))
         panel.cancel_requested.connect(self.stop_requested.emit)
-        panel.popup()
+        if not self._zen_mode:
+            panel.popup()
         return panel
 
     def _on_thinking_panel_closed(self, panel: CompressionThinkingPanel) -> None:
@@ -2798,6 +3050,16 @@ class ChatView(QWidget):
         for row in self._rows:
             if row._role == "user" and row._message_id == message_id:
                 row.set_attachments(items)
+
+    def add_reminder(self, text: str, message_id: str) -> None:
+        """Append a durable timer notice without touching streaming/run state."""
+        if any(row._message_id == message_id for row in self._rows):
+            return
+        self._set_docked(True)
+        row = self._add_bubble("", role="assistant", message_id=message_id)
+        row.set_fork_available(False)
+        row.finalize(text)
+        self._scroll_to_bottom()
 
     def add_user_message(self, text: str, message_id: str | None = None) -> None:
         self._clear_retry()  # 新的一轮开始，之前的失败不再提供重试
@@ -3065,6 +3327,43 @@ class ChatView(QWidget):
                         selections.append(selection)
                 browser.setExtraSelections(selections)
 
+    def focus_message(self, message_id: str) -> bool:
+        """Locate a retained source message without inventing a text-search query."""
+        self.clear_search_matches()
+        index = next((i for i, entry in enumerate(self._full_history)
+                      if entry.message_id == message_id), len(self._full_history))
+        while index < self._history_offset:
+            self._load_earlier()
+        self._cancel_history_anchor()
+        target: QWidget | None = None
+        for row in self._rows:
+            if row._message_id == message_id:
+                target = row.label or row
+                break
+            for segment in row._segments:
+                if segment.message_id == message_id and segment.content is not None:
+                    target = segment.content
+                    break
+            if target is not None:
+                break
+        if target is None:
+            return False
+        self._stick_to_bottom = False
+        self._user_scrolled_up = True
+        self._transcript.activate()
+
+        def scroll() -> None:
+            from shiboken6 import isValid
+
+            if not isValid(target) or not self.isAncestorOf(target):
+                return
+            y = target.mapTo(self._transcript_host, QPoint()).y()
+            self._scroll.verticalScrollBar().setValue(max(0, y - 64))
+
+        scroll()
+        QTimer.singleShot(0, self, scroll)
+        return True
+
     def show_search_match(self, query: str, message_id: str) -> bool:
         """Locate a message, including older pages and merged assistant segments."""
         query = query.strip()
@@ -3255,7 +3554,7 @@ class ChatView(QWidget):
         for context in entry.compressions:
             divider = CompressionDivider(context)
             self._transcript.insertWidget(index, divider)
-            divider.show()
+            divider.setVisible(not self._zen_mode)
             index += 1
 
     def load_history(
@@ -3592,6 +3891,9 @@ class ChatView(QWidget):
         # Rich-text height/viewport changes settle after insertion. rangeChanged
         # restores the anchor until a quiet layout turn, not an arbitrary old maximum.
         self._restore_history_anchor()
+        if self._zen_motion.running:
+            self._history_anchor_timer.start()
+            return
         self._cancel_history_anchor()
         bar = self._scroll.verticalScrollBar()
         self._stick_to_bottom = bar.value() >= bar.maximum() - _STICK_THRESHOLD
@@ -3654,11 +3956,13 @@ class ChatView(QWidget):
     def _on_advanced_finished(self) -> None:
         self._advanced_anim = None
 
-    def _place_advanced_panel(self) -> None:
+    def _place_advanced_panel(self, *, for_snapshot: bool = False) -> None:
         panel, clip = self._advanced_panel, self._advanced_clip
         if panel is None or clip is None:
             return
-        if not self._advanced_expanded and self._advanced_progress <= 0.0:
+        if (not for_snapshot and (self._zen_mode or self._zen_motion.running)) or (
+            not self._advanced_expanded and self._advanced_progress <= 0.0
+        ):
             clip.hide()
             return
         composer = self._composer
@@ -3761,6 +4065,7 @@ class ChatView(QWidget):
                     button.setEnabled(False)
         row.set_column_width(self._column_width)
         row.set_tool_steps_visible(not self._tool_steps_hidden)
+        row.set_zen_mode(self._zen_mode)
         if role == "user" and message_id is not None and self._attachment_resolver is not None:
             row.set_attachments(self._attachment_resolver(message_id))
         if before is None:
@@ -3771,14 +4076,14 @@ class ChatView(QWidget):
             self._transcript.insertWidget(self._transcript.indexOf(before), row)
         # 运行中的可见布局动态插入组件时，Qt 可能要到下一轮事件循环才自动 show；
         # 显式显示可让定稿后动作栏与背景板立即进入正确的可见状态。
-        row.show()
+        row.setVisible(not row._zen_row_hidden)
         return row
 
     def _fit_column(self) -> None:
         """按视口宽度摆消息栏：最宽与输入框一致并居中，窄时两侧至少留 _MESSAGE_SIDE_MIN。"""
         width = self._scroll.viewport().width()
         available = max(0, width - 2 * _MESSAGE_SIDE_MIN)
-        column = min(_COMPOSER_MAX_WIDTH, available)
+        column = min(self._composer_row.maximum_width, available)
         # 奇数视口把多出的 1px 分给右侧，避免消息栏突破 800px 上限。
         left = max(_MESSAGE_SIDE_MIN, (width - column) // 2)
         right = max(_MESSAGE_SIDE_MIN, width - column - left)
@@ -3915,6 +4220,14 @@ class ChatView(QWidget):
         self._jump_anim = None
         if not self._jump_shown:
             self._jump_btn.hide()
+
+    def _place_mode_capsule(self) -> None:
+        viewport = self._scroll.viewport()
+        capsule = self._mode_capsule
+        # Reserve room for the right label, keeping the divider stationary.
+        # Otherwise expanding left would turn a hovered bubble into the Zen hit target.
+        capsule.move(max(0, viewport.width() - 2
+                         - (capsule.expanded_width + capsule.width()) // 2), 8)
 
     def _place_jump_button(self) -> None:
         """底部居中，停在消息区可见底边上方；进出场时按进度下沉。"""

@@ -33,7 +33,10 @@ class Capability(enum.StrEnum):
     TERMINAL = "terminal"
     NETWORK = "network"
     MEMORY_WRITE = "memory_write"
+    MEMORY_READ = "memory_read"
+    SCRATCHPAD = "scratchpad"
     CLOCK_READ = "clock_read"
+    REMINDERS = "reminders"
     HISTORY_READ = "history_read"
 
 
@@ -242,6 +245,21 @@ def evaluate(
             risk=RiskLevel.HIGH,
             reason="查询聊天记录会读取其他会话的私人内容；除完全访问外，每次调用均需确认",
             matched_rule="history.per_call",
+        )
+    if request.capability in (Capability.MEMORY_READ, Capability.SCRATCHPAD):
+        return PermissionDecision(
+            decision=Decision.ALLOW, risk=RiskLevel.NORMAL,
+            reason="当前运行的记忆检索与透明便签；范围由记忆网关绑定",
+            matched_rule="memory.context",
+        )
+    if request.capability is Capability.REMINDERS:
+        creating = request.tool_name == "set_reminder"
+        return PermissionDecision(
+            decision=Decision.CONFIRM if creating else Decision.ALLOW,
+            risk=RiskLevel.NORMAL,
+            reason=("创建提醒后应用会在指定时间向本会话发送通知，请确认时间和内容"
+                    if creating else "仅查看或取消当前会话的提醒，不读取其他会话"),
+            matched_rule="reminder.create" if creating else "reminder.manage",
         )
     if request.capability is Capability.CLOCK_READ:
         return PermissionDecision(

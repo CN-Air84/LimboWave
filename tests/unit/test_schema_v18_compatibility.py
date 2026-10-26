@@ -34,8 +34,8 @@ def test_upgrade_v13_preserves_encrypted_content_and_adds_server_schema() -> Non
         conn.commit()
         original = conn.execute("SELECT * FROM conversations").fetchall()
 
-        assert migrate(conn) == 18
-        assert current_version(conn) == 18
+        assert migrate(conn) == CURRENT_VERSION
+        assert current_version(conn) == CURRENT_VERSION
         assert conn.execute("SELECT * FROM conversations").fetchall() == original
         tables = {
             row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
@@ -63,7 +63,7 @@ def test_reopen_existing_v18_database_changes_neither_schema_nor_rows(tmp_path: 
         original = list(conn.iterdump())
         schema = _schema(conn)
     with closing(sqlite3.connect(path)) as conn:
-        assert migrate(conn) == 18
+        assert migrate(conn, target=18) == 18
         assert conn.total_changes == 0
         assert _schema(conn) == schema
         assert list(conn.iterdump()) == original

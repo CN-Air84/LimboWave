@@ -32,6 +32,10 @@ PARAM_RULES_ENV = "LIMBOWAVE_PARAM_RULES"
 # 与扩展 registerAppTools() 及 tool_gateway._SCHEMAS 一一对应（有测试守）。
 APP_TOOLS = (
     "get_current_datetime",
+    "get_environment",
+    "set_reminder",
+    "list_reminders",
+    "cancel_reminder",
     "query_chat_history",
     "read_document",
     "list_directory",
@@ -43,6 +47,11 @@ APP_TOOLS = (
     "web_search",
     "run_command",
     "add_session_memory",
+    "search_memory",
+    "update_memory",
+    "delete_session_memory",
+    "read_scratchpad",
+    "write_scratchpad",
 )
 
 
@@ -158,6 +167,8 @@ class EnvironmentBuilder:
         # 应用侧注入的环境（如工具 IPC 通道凭据）——由调用方提供，不做默认
         if extra_env:
             env.update(extra_env)
+        # 天气凭据由应用 HTTP 后端持有，不交给模型运行时或派生配置。
+        env.pop("LIMBOWAVE_MSN_WEATHER_API_KEY", None)
         # 隔离 Pi 的配置目录：Node 的 os.homedir() 在 Windows 优先 USERPROFILE
         env["USERPROFILE"] = str(runtime_home)
         env["HOME"] = str(runtime_home)

@@ -213,6 +213,23 @@ def _settings_icon() -> QIcon:
     return QIcon(image)
 
 
+def _footprints_icon() -> QIcon:
+    """A small date rail with three retained moments; theme-aware at high DPI."""
+    image = QPixmap(36, 36)
+    image.setDevicePixelRatio(2.0)
+    image.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(image)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setPen(QPen(QColor(theme.TEXT_SECONDARY), 1.25))
+    painter.drawLine(QPointF(4, 2), QPointF(4, 16))
+    for y, length in ((4, 9), (9, 6), (14, 8)):
+        painter.setBrush(QColor(theme.BG_SURFACE))
+        painter.drawEllipse(QPointF(4, y), 1.6, 1.6)
+        painter.drawLine(QPointF(8, y), QPointF(8 + length, y))
+    painter.end()
+    return QIcon(image)
+
+
 class Sidebar(QWidget):
     """会话导航栏。搜索框有内容时列表显示搜索结果，否则显示会话列表。"""
 
@@ -221,6 +238,7 @@ class Sidebar(QWidget):
     new_conversation_requested = Signal()
     search_requested = Signal()  # 搜索按钮被点：上层呼出搜索悬浮窗
     search_changed = Signal(str)  # 悬浮窗里的查询词变化（保留旧通道）
+    footprints_requested = Signal()
     settings_requested = Signal()
     rename_requested = Signal(str)  # conversation_id（输入框由上层做）
     delete_requested = Signal(str)  # conversation_id（确认框由上层做）
@@ -299,7 +317,17 @@ class Sidebar(QWidget):
         root.addWidget(self._branch_loading)
         self._branch_loading.hide()
 
-        # 左下角：唯一入口「设置」（站点与模型 / 数据 / 请求日志都收进设置页面）
+        # 足迹是用户的记忆画廊，与工程设置分开。
+        self._footprints_btn = QPushButton("足迹")
+        self._footprints_btn.setObjectName("sidebarFootprints")
+        self._footprints_btn.setMinimumHeight(40)
+        self._footprints_btn.setAccessibleName("足迹，打开记忆时间线画廊")
+        self._footprints_btn.setIcon(_footprints_icon())
+        self._footprints_btn.setIconSize(QSize(18, 18))
+        self._footprints_btn.clicked.connect(self.footprints_requested.emit)
+        root.addWidget(self._footprints_btn)
+
+        # 设置仍统一收纳站点与模型、数据和请求日志。
         self._settings_btn = QPushButton("设置")
         self._settings_btn.setObjectName("sidebarSettings")
         self._settings_btn.setIcon(_settings_icon())
@@ -330,6 +358,7 @@ class Sidebar(QWidget):
         """图标不是 QSS，切换主题时重新绘制。"""
         self._search_btn.setIcon(_search_icon())
         self._settings_btn.setIcon(_settings_icon())
+        self._footprints_btn.setIcon(_footprints_icon())
         self._list.viewport().update()
 
     # ---------- 展示更新（由上层驱动） ----------

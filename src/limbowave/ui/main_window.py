@@ -50,6 +50,7 @@ from limbowave.ui import theme
 from limbowave.ui.backdrop import BackdropEngine
 from limbowave.ui.blackout import Blackout
 from limbowave.ui.chat_view import ChatView
+from limbowave.ui.companion_mode import CompanionMode
 from limbowave.ui.login_page import LoginPage
 from limbowave.ui.popup_material import PopupMaterials
 from limbowave.ui.session_toolbar import (
@@ -57,6 +58,7 @@ from limbowave.ui.session_toolbar import (
     SessionToolbar,
 )
 from limbowave.ui.sidebar import Sidebar
+from limbowave.ui.zen_motion import SidebarReveal
 
 _MAX_TRANSITION_PIXELS = 1_400_000
 _FRAME_INTERVAL = 1 / 60
@@ -260,7 +262,9 @@ class MainWindow(QMainWindow):
             self.addAction(self._oobe_restart_action)
 
         self._sidebar = Sidebar()
+        self._zen_mode = False
         self._chat_view = ChatView()
+        self._chat_view.zen_mode_changed.connect(self._set_zen_mode)
         self._history_preview: ChatView | None = None
         self._chat_stack = QStackedWidget()
         self._chat_stack.addWidget(self._chat_view)
@@ -290,7 +294,8 @@ class MainWindow(QMainWindow):
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setObjectName("workspaceSplitter")
         splitter.setHandleWidth(1)
-        splitter.addWidget(self._sidebar)
+        self._sidebar_reveal = SidebarReveal(self._sidebar)
+        splitter.addWidget(self._sidebar_reveal)
         splitter.addWidget(content_host)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
@@ -326,16 +331,29 @@ class MainWindow(QMainWindow):
         self._transition: _PageTransition | None = None
         self._transition_animation: QPropertyAnimation | None = None
         self.setCentralWidget(self._root_stack)
+        self._companion = CompanionMode(self)
+        self._chat_view.companion_requested.connect(self._companion.open)
         app = QApplication.instance()
         if app is not None:
             app.installEventFilter(self)
+
+    def _set_zen_mode(self, enabled: bool) -> None:
+        if self._zen_mode == enabled:
+            return
+        self._zen_mode = enabled
+        self._sidebar_reveal.set_collapsed(enabled)
+        if enabled and self._toolbar._endpoint_panel is not None:
+            self._toolbar._endpoint_panel.close_panel()
+        for view in (self._chat_view, self._history_preview):
+            if view is not None:
+                view.set_zen_mode(enabled)
 
     def _reflow_toolbar(self, collapsed: bool) -> None:
         """切换右半部叠盖动画，并保持明确的键盘焦点归属。"""
         focused = QApplication.focusWidget()
         restore_focus = focused is not None and self._owns_advanced_widget(focused)
         self._chat_view.set_advanced_expanded(not collapsed)
-        if not collapsed:
+        if not collapsed and not self._zen_mode:
             self._toolbar._endpoint_value.setFocus(Qt.FocusReason.OtherFocusReason)
         elif restore_focus:
             self._chat_view._advanced_btn.setFocus(Qt.FocusReason.OtherFocusReason)
@@ -357,7 +375,7 @@ class MainWindow(QMainWindow):
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
         # Nested route panels / native combo popups handle their own Escape first.
-        if (not self._toolbar.collapsed and self._chat_view.isVisible()
+        if (not self._zen_mode and not self._toolbar.collapsed and self._chat_view.isVisible()
                 and isinstance(watched, QWidget) and watched.window() is self
                 and isinstance(event, QKeyEvent) and event.type() == QEvent.Type.KeyPress
                 and event.key() == Qt.Key.Key_Escape
@@ -370,6 +388,7 @@ class MainWindow(QMainWindow):
 
     def show_full_page(self, page: QWidget) -> None:
         """让页面占满整个主窗口，暂时替换聊天工作区。"""
+        self._companion.suspend()
         self._toolbar.set_collapsed(True)
         interrupted_frame = self._interrupt_transition()
         self._clear_login_exit()
@@ -382,6 +401,9 @@ class MainWindow(QMainWindow):
             self._root_stack.removeWidget(self._full_page)
             self._full_page.deleteLater()
         self._full_page = page
+        install_backdrop = getattr(page, "set_backdrop_engine", None)
+        if callable(install_backdrop):
+            install_backdrop(self._backdrop_engine)
         if self._root_stack.indexOf(page) < 0:
             self._root_stack.addWidget(page)
         self._root_stack.setCurrentWidget(page)
@@ -530,6 +552,9 @@ class MainWindow(QMainWindow):
         if self._history_preview is None:
             self._history_preview = ChatView(draft_only=True)
             self._chat_stack.addWidget(self._history_preview)
+            self._history_preview.set_zen_mode(self._zen_mode)
+            self._history_preview.zen_mode_changed.connect(self._set_zen_mode)
+            self._history_preview.companion_requested.connect(self._companion.open)
             self._on_backdrop_changed()
         return self._history_preview
 
@@ -655,7 +680,9 @@ class MainWindow(QMainWindow):
         self._popup_materials.set_theme(definition)
 
     def _repaint_backdrop(self) -> None:
-        for pane in (self._sidebar, self._chat_view, self._toolbar, self._history_preview):
+        for pane in (
+            self._sidebar, self._chat_view, self._toolbar, self._history_preview, self._full_page,
+        ):
             if pane is not None:
                 pane.update()
 
@@ -673,6 +700,7 @@ class MainWindow(QMainWindow):
         if callable(resolver) and not resolver():
             event.ignore()
             return
+        self._companion.shutdown()
         self._backdrop_engine.close()
         super().closeEvent(event)
 

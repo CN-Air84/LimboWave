@@ -603,3 +603,42 @@ def test_session_global_editor_actions_do_not_overlap_cards_in_short_window(
     finally:
         theme.set_font_scale(old_scale)
         theme.FONT_FAMILY = old_font
+
+
+def test_builtin_preset_can_be_edited_and_deleted_in_existing_panel(
+    qtbot, memory_stack, monkeypatch,
+):
+    service, _ = memory_stack
+    service.ensure_builtin_preset()
+    preset, = service.list()
+    panel = _show_editor_page(qtbot, service)
+    assert panel.items.count() == 1
+    assert panel.items.item(0).text() == "忠实的阅读者 · 内置预设"
+    assert any("内置预设也可修改或删除" in label.text() for label in panel.findChildren(QLabel))
+    _double_click(qtbot, panel)
+    _popup, editor, save = _editor_parts(qtbot, panel)
+    assert editor.toPlainText() == preset.content
+    editor.setPlainText("我的阅读者\n请先听我说完。")
+    qtbot.mouseClick(save, Qt.MouseButton.LeftButton)
+    qtbot.waitUntil(lambda: not panel.is_editing or save.isEnabled())
+    qtbot.waitUntil(panel.isEnabled)
+    assert not panel.is_editing
+    assert service.list()[0].id == preset.id
+    assert service.list()[0].content == "我的阅读者\n请先听我说完。"
+    assert not service.ensure_builtin_preset()
+    panel.items.setCurrentRow(0)
+    answers = []
+
+    def confirm(_parent, _title, _message, callback):
+        answers.append(callback)
+
+    monkeypatch.setattr("limbowave.ui.session_memory_panel.ask_confirm", confirm)
+    qtbot.mouseClick(panel.delete_button, Qt.MouseButton.LeftButton)
+    answers.pop()(False)
+    assert len(service.list()) == 1
+    qtbot.mouseClick(panel.delete_button, Qt.MouseButton.LeftButton)
+    answers.pop()(True)
+    qtbot.waitUntil(panel.isEnabled)
+    assert service.list() == []
+    assert not service.ensure_builtin_preset()
+    assert panel.items.count() == 0
