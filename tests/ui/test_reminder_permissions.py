@@ -5,7 +5,7 @@ import pytest
 from limbowave.app import _make_permission_handler
 from limbowave.application.services.permission_service import PermissionService
 from limbowave.application.services.tool_gateway import ToolGateway
-from limbowave.domain.permissions import PermissionPreset
+from limbowave.domain.permissions import Decision, PermissionPreset
 from limbowave.infrastructure.memory_repositories import in_memory_uow_factory
 
 
@@ -30,7 +30,13 @@ async def test_create_reminder_requires_explicit_approval(tmp_path, monkeypatch,
     }))
     assert result is (answer == "once")
     assert prompts == [params]
-    assert permissions.list_audit("c")[-1].user_confirmed is result
+    # The prompt and answer can share a timestamp; locate the final decision explicitly.
+    audits = permissions.list_audit("c")
+    expected = Decision.ALLOW if result else Decision.DENY
+    final = [audit for audit in audits if audit.decision is expected]
+    assert len(final) == 1
+    assert final[0].user_confirmed is result
+    assert final[0].params == params
 
 
 async def test_management_no_prompt_and_chat_only_still_blocks(tmp_path, monkeypatch):
