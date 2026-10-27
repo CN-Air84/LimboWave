@@ -90,6 +90,11 @@ class MemoryPanel(QWidget):
             self.archive = ArchivedMemoryPanel(service, conversation_id, branch_id)
             archive.addWidget(self.archive, 1)
             self.archive.changed.connect(self.reload)
+        from limbowave.ui.privacy_panel import PrivacyPanel
+
+        privacy_page = self._add_page("翻篇与禁区", "保留历史，控制未来复用。", scrollable=True)
+        self.privacy = PrivacyPanel(service.privacy, conversation_id, self)
+        privacy_page.addWidget(self.privacy)
         self.status = QLabel()
         self.status.setWordWrap(True)
         self.status.setTextFormat(Qt.TextFormat.PlainText)

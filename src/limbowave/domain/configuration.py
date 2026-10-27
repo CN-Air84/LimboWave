@@ -10,8 +10,10 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from limbowave.domain.compaction import CompressionProfile
 from limbowave.domain.memory import MemorySettings
 from limbowave.domain.models import CAPABILITY_FIELDS, ActualModel, LogicalModel
+from limbowave.domain.network import NetworkSettings
 from limbowave.domain.providers import EndpointConfig
 
 _CAPABILITY_DEFAULTS = {name: ActualModel.model_fields[name].default for name in CAPABILITY_FIELDS}
@@ -40,6 +42,7 @@ class CompressionSettings(BaseModel):
     preview_threshold: float = Field(default=80.0, ge=0.0, le=100.0)
     block_threshold: float = Field(default=90.0, ge=0.0, le=100.0)
     auto_preview: bool = True
+    profile: CompressionProfile = CompressionProfile.COMPANION
 
     @model_validator(mode="after")
     def _ordered(self) -> CompressionSettings:
@@ -65,6 +68,7 @@ class AppConfiguration(BaseModel):
     # 压缩自动触发的阈值（§七.1）
     compression: CompressionSettings = Field(default_factory=CompressionSettings)
     memory: MemorySettings = Field(default_factory=MemorySettings)
+    network: NetworkSettings = Field(default_factory=NetworkSettings)
 
     @model_validator(mode="before")
     @classmethod

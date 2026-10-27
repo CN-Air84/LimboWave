@@ -11,14 +11,16 @@ from __future__ import annotations
 import sys
 from collections.abc import Callable
 
-from PySide6.QtCore import QEvent, QObject, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QObject, QPoint, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QColor,
+    QHideEvent,
     QKeyEvent,
     QMouseEvent,
     QPainter,
     QPaintEvent,
     QRadialGradient,
+    QResizeEvent,
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -28,6 +30,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMenu,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -48,6 +51,7 @@ from limbowave.ui.oobe_copy import (
     CONSOLE_HEADING,
     DISPLAY_NAME_LABEL,
     DISPLAY_NAME_PLACEHOLDER,
+    INTRODUCTION_SEQUENCE,
     KEY_LABEL,
     KEY_PLACEHOLDER,
     MORE_PROVIDERS,
@@ -74,6 +78,7 @@ from limbowave.ui.oobe_copy import (
 )
 
 CHECK_PREVIEW_MS = 800
+ALT_SKIP_INTERVAL_MS = 900
 _COLUMN_WIDTH = 480
 _PRESET_WIDTH = 340
 _PROVIDER_WIDTH = 720
@@ -82,6 +87,10 @@ _EMPTY_PAGE = 3
 # Logical navigation order, independent of the reused form/empty stack pages.
 _SCREEN_STEP = {
     "intro": 0,
+    "voice_settings": 7,
+    "voice": 8,
+    "network": 9,
+    "network_settings": 9.2,
     "welcome": 1,
     "browse": 2,
     "provider": 3,
@@ -94,7 +103,27 @@ _SCREEN_STEP = {
     "error_key": 6,
     "error_network": 6,
     "error_timeout": 6,
-    "done": 7,
+    "done": 10,
+}
+
+_FORCED_FORWARD: dict[str, tuple[str, ...]] = {
+    "intro": ("welcome", "browse"),
+    "welcome": ("provider", "browse"),
+    "browse": ("provider", "later"),
+    "provider": ("key", "key_custom"),
+    "key": ("checking",),
+    "key_custom": ("checking",),
+    "checking": ("models", "error_key", "error_network", "error_timeout"),
+    "models": ("success",),
+    "success": ("voice_settings",),
+    "voice_settings": ("voice",),
+    "voice": ("network",),
+    "network": ("done", "network_settings"),
+    "network_settings": ("done",),
+    "error_key": ("models",),
+    "error_network": ("models",),
+    "error_timeout": ("models",),
+    "later": ("done",),
 }
 
 
@@ -255,11 +284,20 @@ class OobeDemo(QWidget):
         self._display_names: dict[str, str] = {}
         self._rows: dict[str, _ProviderRow] = {}
         self._rail_buttons: dict[str, QPushButton] = {}
+        self._optional_settings_factories: dict[str, Callable[[], QWidget]] = {}
+        self._optional_settings_pages: dict[str, QWidget] = {}
+        self._optional_stack_indices: dict[str, int] = {}
         self._check_generation = 0
         self._check_timer = QTimer(self)
         self._check_timer.setSingleShot(True)
         self._check_timer.setInterval(CHECK_PREVIEW_MS)
         self._check_timer.timeout.connect(self._finish_check)
+        self._alt_skip_count = 0
+        self._alt_skip_timer = QTimer(self)
+        self._alt_skip_timer.setSingleShot(True)
+        self._alt_skip_timer.setInterval(ALT_SKIP_INTERVAL_MS)
+        self._alt_skip_timer.timeout.connect(self._reset_alt_skip)
+        self._skip_menu: QMenu | None = None
 
         root = QHBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -269,7 +307,9 @@ class OobeDemo(QWidget):
             self.setMinimumSize(960, 640)
             root.addWidget(self._build_rail())
         root.addWidget(self._build_stage(), 1)
-        self.setStyleSheet(_stylesheet())
+        from limbowave.ui.oobe_companion import introduction_stylesheet
+
+        self.setStyleSheet(_stylesheet() + introduction_stylesheet())
         app = QApplication.instance()
         if app is not None:
             app.installEventFilter(self)
@@ -282,6 +322,8 @@ class OobeDemo(QWidget):
         return self._display_name.text().strip()
 
     def _detach(self) -> None:
+        self.clear_optional_secrets()
+        self._stop_introduction_activity()
         app = QApplication.instance()
         if app is not None:
             app.removeEventFilter(self)
@@ -294,10 +336,12 @@ class OobeDemo(QWidget):
         """切到某一屏。``auto_continue`` 只在用户真的点了检查时为真，对照文案时不要自动往下走。"""
         changed = screen_id != self._screen_id
         if changed:
+            self.clear_optional_secrets()
             direction = -1 if _SCREEN_STEP[screen_id] < _SCREEN_STEP[self._screen_id] else 1
             # Titles, status copy and actions change outside the inner form stack.
             # Capture the entire column before any of those widgets are updated.
             self._pages.capture_refresh(direction)
+        self._stop_introduction_activity()
         self._check_timer.stop()
         if screen_id != "checking":
             self._check_generation += 1
@@ -371,9 +415,9 @@ class OobeDemo(QWidget):
 
     def _build_stage(self) -> QWidget:
         stage = _Stage()
-        outer = QHBoxLayout(stage)
+        outer = QVBoxLayout(stage)
         outer.setContentsMargins(64, 52, 48, 32)
-        outer.setSpacing(0)
+        outer.setSpacing(16)
 
         column = QWidget()
         self._column = column
@@ -415,6 +459,12 @@ class OobeDemo(QWidget):
         self._stack.addWidget(QWidget())
         self._stack.addWidget(self._build_intro())
         self._stack.addWidget(self._build_models())
+        from limbowave.ui.oobe_companion import CompanionIntroduction
+
+        self.voice_introduction = CompanionIntroduction("voice")
+        self.network_introduction = CompanionIntroduction("network")
+        self._voice_intro_index = self._stack.addWidget(self.voice_introduction)
+        self._network_intro_index = self._stack.addWidget(self.network_introduction)
         self._stack_index = self._column_layout.count()
         self._column_layout.addWidget(self._stack)
 
@@ -442,9 +492,12 @@ class OobeDemo(QWidget):
         self._primary.setCursor(Qt.CursorShape.PointingHandCursor)
         self._primary.clicked.connect(self._on_primary)
         footer.addStretch(1)
+        self._optional_settings_button = QPushButton()
+        self._optional_settings_button.setProperty("flat", True)
+        self._optional_settings_button.clicked.connect(self._open_optional_settings)
+        footer.addWidget(self._optional_settings_button)
         footer.addWidget(self._secondary)
         footer.addWidget(self._primary)
-        self._column_layout.addLayout(footer)
         self._tail_index = self._column_layout.count()
         self._column_layout.addStretch(1)
 
@@ -460,6 +513,7 @@ class OobeDemo(QWidget):
         self._pages = _OobePages()
         self._pages.add_page(content)
         outer.addWidget(self._pages, 1)
+        outer.addLayout(footer)
         return stage
 
     def _build_intro(self) -> QWidget:
@@ -732,6 +786,24 @@ class OobeDemo(QWidget):
         )
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if event.type() == QEvent.Type.ApplicationDeactivate:
+            self._stop_introduction_activity()
+            self._reset_alt_skip()
+        if (
+            event.type() == QEvent.Type.KeyPress
+            and isinstance(event, QKeyEvent)
+            and event.key() == Qt.Key.Key_Alt
+            and not event.isAutoRepeat()
+            and isinstance(watched, QWidget)
+            and (watched is self or self.isAncestorOf(watched))
+        ):
+            self._alt_skip_count += 1
+            if self._alt_skip_count >= 3:
+                self._reset_alt_skip()
+                self._force_forward()
+            else:
+                self._alt_skip_timer.start()
+            return True
         if (
             event.type() == QEvent.Type.KeyPress
             and isinstance(event, QKeyEvent)
@@ -742,6 +814,57 @@ class OobeDemo(QWidget):
             self._on_escape()
             return True
         return super().eventFilter(watched, event)
+
+    def _reset_alt_skip(self) -> None:
+        self._alt_skip_timer.stop()
+        self._alt_skip_count = 0
+
+    def _force_forward(self) -> None:
+        """Change screens without saving, probing, or completing configuration."""
+        targets = _FORCED_FORWARD.get(self._screen_id, ())
+        if not targets:
+            if not self._preview:
+                self._detach()
+                self.skipped.emit()
+            return
+        if len(targets) == 1:
+            self._force_show_screen(targets[0])
+            return
+        self._show_force_forward_menu(targets)
+
+    def _force_show_screen(self, screen_id: str) -> None:
+        if screen_id == "done" and not self._preview:
+            self._detach()
+            self.skipped.emit()
+            return
+        self.show_screen(screen_id)
+
+    def _show_force_forward_menu(self, targets: tuple[str, ...]) -> None:
+        if self._skip_menu is not None:
+            self._skip_menu.close()
+        menu = QMenu(self)
+        menu.setObjectName("oobeForceForwardMenu")
+        menu.setTitle("选择要前往的下一页")
+        for screen_id in targets:
+            action = menu.addAction(present(screen_id, self._provider()).rail)
+            action.setData(screen_id)
+            action.triggered.connect(
+                lambda _checked=False, target=screen_id: self._choose_force_forward(target)
+            )
+        menu.aboutToHide.connect(self._clear_skip_menu)
+        self._skip_menu = menu
+        anchor = self.mapToGlobal(QPoint(self.width() // 2, self.height() // 2))
+        size = menu.sizeHint()
+        menu.popup(anchor - QPoint(size.width() // 2, size.height() // 2))
+
+    def _choose_force_forward(self, screen_id: str) -> None:
+        menu = self._skip_menu
+        if menu is not None:
+            menu.close()
+        self._force_show_screen(screen_id)
+
+    def _clear_skip_menu(self) -> None:
+        self._skip_menu = None
 
     def _prepare_provider(self, screen_id: str) -> None:
         if screen_id == "key_custom":
@@ -805,6 +928,11 @@ class OobeDemo(QWidget):
         masked = mask_middle(self._key.text()) if self._screen_id == "checking" else ""
         self._secret.setText(masked)
         self._secret.setVisible(bool(masked))
+        optional = self._screen_id == "network"
+        self._optional_settings_button.setVisible(optional)
+        self._optional_settings_button.setText(
+            "看看联网设置"
+        )
         self._primary.setText(copy.primary)
         self._secondary.setText(copy.secondary)
         self._secondary.setVisible(bool(copy.secondary))
@@ -814,7 +942,13 @@ class OobeDemo(QWidget):
         self._mark.style().polish(self._mark)
 
     def _show_page(self, screen_id: str) -> None:
-        if screen_id == "intro":
+        if screen_id in ("voice_settings", "network_settings"):
+            index = self._optional_page_index(screen_id)
+        elif screen_id == "voice":
+            index = self._voice_intro_index
+        elif screen_id == "network":
+            index = self._network_intro_index
+        elif screen_id == "intro":
             index = 4
             self._fill_intro(self._copy().body)
         elif screen_id == "welcome":
@@ -828,14 +962,25 @@ class OobeDemo(QWidget):
         else:
             index = _EMPTY_PAGE
         self._stack.setCurrentIndex(index)
-        fill = screen_id in ("provider", "models")
+        fill = screen_id in (
+            "provider",
+            "models",
+            "voice",
+            "network",
+            "voice_settings",
+            "network_settings",
+        )
         vertical = QSizePolicy.Policy.Expanding if fill else QSizePolicy.Policy.Maximum
         self._stack.setSizePolicy(QSizePolicy.Policy.Preferred, vertical)
         self._column_layout.setStretch(self._stack_index, 1 if fill else 0)
         self._column_layout.setStretch(self._tail_index, 0 if fill else 1)
         self._stack.updateGeometry()
         self._column_layout.invalidate()
-        width = _PROVIDER_WIDTH if fill else _COLUMN_WIDTH
+        if screen_id in ("voice", "network", "voice_settings", "network_settings"):
+            rail_width = 220 if self._preview else 0
+            width = max(360, min(900, self.width() - rail_width - 112))
+        else:
+            width = _PROVIDER_WIDTH if fill else _COLUMN_WIDTH
         self._column.setMinimumWidth(width)
         self._column.setMaximumWidth(width)
         self._pages.setMinimumWidth(width)
@@ -908,6 +1053,10 @@ class OobeDemo(QWidget):
         screen = self._screen_id
         if screen == "intro":
             self.show_screen("welcome")
+        elif screen in INTRODUCTION_SEQUENCE[:-1]:
+            self.show_screen(INTRODUCTION_SEQUENCE[INTRODUCTION_SEQUENCE.index(screen) + 1])
+        elif screen in ("voice_settings", "network_settings"):
+            self.show_screen(screen.removesuffix("_settings"))
         elif screen == "welcome":
             self.show_screen("provider")
         elif screen == "provider":
@@ -921,7 +1070,7 @@ class OobeDemo(QWidget):
                 self.show_screen("success")
             else:
                 self.model_selected.emit(str(self._default_model.currentData()))
-        elif screen == "success":
+        elif screen == INTRODUCTION_SEQUENCE[-1]:
             if self._preview:
                 self.show_screen("done")
             else:
@@ -942,7 +1091,13 @@ class OobeDemo(QWidget):
 
     def _on_secondary(self) -> None:
         screen = self._screen_id
-        if screen in ("intro", "welcome"):
+        if screen == "voice_settings":
+            self.show_screen("voice")
+        elif screen == "network_settings":
+            self.show_screen("network")
+        elif screen in ("voice", "network"):
+            self.show_screen(INTRODUCTION_SEQUENCE[INTRODUCTION_SEQUENCE.index(screen) - 1])
+        elif screen in ("intro", "welcome"):
             self.show_screen("browse")
         elif screen == "browse":
             if self._preview:
@@ -963,10 +1118,27 @@ class OobeDemo(QWidget):
 
     def _on_escape(self) -> None:
         """Esc 沿设置退回一步，不触发「再检查一次」这类次按钮。"""
+        if self._screen_id in ("voice", "network"):
+            current = (
+                self.voice_introduction if self._screen_id == "voice" else self.network_introduction
+            )
+            if current.stop_activity():
+                return
+        if self._screen_id == "voice_settings":
+            self.show_screen("success")
+            return
+        if self._screen_id == "network_settings":
+            self.show_screen("network")
+            return
         if self._screen_id == "intro":
             return
         if self._screen_id == "welcome":
             self.show_screen("intro")
+            return
+        if self._screen_id in INTRODUCTION_SEQUENCE[1:]:
+            self.show_screen(
+                INTRODUCTION_SEQUENCE[INTRODUCTION_SEQUENCE.index(self._screen_id) - 1]
+            )
             return
         if self._screen_id in ("checking", "models", "success", "error_key"):
             self.show_screen(self._key_screen())
@@ -975,6 +1147,68 @@ class OobeDemo(QWidget):
             self.show_screen("provider")
             return
         self.show_screen("welcome")
+
+    def configure_optional_settings(
+        self,
+        *,
+        voice: Callable[[], QWidget],
+        network: Callable[[], QWidget],
+    ) -> None:
+        """Factories are wired by the live gate; opening the tour never creates editors."""
+        self._optional_settings_factories = {"voice_settings": voice, "network_settings": network}
+
+    def _open_optional_settings(self) -> None:
+        if self._screen_id == "network":
+            self.show_screen("network_settings")
+
+    def _optional_page_index(self, screen_id: str) -> int:
+        if screen_id in self._optional_stack_indices:
+            return self._optional_stack_indices[screen_id]
+        factory = self._optional_settings_factories.get(screen_id)
+        if factory is None:
+            page = QWidget()
+            body = QVBoxLayout(page)
+            hint = QLabel("设置入口将在已解锁的正式引导中提供；也可稍后到设置中配置。")
+            hint.setWordWrap(True)
+            body.addWidget(hint)
+            body.addStretch(1)
+        else:
+            page = factory()
+        scroll = QScrollArea()
+        scroll.setObjectName("oobeScroll")
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(page)
+        self._optional_settings_pages[screen_id] = page
+        index = self._stack.addWidget(scroll)
+        self._optional_stack_indices[screen_id] = index
+        return index
+
+    def _stop_introduction_activity(self) -> None:
+        for page in (self.voice_introduction, self.network_introduction):
+            page.reset()
+
+    def clear_optional_secrets(self) -> None:
+        # Explicitly clear even when the containing window was never visible.
+        for page in self._optional_settings_pages.values():
+            for field in page.findChildren(QLineEdit):
+                if field.echoMode() != QLineEdit.EchoMode.Normal:
+                    field.clear()
+
+    def hideEvent(self, event: QHideEvent) -> None:
+        self.clear_optional_secrets()
+        self._stop_introduction_activity()
+        super().hideEvent(event)
+
+    def resizeEvent(self, event: QResizeEvent) -> None:
+        super().resizeEvent(event)
+        if hasattr(self, "voice_introduction") and self._screen_id in (
+            "voice",
+            "network",
+            "voice_settings",
+            "network_settings",
+        ):
+            self._show_page(self._screen_id)
 
     def _begin_check(self) -> None:
         self.show_screen("checking", auto_continue=self._preview)

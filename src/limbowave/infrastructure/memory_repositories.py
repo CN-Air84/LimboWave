@@ -15,7 +15,7 @@ from __future__ import annotations
 from collections.abc import Generator, Sequence
 from dataclasses import replace
 from datetime import datetime
-from heapq import nlargest
+from heapq import nlargest, nsmallest
 from types import TracebackType
 from typing import Any
 
@@ -191,6 +191,25 @@ class _Messages:
                 and (branch_id is None or m.branch_id == branch_id))
         for message in sorted(rows, key=lambda m: (m.created_at, m.id), reverse=True):
             yield replace(message, thinking="", tool_steps=(), segments=(), pi_entry_id=None)
+
+    def page_chat_history(
+        self, conversation_id: str, branch_id: str, *, limit: int,
+        cursor: tuple[datetime, str] | None = None, forward: bool = False,
+        upper: tuple[datetime, str, bool] | None = None,
+    ) -> list[Message]:
+        merged = dict(self._store.messages)
+        merged.update({m.id: m for m in self._staged.values()})
+        candidates = (
+            m for m in merged.values()
+            if m.conversation_id == conversation_id and m.branch_id == branch_id
+            and (cursor is None or ((m.created_at, m.id) > cursor if forward
+                                    else (m.created_at, m.id) < cursor))
+            and (upper is None or (m.created_at, m.id) < upper[:2]
+                 or (upper[2] and (m.created_at, m.id) == upper[:2]))
+        )
+        select = nsmallest if forward else nlargest
+        return [replace(m, thinking="", tool_steps=(), segments=(), pi_entry_id=None)
+                for m in select(limit, candidates, key=lambda m: (m.created_at, m.id))]
 
     def history_position(self, message_id: str) -> tuple[str, str, datetime] | None:
         message = self.get(message_id)
@@ -578,6 +597,16 @@ class _Reminders:
         if item is None or item.status is not ReminderStatus.PENDING:
             return False
         self.add(replace(item, status=status, completed_at=completed_at))
+        return True
+
+    def advance(
+        self, reminder_id: str, expected_time: datetime, next_time: datetime,
+    ) -> bool:
+        item = self.get(reminder_id)
+        if (item is None or item.status is not ReminderStatus.PENDING
+                or item.target_time != expected_time):
+            return False
+        self.add(replace(item, target_time=next_time))
         return True
 
 

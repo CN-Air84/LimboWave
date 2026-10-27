@@ -479,6 +479,7 @@ class _BubbleRow(QWidget):
     按钮只外发 message_id，业务逻辑（分叉）在应用层。
     """
 
+    reminder_clicked = Signal(str)  # durable notice ID; application resolves its origin
     stream_updated = Signal()  # one display/layout update, not one provider delta
     edit_clicked = Signal(str)  # message_id
     fork_clicked = Signal(str)  # message_id：保留起点回复，不触发生成
@@ -518,6 +519,7 @@ class _BubbleRow(QWidget):
         self._tool_steps_progress = 1.0
         self._tool_steps_animation: QVariantAnimation | None = None
         self._actions: QWidget | None = None
+        self._reminder_btn: QPushButton | None = None
         self._copy_btn: _ActionButton | None = None
         self._fork_btn: _ActionButton | None = None
         self._regenerate_btn: _ActionButton | None = None
@@ -644,6 +646,27 @@ class _BubbleRow(QWidget):
 
     def _sync_actions(self) -> None:
         """完整回复定稿且有 ID 后，才显示 Fork 与重新生成。"""
+        if (self._role == "assistant" and self._message_id is not None
+                and self._message_id.startswith("notice_reminder_") and self._actions is not None):
+            self._can_fork = False
+            if self._reminder_btn is None:
+                context_button = QPushButton("回到当初的约定", self._actions)
+                context_button.setObjectName("reminderContextButton")
+                context_button.setAccessibleName("回到设定此提醒时的上下文")
+                context_button.setToolTip("定位到当初设定此提醒的消息，不会自动调用模型")
+                context_button.setCursor(Qt.CursorShape.PointingHandCursor)
+                context_button.setMinimumHeight(_ACTION_BUTTON_SIZE)
+                context_button.setStyleSheet(
+                    "QPushButton { background: transparent; border: 1px solid transparent;"
+                    f" color: {theme.ACCENT}; padding: 2px 8px;"
+                    f" border-radius: {theme.RADIUS_SM}px; }}"
+                    f"QPushButton:hover {{ background: {theme.BG_SURFACE_HOVER}; }}"
+                    f"QPushButton:focus {{ border-color: {theme.ACCENT}; }}"
+                )
+                context_button.clicked.connect(self._on_reminder)
+                cast(QHBoxLayout, self._actions.layout()).insertWidget(0, context_button)
+                self._reminder_btn = context_button
+            self._reminder_btn.setVisible(not self._zen_mode)
         for button in (self._fork_btn, self._regenerate_btn):
             if button is not None:
                 button.setVisible(
@@ -788,6 +811,10 @@ class _BubbleRow(QWidget):
         self._retry_animation.deleteLater()
         self._retry_animation = None
         self._assistant_panel.setGraphicsEffect(None)  # type: ignore[arg-type]
+
+    def _on_reminder(self) -> None:
+        if self._message_id is not None:
+            self.reminder_clicked.emit(self._message_id)
 
     def _on_fork(self) -> None:
         if self._message_id is not None:
@@ -1940,6 +1967,8 @@ class ComposerDraft:
 class ChatView(QWidget):
     """最小聊天视图。通过信号表达意图，经方法接收展示更新。"""
 
+    voice_context_invalidated = Signal()
+    reminder_context_requested = Signal(str)
     message_submitted = Signal(str)
     message_queued = Signal(str)
     queue_cancel_requested = Signal(str)
@@ -2300,6 +2329,9 @@ class ChatView(QWidget):
         self._attach_menu.snippet_requested.connect(bar.attach_snippet_requested.emit)
         self._attach_btn.clicked.connect(lambda: self._attach_menu.popup_above(self._attach_btn))
         tools.addWidget(self._attach_btn)
+        from limbowave.ui.voice_controls import VoiceControls
+
+        self.voice_controls = VoiceControls(self)
 
         self._permission_btn = _PermissionButton()
         self._permission_btn.setFixedHeight(30)
@@ -2368,6 +2400,7 @@ class ChatView(QWidget):
         self._send_btn.clicked.connect(self._on_send)
         tools.addWidget(self._send_btn)
         composer.addLayout(tools)
+        composer.addWidget(self.voice_controls)
         self._composer_row.addWidget(self._composer)
         self._presence_bar = PresenceBar()
         root.addWidget(self._presence_bar)
@@ -2531,6 +2564,7 @@ class ChatView(QWidget):
             self._history_anchor_timer.start()
 
     def hideEvent(self, event: QHideEvent) -> None:
+        self.voice_context_invalidated.emit()
         if self._zen_motion.running:
             self._zen_motion.settle()
         super().hideEvent(event)
@@ -2540,6 +2574,7 @@ class ChatView(QWidget):
         self._sync_send_button()
 
     def _on_send(self) -> None:
+        self.voice_context_invalidated.emit()
         text = self._input.toPlainText().strip()
         if self._can_queue():
             # The app clears the composer only after the immutable entry is accepted.
@@ -2582,6 +2617,7 @@ class ChatView(QWidget):
         self._before_edit = draft.before_edit
         self._attachment_bar.restore(draft.attachments)
         self._set_editing(draft.editing_message_id)
+        self.voice_context_invalidated.emit()
         self._input.setPlainText(draft.text)
         self._sync_send_button()
 
@@ -2619,6 +2655,7 @@ class ChatView(QWidget):
 
     def begin_edit(self, message_id: str, text: str) -> None:
         """先保存新消息草稿，再进入编辑态；上层随后替换为旧消息附件。"""
+        self.voice_context_invalidated.emit()
         if self._editing_id is None:
             self._before_edit = self.snapshot_draft()
         self._set_editing(message_id)
@@ -2860,6 +2897,8 @@ class ChatView(QWidget):
     ) -> None:
         """独立于模型 busy/available 的加载态；保留旧历史与草稿，不创建助手卡片。"""
         was_requested = self._history_loading_overlay_requested
+        if loading:
+            self.voice_context_invalidated.emit()
         self._history_loading = loading
         self._history_loading_overlay_requested = loading and show_overlay
         if loading:
@@ -3454,6 +3493,7 @@ class ChatView(QWidget):
         内部只清**组件与历史缓存**；``_render_window`` 复用同一个清理逻辑时
         不能顺手清掉 ``_full_history``（否则窗口重渲染会把自己清空）。
         """
+        self.voice_context_invalidated.emit()
         self.cancel_edit()  # 被编辑的消息不在新会话里
         self._cancel_history_transition()
         self.clear_search_matches()
@@ -4059,6 +4099,7 @@ class ChatView(QWidget):
         row.fork_clicked.connect(self.fork_requested)
         row.regenerate_clicked.connect(self.regenerate_requested)
         row.retry_clicked.connect(self.retry_requested)
+        row.reminder_clicked.connect(self.reminder_context_requested)
         if self._read_only:
             for button in (row._edit_btn, row._retry_btn, row._fork_btn, row._regenerate_btn):
                 if button is not None:

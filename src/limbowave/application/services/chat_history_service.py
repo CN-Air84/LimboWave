@@ -3,10 +3,20 @@
 from __future__ import annotations
 
 import json
+from collections import OrderedDict
 from typing import Any
 
-from limbowave.application.repositories import UnitOfWorkFactory
-from limbowave.domain.conversation import Message
+from limbowave.application.repositories import UnitOfWork, UnitOfWorkFactory
+from limbowave.application.services.chat_history_context import (
+    DEFAULT_CONTEXT_TURNS,
+    MAX_CONTEXT_TURNS,
+    expand_context,
+)
+from limbowave.application.services.command_receipts import RuntimeConflict
+from limbowave.application.services.history_pagination import _segments
+from limbowave.application.services.privacy_service import allowed_messages, load_policy
+from limbowave.domain.conversation import Message, MessageRole
+from limbowave.domain.privacy import PrivacyPolicy
 
 DEFAULT_LIMIT = 20
 MAX_LIMIT = 50
@@ -15,13 +25,72 @@ MAX_QUERY_CHARS = 500
 MAX_ID_CHARS = 200
 MAX_CONTENT_CHARS = 2000
 MAX_TITLE_CHARS = 200
+# Provenance reads are independent of search hits, offset and page size.
+MAX_PRIVACY_TURN_MESSAGES = 64
+PRIVACY_TURN_PAGE_SIZE = 8
+MAX_PRIVACY_CACHE_MESSAGES = 256
+
+
+def _history_turn_access(
+    uow: UnitOfWork, policy: PrivacyPolicy, anchor: Message,
+) -> dict[str, bool]:
+    """Resolve the owning user on the effective branch, bounded and fail closed.
+
+    Newest-first search cannot carry a user's block forward to replies. Public
+    pages supply the complete preceding turn and derived timestamp/run metadata.
+    """
+    try:
+        segments = _segments(uow, anchor.conversation_id, anchor.branch_id)
+    except RuntimeConflict:
+        return {anchor.id: False}
+    key = anchor.created_at, anchor.id
+    if not segments or not segments[-1].contains(key):
+        return {anchor.id: False}
+    messages: list[Message] = []
+    for index in range(len(segments) - 1, -1, -1):
+        segment = segments[index]
+        upper = (*key, True) if index == len(segments) - 1 else segment.upper
+        cursor = None
+        while len(messages) < MAX_PRIVACY_TURN_MESSAGES:
+            page = uow.messages.page_chat_history(
+                anchor.conversation_id, segment.branch_id,
+                limit=min(PRIVACY_TURN_PAGE_SIZE, MAX_PRIVACY_TURN_MESSAGES - len(messages)),
+                cursor=cursor, upper=upper,
+            )
+            if not page:
+                break
+            if not messages and page[0].id != anchor.id:
+                return {anchor.id: False}
+            for message in page:
+                messages.append(message)
+                if message.role is MessageRole.USER:
+                    permitted = {m.id for m in allowed_messages(policy, list(reversed(messages)))}
+                    return {m.id: m.id in permitted for m in messages}
+            cursor = page[-1].created_at, page[-1].id
+    # Unknown provenance is not evidence that an assistant paraphrase is safe.
+    # A nearer, older reply may still find its user within its own budget; do
+    # not poison the cache for the entire fragment when only this anchor failed.
+    return {anchor.id: False}
 
 
 def validate_history_params(params: dict[str, Any]) -> None:
     """语义校验可在权限弹窗前调用；bool 不能充当分页整数。"""
-    allowed = {"query", "conversation_id", "branch_id", "limit", "offset"}
+    allowed = {"query", "conversation_id", "branch_id", "limit", "offset",
+               "message_id", "before_turns", "after_turns"}
     if params.keys() - allowed:
         raise ValueError("聊天记录查询存在未知参数")
+    if "message_id" in params:
+        anchor = params["message_id"]
+        if not isinstance(anchor, str) or not anchor.strip() or len(anchor) > MAX_ID_CHARS:
+            raise ValueError(f"参数 message_id 必须为1–{MAX_ID_CHARS}字的非空字符串")
+        if params.keys() & {"query", "limit", "offset"}:
+            raise ValueError("按消息展开前后文不能同时传入 query、limit 或 offset")
+    elif params.keys() & {"before_turns", "after_turns"}:
+        raise ValueError("before_turns / after_turns 必须与 message_id 一起使用")
+    for key in ("before_turns", "after_turns"):
+        value = params.get(key, DEFAULT_CONTEXT_TURNS)
+        if type(value) is not int or not 0 <= value <= MAX_CONTEXT_TURNS:
+            raise ValueError(f"参数 {key} 必须为 0..{MAX_CONTEXT_TURNS} 的整数")
     for key, maximum in (
         ("query", MAX_QUERY_CHARS),
         ("conversation_id", MAX_ID_CHARS),
@@ -65,30 +134,46 @@ class ChatHistoryService:
     def query(
         self,
         *,
-        query: str = "",
+        query: str | None = None,
         conversation_id: str | None = None,
         branch_id: str | None = None,
-        limit: int = DEFAULT_LIMIT,
-        offset: int = 0,
+        limit: int | None = None,
+        offset: int | None = None,
+        message_id: str | None = None,
+        before_turns: int | None = None,
+        after_turns: int | None = None,
         max_output_bytes: int = 64 * 1024,
+        requester_conversation_id: str | None = None,
     ) -> dict[str, Any]:
-        validate_history_params(
-            {
-                "query": query,
-                "conversation_id": conversation_id,
-                "branch_id": branch_id,
-                "limit": limit,
-                "offset": offset,
-            }
-        )
-        query = query.strip().casefold()
+        validate_history_params({key: value for key, value in {
+            "query": query, "conversation_id": conversation_id, "branch_id": branch_id,
+            "limit": limit, "offset": offset, "message_id": message_id,
+            "before_turns": before_turns, "after_turns": after_turns,
+        }.items() if value is not None})
         conversation_id = (conversation_id.strip() or None) if conversation_id else None
         branch_id = (branch_id.strip() or None) if branch_id else None
+        if message_id is not None:
+            return expand_context(
+                self._uow_factory, message_id=message_id.strip(),
+                conversation_id=conversation_id, branch_id=branch_id,
+                before_turns=DEFAULT_CONTEXT_TURNS if before_turns is None else before_turns,
+                after_turns=DEFAULT_CONTEXT_TURNS if after_turns is None else after_turns,
+                max_output_bytes=max_output_bytes,
+                requester_conversation_id=requester_conversation_id,
+                content_limit=MAX_CONTENT_CHARS, title_limit=MAX_TITLE_CHARS,
+            )
+        query = (query or "").strip().casefold()
+        limit = DEFAULT_LIMIT if limit is None else limit
+        offset = 0 if offset is None else offset
         rows: list[dict[str, Any]] = []
         originals: list[Message] = []
         has_more = False
         skipped = 0
         with self._uow_factory() as uow:
+            uow.begin_read()
+            policy = load_policy(uow, requester_conversation_id)
+            if policy.fresh_start:
+                conversation_id = requester_conversation_id
             conversations = (
                 {c.id: c for c in uow.conversations.list_all()} if conversation_id is None else {}
             )
@@ -96,6 +181,22 @@ class ChatHistoryService:
                 conversation = uow.conversations.get(conversation_id)
                 if conversation is not None:
                     conversations[conversation.id] = conversation
+            turn_cache: OrderedDict[tuple[str, str], bool] = OrderedDict()
+
+            def permits(message: Message) -> bool:
+                if not policy.rules:
+                    return True
+                if message.role is MessageRole.USER:
+                    return not policy.blocks(message.content, message.id)
+                key = message.branch_id, message.id
+                if key not in turn_cache:
+                    turn_access = _history_turn_access(uow, policy, message)
+                    for mid, permitted in turn_access.items():
+                        turn_cache[message.branch_id, mid] = permitted
+                        while len(turn_cache) > MAX_PRIVACY_CACHE_MESSAGES:
+                            turn_cache.popitem(last=False)
+                return turn_cache.get(key, False)
+
             messages = uow.messages.iter_chat_history(
                 conversation_id=conversation_id,
                 branch_id=branch_id,
@@ -103,11 +204,14 @@ class ChatHistoryService:
             try:
                 for message in messages:
                     conversation = conversations.get(message.conversation_id)
-                    if conversation is None or not message.content:
+                    if (conversation is None or not message.content
+                            or not permits(message)
+                            or policy.blocks(conversation.title)):
                         continue
+                    visible_title = "历史会话" if policy.rules else conversation.title
                     if (
                         query
-                        and query not in conversation.title.casefold()
+                        and query not in visible_title.casefold()
                         and query not in message.content.casefold()
                     ):
                         continue
@@ -118,12 +222,12 @@ class ChatHistoryService:
                         has_more = True
                         break
                     content, start = _excerpt(message.content, query, MAX_CONTENT_CHARS)
-                    title = conversation.title[:MAX_TITLE_CHARS]
+                    title = visible_title[:MAX_TITLE_CHARS]
                     rows.append(
                         {
                             "conversation_id": message.conversation_id,
                             "conversation_title": title,
-                            "title_truncated": title != conversation.title,
+                            "title_truncated": title != visible_title,
                             "branch_id": message.branch_id,
                             "message_id": message.id,
                             "role": message.role.value,

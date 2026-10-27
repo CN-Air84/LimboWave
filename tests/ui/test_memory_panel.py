@@ -53,14 +53,14 @@ def test_memory_subtabs_separate_settings_and_list_with_appearance_animation(qtb
     tabs, stack = panel._subtabs, panel._stack
     assert isinstance(tabs, AnimatedTabBar)
     assert isinstance(stack, AnimatedPageStack)
-    assert [tabs.tabText(i) for i in range(tabs.count())] == ["记忆注入", "记忆编辑"]
+    assert [tabs.tabText(i) for i in range(tabs.count())] == ["记忆注入", "记忆编辑", "翻篇与禁区"]
     assert tabs.objectName() == "memorySubtabs"
     assert tabs._indicator.objectName() == "memorySubtabIndicator"
-    assert stack.count() == 2
+    assert stack.count() == 3
     assert stack.current_index == 0
     assert panel.policy.isVisible() and panel.global_interval.isVisible()
     assert not panel.items.isVisible()
-    assert panel.findChildren(QPlainTextEdit) == []
+    assert not any(w.isVisible() for w in panel.findChildren(QPlainTextEdit))
     assert tabs.width() == tabs.preferred_width()
     left = tabs.mapTo(panel, QPoint()).x()
     assert abs(left - (panel.width() - left - tabs.width())) <= 2
@@ -78,7 +78,7 @@ def test_memory_subtabs_separate_settings_and_list_with_appearance_animation(qtb
     assert panel.new_button.text() == "添加记忆"
     assert not panel.delete_button.isEnabled()
     assert not panel.promote_button.isVisible()
-    assert panel.findChildren(QPlainTextEdit) == []
+    assert not any(w.isVisible() for w in panel.findChildren(QPlainTextEdit))
 
 
 def test_global_injection_settings_and_intervals(qtbot, memory_stack):

@@ -125,15 +125,18 @@ async def test_transport_snapshot_matches_mock_received_request(
     received = _read_jsonl(mock_log)
     assert received, "mock 应收到真实请求"
     actual_body = received[0]["body"]
-    actual_headers = received[0]["headers"]
+    # HTTP header names are case-insensitive; raw mock logs preserve wire spelling.
+    actual_headers = {name.lower(): value for name, value in received[0]["headers"].items()}
+    snapshot_headers = {name.lower(): value for name, value in transport.headers.items()}
 
+    assert transport.body == actual_body
     # 传输快照的请求体与 mock 实收一致（关键字段逐条对）
     for key in ("model", "stream", "max_completion_tokens"):
         assert transport.body.get(key) == actual_body.get(key), f"字段 {key} 不一致"
 
     # 密钥确实送达，但快照里只有脱敏视图
-    assert SECRET in actual_headers.get("Authorization", "")
-    assert transport.headers["Authorization"] == {
+    assert actual_headers.get("authorization") == f"Bearer {SECRET}"
+    assert snapshot_headers["authorization"] == {
         "present": True,
         "scheme": "Bearer",
         "value": "[REDACTED]",

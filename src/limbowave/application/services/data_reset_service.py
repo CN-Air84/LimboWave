@@ -19,7 +19,9 @@ RESET_WAIT_SECONDS = 5
 DATABASE_FILES = ("limbowave.db", "limbowave.db-wal", "limbowave.db-shm", "limbowave.db-journal")
 # 主密钥最后删：前面的删除失败时，尚未删除的加密内容仍有解锁途径。
 RESET_DIRECTORIES = ("blobs", "runtime", "themes", "vault")
-RESET_FILES = ("config.json", "preferences.json", "vault.tmp", "vault.json")
+RESET_FILES = (
+    "config.json", "preferences.json", "voice.json", "voice.json.tmp", "vault.tmp", "vault.json",
+)
 
 
 class ResetScope(StrEnum):

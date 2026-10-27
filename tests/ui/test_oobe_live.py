@@ -107,6 +107,25 @@ def test_add_and_choose_explicit_default_model(setup, qtbot):
     assert config.default_model_id == "chosen"
     assert config.models[0].bindings[0].model_id == "chosen"
     assert len(config.actual_models) == 2
+    finished = []
+    page.finished.connect(lambda: finished.append(True))
+    for expected in ("voice_settings", "voice", "network"):
+        page._primary.click()
+        assert page.screen_id == expected
+        assert gate._settings.load().default_model_id == "chosen"
+        assert not finished and not gate._closed
+    # Reverse navigation must not recreate/reselect a model or close the gate.
+    page._secondary.click()
+    assert page.screen_id == "voice"
+    page._secondary.click()
+    assert page.screen_id == "voice_settings"
+    page._secondary.click()
+    assert page.screen_id == "voice"
+    page._primary.click()
+    assert page.screen_id == "network"
+    page._primary.click()
+    assert finished == [True] and gate._closed
+    assert gate._settings.load().default_model_id == "chosen"
 
 
 def test_failed_discovery_keeps_manual_configuration_available(setup, monkeypatch, qtbot):
@@ -326,3 +345,102 @@ def test_endpoint_save_failure_stays_on_form_and_starts_no_request(setup, monkey
     assert page._display_name.text() == "  我的服务商  "
     assert not pending
     assert not gate._settings.load().endpoints
+
+def test_live_optional_editors_are_lazy_and_visiting_does_not_save(setup, qtbot):
+    from limbowave.ui.network_settings_page import NetworkSettingsPage
+    from limbowave.ui.voice_settings import VoiceSettingsPage
+
+    page, gate, pending = setup
+    config = gate._paths.data_root / "config.json"
+    voice = gate._paths.data_root / "voice.json"
+    secrets = gate._paths.data_root / "vault" / "secrets.json"
+    before = {p: p.read_bytes() if p.exists() else None for p in (config, voice, secrets)}
+    assert not page._optional_settings_pages
+    assert page.findChild(VoiceSettingsPage) is None
+    for screen, settings_screen, kind in (
+        ("voice", "voice_settings", VoiceSettingsPage),
+        ("network", "network_settings", NetworkSettingsPage),
+    ):
+        if screen == "voice":
+            page.show_screen(settings_screen)
+        else:
+            page.show_screen(screen)
+            page._optional_settings_button.click()
+        assert page.screen_id == settings_screen
+        editor = page._optional_settings_pages[page.screen_id]
+        assert isinstance(editor, kind)
+        field = editor.transcription.key if screen == "voice" else editor.key
+        field.setText("unsaved-private-secret")
+        page._primary.click()
+        assert page.screen_id == screen
+        qtbot.wait(300)
+        assert field.text() == ""
+    assert pending == []
+    for path, content in before.items():
+        assert (path.read_bytes() if path.exists() else None) == content
+
+
+def test_live_voice_settings_save_uses_real_encrypted_credentials(setup):
+    page, gate, pending = setup
+    page.show_screen("voice_settings")
+    editor = page._optional_settings_pages["voice_settings"]
+    editor.transcription.enabled.setChecked(True)
+    editor.transcription.url.setText("https://speech.example/v1")
+    editor.transcription.model.setText("configured-stt")
+    editor.transcription.key.setText("oobe-voice-secret")
+    editor.save_button.click()
+    assert "已保存" in editor.feedback.text()
+    assert editor.transcription.key.text() == ""
+    assert pending == []
+    from limbowave.application.services.voice_service import VoiceSettingsService
+    service = VoiceSettingsService(gate._paths.data_root / "voice.json", gate._credentials)
+    settings = service.load()
+    assert settings.transcription.enabled and not settings.speech.enabled
+    assert service.secret_for(settings.transcription.credential_ref) == "oobe-voice-secret"
+    assert "oobe-voice-secret" not in service.path.read_text(encoding="utf-8")
+    assert "oobe-voice-secret" not in (gate._paths.data_root / "vault" / "secrets.json").read_text()
+    page._primary.click()
+    assert page.screen_id == "voice"
+
+
+def test_live_network_settings_save_preserves_models_and_no_probe(setup):
+    page, gate, pending = setup
+    from limbowave.domain.network import SearchProvider
+    previous = gate._settings.load()
+    page.show_screen("network_settings")
+    editor = page._optional_settings_pages["network_settings"]
+    editor.provider.setCurrentIndex(editor.provider.findData(SearchProvider.TAVILY.value))
+    editor.key.setText("oobe-network-secret")
+    editor.save_button.click()
+    assert "已保存" in editor.feedback.text()
+    assert editor.key.text() == ""
+    config = gate._settings.load()
+    assert config.network.search_provider is SearchProvider.TAVILY
+    assert gate._credentials.resolve(config.network.credential_ref) == "oobe-network-secret"
+    assert config.models == previous.models
+    assert config.endpoints == previous.endpoints
+    assert config.default_model_id == previous.default_model_id
+    assert pending == []
+    assert "oobe-network-secret" not in (gate._paths.data_root / "config.json").read_text()
+    page._secondary.click()
+    assert page.screen_id == "network"
+
+
+def test_live_configuration_failure_stays_editable_and_can_skip(setup, monkeypatch):
+    page, gate, pending = setup
+    page.show_screen("voice_settings")
+    editor = page._optional_settings_pages["voice_settings"]
+    editor.transcription.enabled.setChecked(True)
+    editor.transcription.url.setText("https://speech.example/v1")
+    editor.transcription.model.setText("configured-stt")
+    editor.transcription.key.setText("private-not-in-error")
+    def fail(*args):
+        raise OSError("internal path private-not-in-error")
+    monkeypatch.setattr(gate._credentials, "store_secret", fail)
+    editor.save_button.click()
+    assert page.screen_id == "voice_settings"
+    assert "private-not-in-error" not in editor.feedback.text()
+    assert not (gate._paths.data_root / "voice.json").exists()
+    page._secondary.click()
+    assert page.screen_id == "voice"
+    assert pending == []

@@ -322,3 +322,50 @@ async def test_rate_limit_capability_is_separate_from_tool_authorization() -> No
     finally:
         await ipc.stop()
     assert ipc.rate_limit_session is None
+
+
+async def test_capability_snapshot_is_authenticated_read_only_and_not_cached():
+    recorder = _Recorder()
+    calls = []
+    state = {"status": "unconfigured"}
+
+    async def snapshot(conversation_id, run_id):
+        calls.append((conversation_id, run_id))
+        if run_id != "current":
+            raise RuntimeError("secret must not appear in error")
+        return {"version": 1, "run_id": run_id, "capabilities": {
+            "web_search": {"status": state["status"]},
+        }}
+
+    ipc = ToolIpcServer(recorder, conversation_provider=lambda: "trusted",
+                        capability_snapshot=snapshot)
+    await ipc.start()
+    try:
+        token = ipc.session.token
+        request = {"operation": "capability_snapshot", "run_id": "current",
+                   "conversation_id": "forged", "confirmed": True}
+        assert not (await _call(ipc, {**request, "token": "wrong"}))["ok"]
+        assert calls == []
+        response = await _call(ipc, {**request, "token": token})
+        assert response["data"]["capabilities"]["web_search"]["status"] == "unconfigured"
+        assert calls == [("trusted", "current")]
+        state["status"] = "restricted"
+        response = await _call(ipc, {**request, "token": token})
+        assert response["data"]["capabilities"]["web_search"]["status"] == "restricted"
+        for run_id in (None, "", " " , "x" * 201, "stale"):
+            response = await _call(ipc, {**request, "token": token, "run_id": run_id})
+            assert not response["ok"]
+            assert "secret" not in str(response)
+        assert recorder.calls == []
+        assert ipc.stats.tools == {}
+    finally:
+        await ipc.stop()
+
+
+async def test_capability_snapshot_without_provider_fails_closed(server):
+    ipc, recorder = server
+    response = await _call(ipc, {
+        "token": ipc.session.token, "operation": "capability_snapshot", "run_id": "r",
+    })
+    assert not response["ok"]
+    assert recorder.calls == []

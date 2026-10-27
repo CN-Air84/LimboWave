@@ -67,6 +67,7 @@ class _VerticalTabRail(QFrame):
         self.setObjectName("settingsRail")
         self.setFixedWidth(190)
         self._buttons: list[QPushButton] = []
+        self._group_labels: list[QLabel] = []
         self._current = 0
         self._group = QButtonGroup(self)
         self._group.setExclusive(True)
@@ -87,6 +88,17 @@ class _VerticalTabRail(QFrame):
     @property
     def current_index(self) -> int:
         return self._current
+
+    @property
+    def group_titles(self) -> tuple[str, ...]:
+        return tuple(label.text() for label in self._group_labels)
+
+    def add_group(self, text: str) -> None:
+        label = QLabel(text)
+        label.setObjectName("settingsGroupLabel")
+        label.setFixedHeight(24)
+        self._layout.insertWidget(self._layout.count() - 1, label)
+        self._group_labels.append(label)
 
     def add_tab(self, text: str) -> int:
         index = len(self._buttons)
@@ -321,6 +333,7 @@ class SettingsPage(QWidget):
     restore_requested = Signal()
     reset_requested = Signal()
     appearance_changed = Signal(object)
+    voice_changed = Signal(object)
     presence_changed = Signal(object)
     reminder_notifications_changed = Signal(object)
     reminder_sound_preview_requested = Signal()
@@ -337,6 +350,7 @@ class SettingsPage(QWidget):
         credentials: Any,
         *,
         preferences: Any = None,
+        voice_service: Any = None,
         appearance_themes: Any = None,
         vault: Any = None,
         request_logs: Any = None,
@@ -350,6 +364,7 @@ class SettingsPage(QWidget):
         self._discovery_cache: dict[str, tuple[EndpointConfig, DiscoveryResult]] = {}
         self._settings = settings
         self._credentials = credentials
+        self._voice_service = voice_service
         self._preferences = preferences
         self._appearance_themes = appearance_themes
         self._vault = vault
@@ -414,19 +429,30 @@ class SettingsPage(QWidget):
         body_layout.addWidget(content, 1)
         root.addWidget(body, 1)
 
+        self._rail.add_group("模型与连接")
         self._add_lazy_page("逻辑模型", self._build_models)
         self._add_lazy_page("站点端点", self._build_endpoints)
+        self._add_lazy_page("联网搜索", self._build_network)
+
         self._appearance_index = -1
+        if preferences is not None or voice_service is not None:
+            self._rail.add_group("使用体验")
         if preferences is not None:
             self._appearance_index = self._add_lazy_page("外观", self._build_appearance)
             self._add_lazy_page("提醒通知", self._build_reminders)
             self._add_lazy_page("低压在场", self._build_presence)
+        if voice_service is not None:
+            self._add_lazy_page("语音", self._build_voice)
+
+        self._rail.add_group("数据与隐私")
         if memories is not None:
             self._add_lazy_page("记忆", self._build_memory)
         self._add_lazy_page("数据与安全", self._build_data_security)
         if lan_panel is not None:
             self._add_lazy_page("局域网访问", self._build_lan)
         self._request_log_index = self._add_page("请求日志", _RequestLogTab(None, None, self))
+
+        self._rail.add_group("其他")
         self._add_lazy_page("关于", self._build_about)
         self._rail.tab_selected.connect(self._on_tab_selected)
         # Install inherited QSS before building controls, not after polishing a
@@ -509,6 +535,21 @@ class SettingsPage(QWidget):
             self.reminder_sound_preview_requested.emit,
         )
         return self._scroll_page(self._reminder_notifications_tab)
+
+    def _build_network(self) -> QWidget:
+        from limbowave.application.services.network_settings_service import NetworkSettingsService
+        from limbowave.ui.network_settings_page import NetworkSettingsPage
+
+        return self._scroll_page(NetworkSettingsPage(
+            NetworkSettingsService(self._settings, self._credentials),
+        ))
+
+    def _build_voice(self) -> QWidget:
+        from limbowave.ui.voice_settings import VoiceSettingsPage
+
+        page = VoiceSettingsPage(self._voice_service)
+        page.changed.connect(self.voice_changed.emit)
+        return self._scroll_page(page)
 
     def _build_presence(self) -> QWidget:
         from limbowave.ui.gentle_presence import PresenceSettingsPage
@@ -789,6 +830,9 @@ class SettingsPage(QWidget):
             #settingsContent {{ background: {theme.BG_APP}; border: none; }}
             #settingsIndicator {{ background: {theme.tab_indicator_surface()}; border: none;
                 border-radius: 2px; }}
+            QLabel#settingsGroupLabel {{ background: transparent; border: none;
+                color: {theme.TEXT_SECONDARY}; font-size: {theme.FS_TINY}px; font-weight: 600;
+                padding: 6px 10px 0 10px; }}
             QPushButton[settingsTab="true"] {{ background: transparent; border: none;
                 border-radius: {theme.RADIUS_MD}px; color: {theme.TEXT_SECONDARY};
                 text-align: left; padding: 0 14px 0 24px; font-weight: 500; }}

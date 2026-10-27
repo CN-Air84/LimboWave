@@ -239,6 +239,12 @@ def evaluate(
     3. 有匹配授权且在范围内：放行。
     4. 无匹配授权：要求确认（用户可授予本次或本会话）。
     """
+    if request.tool_name == "web_search":
+        return PermissionDecision(
+            decision=Decision.CONFIRM, risk=RiskLevel.NORMAL,
+            reason="搜索词会发送给已配置的外部搜索服务；每次搜索需确认",
+            matched_rule="network.search_per_call",
+        )
     if request.capability is Capability.HISTORY_READ:
         return PermissionDecision(
             decision=Decision.CONFIRM,
@@ -257,7 +263,9 @@ def evaluate(
         return PermissionDecision(
             decision=Decision.CONFIRM if creating else Decision.ALLOW,
             risk=RiskLevel.NORMAL,
-            reason=("创建提醒后应用会在指定时间向本会话发送通知，请确认时间和内容"
+            reason=(("创建周期提醒后会持续通知，直到取消；请确认周期、时区、首次时间和内容"
+                     if request.raw_params.get("recurrence") else
+                     "创建提醒后应用会在指定时间向本会话发送通知，请确认时间和内容")
                     if creating else "仅查看或取消当前会话的提醒，不读取其他会话"),
             matched_rule="reminder.create" if creating else "reminder.manage",
         )

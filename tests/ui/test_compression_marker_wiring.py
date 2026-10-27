@@ -106,6 +106,7 @@ async def test_apply_and_rollback_refresh_only_after_success(monkeypatch, succes
         ),
         "run_blocking": blocking, "_run_compression": result, "setup": None,
         "compression_run": SimpleNamespace(task=None, abortable=False),
+        "_compression_settings": lambda: SimpleNamespace(profile="companion"),
         "chat": SimpleNamespace(set_status=lambda text: None),
         "FloatingPanel": Panel, "window": None,
         "Qt": SimpleNamespace(WindowType=SimpleNamespace(Widget=1)),
@@ -118,6 +119,7 @@ async def test_apply_and_rollback_refresh_only_after_success(monkeypatch, succes
         return SimpleNamespace(usage=None)
 
     namespace["compression"].estimate = estimate
+    callback("_open_compression_preview", namespace)
     compress = callback("_do_compress", namespace)
     await compress()
     assert not refreshed
@@ -142,3 +144,94 @@ async def test_branch_payload_uses_process_without_local_projection():
     load = callback("_load_branch_payload", namespace)
     assert await load("branch") is payload
     assert calls == [("history_payload", (None, "branch"), "branch")]
+
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change_scope", [False, True])
+async def test_history_reads_existing_versions_without_calling_a_model(change_scope):
+    scope = SimpleNamespace(conversation_id="c1")
+    coordinator = SimpleNamespace(branch_id="b1", kernel=None, busy=True)
+    opened = []
+    statuses = []
+
+    async def blocking(operation):
+        value = operation()
+        if change_scope:
+            coordinator.branch_id = "other"
+        return value
+
+    async def open_preview(*args):
+        opened.append(args)
+
+    namespace = {
+        "controller": scope, "preview_scope": None,
+        "compression": SimpleNamespace(
+            get_active=lambda bid: SimpleNamespace(id="accepted"),
+            list_versions=lambda bid: [SimpleNamespace(id="latest")],
+        ),
+        "run_blocking": blocking, "_open_compression_preview": open_preview,
+        "chat": SimpleNamespace(set_status=statuses.append),
+    }
+    scope.coordinator = lambda: coordinator
+    show = callback("_show_compression_history", namespace)
+    await show()
+    assert opened == ([] if change_scope else [("accepted", "c1", "b1")])
+    assert not statuses
+
+
+
+@pytest.mark.parametrize("active,versions,expected", [
+    ("active", ["older", "newer"], "active"),
+    (None, ["older", "newer"], "newer"),
+    (None, [], None),
+])
+async def test_history_opens_without_generation_or_kernel(active, versions, expected):
+    opened, statuses = [], []
+
+    async def blocking(fn):
+        return fn()
+
+    async def open_preview(*args):
+        opened.append(args)
+
+    coordinator = SimpleNamespace(branch_id="b1", kernel=None)
+    ns = {
+        "controller": SimpleNamespace(conversation_id="c1", coordinator=lambda: coordinator),
+        "preview_scope": None,
+        "compression": SimpleNamespace(
+            get_active=lambda bid: SimpleNamespace(id=active) if active else None,
+            list_versions=lambda bid: [SimpleNamespace(id=vid) for vid in versions],
+        ),
+        "run_blocking": blocking,
+        "_open_compression_preview": open_preview,
+        "chat": SimpleNamespace(set_status=statuses.append),
+    }
+    await callback("_show_compression_history", ns)()
+    assert opened == ([(expected, "c1", "b1")] if expected else [])
+    assert bool(statuses) is (expected is None)
+
+
+async def test_history_discards_late_result_after_branch_switch():
+    opened = []
+    coordinator = SimpleNamespace(branch_id="b1")
+
+    async def blocking(fn):
+        result = fn()
+        coordinator.branch_id = "b2"
+        return result
+
+    async def open_preview(*args):
+        opened.append(args)
+
+    ns = {
+        "controller": SimpleNamespace(conversation_id="c1", coordinator=lambda: coordinator),
+        "preview_scope": None,
+        "compression": SimpleNamespace(get_active=lambda bid: SimpleNamespace(id="active"),
+                                       list_versions=lambda bid: []),
+        "run_blocking": blocking,
+        "_open_compression_preview": open_preview,
+        "chat": SimpleNamespace(set_status=lambda text: None),
+    }
+    await callback("_show_compression_history", ns)()
+    assert not opened

@@ -31,6 +31,7 @@ from limbowave.application.services.configuration_service import ConfigurationSe
 from limbowave.domain.configuration import AppConfiguration
 from limbowave.domain.model_matching import MatchPlan, logical_for_actual, plan_for_logical
 from limbowave.domain.models import ActualModel, LogicalModel, ModelBinding, ModelCapability
+from limbowave.domain.network import NetworkSettings
 from limbowave.domain.providers import EndpointConfig
 
 _KEEP = object()  # 哨兵：default_model_id 不传 = 保持原值；显式传 None = 清除
@@ -54,6 +55,7 @@ def _rebuild(
         ),
         compression=config.compression,
         memory=config.memory,
+        network=config.network,
     )
 
 
@@ -104,6 +106,11 @@ class SettingsService:
     def _save(self, config: AppConfiguration) -> AppConfiguration:
         self._configuration.save(config)
         return config
+
+    def update_network(self, network: NetworkSettings) -> AppConfiguration:
+        config = self.load().model_dump()
+        config["network"] = network.model_dump()
+        return self._save(AppConfiguration.model_validate(config))
 
     # ---------- 站点端点 ----------
 

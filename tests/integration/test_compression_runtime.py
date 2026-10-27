@@ -11,6 +11,7 @@ from limbowave.application.kernel import KernelSetup
 from limbowave.application.services.compression_service import CompressionService
 from limbowave.application.services.run_coordinator import RunContext, RunCoordinator
 from limbowave.composition import build_kernel
+from limbowave.domain.compaction import CompressionProfile
 from limbowave.infrastructure.crypto.vault import VaultKey
 from limbowave.infrastructure.memory_repositories import InMemoryStore, in_memory_uow_factory
 from tests.integration.test_recovery_e2e import _paths, _seed, _send_and_wait
@@ -24,10 +25,12 @@ def requests(path: Path) -> list[dict]:
     ]
 
 
+@pytest.mark.parametrize("profile", list(CompressionProfile))
 async def test_real_compaction_isolation_tail_resume_and_rollback(
     tmp_path: Path,
     mock_provider: tuple[int, Path],
     vault_key: VaultKey,
+    profile: CompressionProfile,
 ):
     port, log = mock_provider
     paths = _paths(tmp_path)
@@ -46,7 +49,8 @@ async def test_real_compaction_isolation_tail_resume_and_rollback(
     service = CompressionService(factory)
     try:
         await coord.start()
-        await _send_and_wait(coord, "OLD-CANARY-DO-NOT-REPLAY " + "x" * 10000)
+        source_chars = 38000 if profile is CompressionProfile.COMPANION else 10000
+        await _send_and_wait(coord, "OLD-CANARY-DO-NOT-REPLAY " + "x" * source_chars)
         await coord.wait_idle()
         conversation, branch = coord.conversation_id, coord.branch_id
         version = service.create_version(
@@ -55,10 +59,22 @@ async def test_real_compaction_isolation_tail_resume_and_rollback(
             tokens_before=42000,
             compression_model_id=setup.logical_model_id,
             compression_endpoint_id=setup.endpoint_id,
+            profile=profile,
         )
         original = await kernel.get_entries()
+        before_preview = len(requests(log))
         assert await service.generate_isolated(version.id, kernel, timeout=60)
         assert await kernel.get_entries() == original, "Preview changed the live Pi tree"
+        if profile is CompressionProfile.COMPANION:
+            distillation_requests = requests(log)[before_preview:]
+            assert len(distillation_requests) >= 3
+            for request in distillation_requests:
+                body = json.dumps(request["body"], ensure_ascii=False)
+                assert "陪伴型上下文压缩器" in body
+                assert "上一段蒸馏" in body
+                # Native new_session must discard prior batches, not accumulate raw history.
+                assert body.count("x") < source_chars
+
         await _send_and_wait(coord, "TAIL-AFTER-PREVIEW")
         await coord.wait_idle()
         before = await kernel.get_context_usage()

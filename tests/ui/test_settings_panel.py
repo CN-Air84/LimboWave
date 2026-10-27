@@ -46,7 +46,8 @@ def test_data_security_page_relays_data_requests(
     page.select_tab("数据与安全")
 
     titles = [button.text() for button in page._rail._buttons]
-    assert titles == ["逻辑模型", "站点端点", "数据与安全", "请求日志", "关于"]
+    assert titles == ["逻辑模型", "站点端点", "联网搜索", "数据与安全", "请求日志", "关于"]
+    assert page._rail.group_titles == ("模型与连接", "数据与隐私", "其他")
     merged = page._pages._stack.currentWidget()
     assert merged is not None
     security = merged.findChild(_SecurityTab)
@@ -117,6 +118,46 @@ class _Store:
 
     def refs(self) -> list[str]:
         return []
+
+
+def test_settings_page_groups_optional_tabs_by_purpose(
+    qtbot: QtBot,
+    tmp_path: Path,
+    vault_key: VaultKey,
+) -> None:
+    from PySide6.QtWidgets import QWidget
+
+    from limbowave.application.services.preferences_service import PreferencesService
+
+    settings = SettingsService(ConfigurationService(JsonConfigRepository(tmp_path / "config.json")))
+    credentials = CredentialService(SecretStore(vault_key, tmp_path / "vault" / "secrets.json"))
+    page = SettingsPage(
+        None,
+        settings,
+        credentials,
+        preferences=PreferencesService(tmp_path / "preferences.json"),
+        voice_service=object(),
+        memories=object(),
+        lan_panel=QWidget(),
+    )
+    qtbot.addWidget(page)
+
+    assert page._rail.group_titles == ("模型与连接", "使用体验", "数据与隐私", "其他")
+    assert [button.text() for button in page._rail._buttons] == [
+        "逻辑模型",
+        "站点端点",
+        "联网搜索",
+        "外观",
+        "提醒通知",
+        "低压在场",
+        "语音",
+        "记忆",
+        "数据与安全",
+        "局域网访问",
+        "请求日志",
+        "关于",
+    ]
+    assert all(not label.focusPolicy() for label in page._rail._group_labels)
 
 
 def test_settings_page_fills_parent_and_uses_vertical_tabs(

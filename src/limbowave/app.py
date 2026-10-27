@@ -971,8 +971,23 @@ def _wire_impl(
     # 模型发起的工具调用经扩展薄代理送到这里，由应用统一执行：
     # 参数校验 → 权限与资源范围 → 高影响检查 → 执行 → 输出限制 → 审计。
     # 因此执行器、权限、审计都只有**一份实现**。
+    from limbowave.application.services.configuration_service import ConfigurationService
+    from limbowave.application.services.credential_service import CredentialService
     from limbowave.application.services.permission_service import PermissionService
+    from limbowave.application.services.settings_service import SettingsService
     from limbowave.application.services.tool_gateway import ToolGateway
+    from limbowave.infrastructure.configuration.json_config_repository import JsonConfigRepository
+    from limbowave.infrastructure.crypto.secret_store import SecretStore
+    from limbowave.infrastructure.network_backend import create_network_tools
+
+    settings = SettingsService(
+        ConfigurationService(JsonConfigRepository(paths.data_root / "config.json"))
+    )
+    credentials = (
+        CredentialService(SecretStore(key, paths.data_root / "vault" / "secrets.json"))
+        if key is not None
+        else None
+    )
 
     permissions = PermissionService(uow_factory)
     # 附件文档服务（read_document 的执行后端）在这里就要建好：工具通道先于内核
@@ -996,6 +1011,7 @@ def _wire_impl(
     environment_service = create_environment_service()
     tool_gateway = ToolGateway(
         permissions, paths.data_root, documents=files, terminal=terminal,
+        network=create_network_tools(settings, credentials),
         chat_history=ChatHistoryService(uow_factory), environment=environment_service,
     )
     # 装配可观测：read_document 报「文档服务未配置」时，先看这条日志——
@@ -1006,6 +1022,18 @@ def _wire_impl(
     )
     # 控制器稍后才建：派发经持有者延迟取会话标识（闭包在调用时才解引用）
     holder: dict[str, object] = {}
+
+    async def _capability_snapshot(conversation_id: str, run_id: str) -> dict[str, Any]:
+        context = tool_gateway.memory_context()
+        if (context is None or context.run_id != run_id
+                or context.conversation_id != conversation_id
+                or shutting_down or resetting or restoring):
+            raise RuntimeError("能力快照运行上下文已失效")
+        snapshot = await run_blocking(tool_gateway.runtime_capabilities, conversation_id)
+        if (tool_gateway.memory_context() != context
+                or shutting_down or resetting or restoring):
+            raise RuntimeError("能力快照运行上下文已改变")
+        return {**snapshot, "run_id": run_id}
 
     async def _dispatch_tool(
         tool_name: str, params: dict[str, object], conversation_id: str, confirmed: bool
@@ -1061,6 +1089,7 @@ def _wire_impl(
         tool_ipc = ToolIpcServer(
             _dispatch_tool,
             rate_limit=request_limiter.try_acquire,
+            capability_snapshot=_capability_snapshot,
             conversation_provider=lambda: getattr(
                 holder.get("controller"), "conversation_id", None
             ),
@@ -1135,25 +1164,21 @@ def _wire_impl(
         controller.coordinator().storage_worker = conversation_process
 
     # 三个查询/管理服务（只读或经服务层落盘；窗口不直接碰仓库）
-    from limbowave.application.services.configuration_service import ConfigurationService
     from limbowave.application.services.conversation_title_service import (
         ConversationTitleService,
     )
-    from limbowave.application.services.credential_service import CredentialService
     from limbowave.application.services.history_service import ConversationSummary, HistoryService
     from limbowave.application.services.memory_service import MemoryService
     from limbowave.application.services.request_log_service import RequestLogService
-    from limbowave.application.services.settings_service import SettingsService
-    from limbowave.infrastructure.configuration.json_config_repository import (
-        JsonConfigRepository,
-    )
-    from limbowave.infrastructure.crypto.secret_store import SecretStore
 
     memories = MemoryService(
         uow_factory, ConfigurationService(JsonConfigRepository(paths.data_root / "config.json"))
     )
     _run_startup_task(memories.ensure_builtin_preset)
     controller.set_memory_service(memories)
+    memories.privacy.is_busy = lambda: (
+        controller.busy or queue_dispatching or compression_run.task is not None
+    )
     tool_gateway.memory_service = memories
     tool_gateway.memory_context = lambda: controller.memory_context
     from limbowave.application.services.reminder_service import ReminderService
@@ -1166,23 +1191,17 @@ def _wire_impl(
         context = controller.memory_context
         if context is None or shutting_down or resetting or restoring:
             return None
-        return ReminderContext(context.conversation_id, context.branch_id)
+        return ReminderContext(
+            context.conversation_id, context.branch_id, context.user_message_id,
+        )
 
     tool_gateway.reminder_context = _reminder_context
     history = HistoryService(uow_factory)
     history_reader = HistoryReader()
     history_list_generation = 0
-    conversation_titles = ConversationTitleService()
+    conversation_titles = ConversationTitleService(privacy=memories.privacy)
     request_logs = RequestLogService(uow_factory)
-    settings = SettingsService(
-        ConfigurationService(JsonConfigRepository(paths.data_root / "config.json"))
-    )
     request_limiter.configure(settings.load().endpoints)
-    credentials = (
-        CredentialService(SecretStore(key, paths.data_root / "vault" / "secrets.json"))
-        if key is not None
-        else None
-    )
 
     # Phase 4：文件 / 剪贴板 / 图片 / 附件装配。blob 仓与 FileService 已在
     # 工具网关之前建好（read_document 需要）；这里补齐其余服务并接装配器。
@@ -1217,6 +1236,16 @@ def _wire_impl(
         allowed=lambda: key is not None and not resetting and not restoring and not shutting_down,
     )
     rollback.callback(reminder_notifications.shutdown)
+
+    from limbowave.application.services.voice_service import VoiceSettingsService
+    from limbowave.ui.voice_controller import VoiceController
+
+    voice_service = VoiceSettingsService(paths.data_root / "voice.json", credentials)
+    voice_controller = VoiceController(
+        window.chat, voice_service,
+        allowed=lambda: key is not None and not resetting and not restoring and not shutting_down,
+    )
+    rollback.callback(voice_controller.shutdown)
 
     def _load_appearance_themes() -> AppearanceThemeService:
         legacy = preferences.load()
@@ -1865,9 +1894,9 @@ def _wire_impl(
     compression_trigger = CompressionTrigger()
     usage_refresh_generation = {"value": 0}
 
-    def _compression_settings() -> object:
-        from limbowave.domain.configuration import CompressionSettings
+    from limbowave.domain.configuration import CompressionSettings
 
+    def _compression_settings() -> CompressionSettings:
         return settings.load().compression or CompressionSettings()
 
     async def _refresh_usage() -> None:
@@ -1879,7 +1908,7 @@ def _wire_impl(
         config_settings = _compression_settings()
         report = await compression.estimate(
             controller.coordinator().kernel,
-            settings=config_settings,  # type: ignore[arg-type]
+            settings=config_settings,
         )
         if (
             preview_scope is not None
@@ -1959,6 +1988,7 @@ def _wire_impl(
         *,
         automatic: bool = False,
         retry_version_id: str | None = None,
+        profile: str | None = None,
     ) -> None:
         coordinator = controller.coordinator()
         conversation_id, branch_id = controller.conversation_id, coordinator.branch_id
@@ -1975,11 +2005,16 @@ def _wire_impl(
             return
         try:
             compression_run.task = asyncio.current_task()
+            from limbowave.domain.compaction import CompressionProfile
+
+            selected_profile = CompressionProfile(profile or _compression_settings().profile)
             if retry_version_id is not None:
                 previous = await run_blocking(compression.get, retry_version_id)
                 if previous is None or previous.branch_id != branch_id:
                     chat.set_status("请先切回该压缩版本所属的分支")
                     return
+                if profile is None:
+                    selected_profile = previous.profile
             if (
                 preview_scope is not None
                 or coordinator.kernel is not kernel
@@ -1998,47 +2033,78 @@ def _wire_impl(
                     tokens_before=report.usage.tokens if report.usage else 0,
                     compression_model_id=setup.logical_model_id if setup else "",
                     compression_endpoint_id=setup.endpoint_id if setup else "",
+                    profile=selected_profile,
                 )
                 await _run_compression(version.id, kernel)
 
-            from limbowave.ui.compression_widgets import CompressionPreviewDialog
-
-            panel = FloatingPanel(window, "压缩预览", width=760)
-            dialog = CompressionPreviewDialog(compression, version.id, panel, runtime_managed=True)
-            dialog.setWindowFlags(Qt.WindowType.Widget)
-
-            async def apply_version(version_id: str, edited: str) -> None:
-                ok = await coordinator.apply_compression(version_id, edited_summary=edited)
-                if ok:
-                    compression_trigger.mark_handled(branch_id)
-                    await _refresh_compression_markers(conversation_id, branch_id)
-                if shiboken6.isValid(dialog):
-                    dialog.finish_runtime_change(ok)
-                await _refresh_usage()
-
-            async def rollback_version(target_branch: str) -> None:
-                ok = await coordinator.rollback_compression(target_branch)
-                if ok:
-                    await _refresh_compression_markers(conversation_id, target_branch)
-                if shiboken6.isValid(dialog):
-                    dialog.finish_runtime_change(ok, rollback=True)
-                await _refresh_usage()
-
-            dialog.apply_requested.connect(lambda vid, text: _spawn(apply_version(vid, text)))
-            dialog.rollback_requested.connect(lambda bid: _spawn(rollback_version(bid)))
-            dialog.retry_requested.connect(lambda vid: _spawn(_retry_compress(vid)))
-            panel.content_layout.addWidget(dialog, 1)
-            dialog.finished.connect(panel.close_panel)
-            panel.popup()
+            await _open_compression_preview(version.id, conversation_id, branch_id)
             await _refresh_usage()
         finally:
             if compression_run.task is asyncio.current_task():
                 compression_run.task = None
             compression_trigger.finish(ticket)
 
-    async def _retry_compress(version_id: str) -> None:
+    async def _open_compression_preview(
+        version_id: str, conversation_id: str, branch_id: str,
+    ) -> None:
+        from limbowave.ui.compression_widgets import CompressionPreviewDialog
+
+        coordinator = controller.coordinator()
+        if (preview_scope is not None or controller.conversation_id != conversation_id
+                or coordinator.branch_id != branch_id):
+            return
+        panel = FloatingPanel(window, "压缩记忆 · 版本与预览", width=800)
+        dialog = CompressionPreviewDialog(compression, version_id, panel, runtime_managed=True)
+        dialog.setWindowFlags(Qt.WindowType.Widget)
+
+        async def apply_version(version_id: str, edited: str) -> None:
+            ok = await coordinator.apply_compression(version_id, edited_summary=edited)
+            if ok:
+                compression_trigger.mark_handled(branch_id)
+                await _refresh_compression_markers(conversation_id, branch_id)
+            if shiboken6.isValid(dialog):
+                dialog.finish_runtime_change(ok)
+            await _refresh_usage()
+
+        async def rollback_version(target_branch: str) -> None:
+            ok = await coordinator.rollback_compression(target_branch)
+            if ok:
+                await _refresh_compression_markers(conversation_id, target_branch)
+            if shiboken6.isValid(dialog):
+                dialog.finish_runtime_change(ok, rollback=True)
+            await _refresh_usage()
+
+        dialog.apply_requested.connect(lambda vid, text: _spawn(apply_version(vid, text)))
+        dialog.rollback_requested.connect(lambda bid: _spawn(rollback_version(bid)))
+        dialog.retry_requested.connect(lambda vid, kind: _spawn(_retry_compress(vid, kind)))
+        panel.content_layout.addWidget(dialog, 1)
+        dialog.finished.connect(panel.close_panel)
+        panel.popup()
+
+    async def _show_compression_history() -> None:
+        conversation_id = controller.conversation_id
+        branch_id = controller.coordinator().branch_id
+        if conversation_id is None or branch_id is None or preview_scope is not None:
+            chat.set_status("请先打开需要查看压缩版本的会话")
+            return
+
+        def read() -> str | None:
+            active = compression.get_active(branch_id)
+            versions = compression.list_versions(branch_id)
+            return active.id if active else (versions[-1].id if versions else None)
+
+        version_id = await run_blocking(read)
+        if (controller.conversation_id != conversation_id
+                or controller.coordinator().branch_id != branch_id or preview_scope is not None):
+            return
+        if version_id is None:
+            chat.set_status("当前分支还没有压缩版本；生成并预览后会保留在这里")
+            return
+        await _open_compression_preview(version_id, conversation_id, branch_id)
+
+    async def _retry_compress(version_id: str, profile: str | None = None) -> None:
         """Claim the shared guard before even reading the previous version."""
-        await _do_compress(retry_version_id=version_id)
+        await _do_compress(retry_version_id=version_id, profile=profile)
 
     chat.compress_requested.connect(lambda: _spawn(_do_compress()))
 
@@ -2479,6 +2545,9 @@ def _wire_impl(
         view.message_queued.connect(lambda text: _enqueue_text(view, text))
         view.queue_cancel_requested.connect(_cancel_queued)
         view.queue_resume_requested.connect(_resume_queue)
+        view.reminder_context_requested.connect(lambda message_id: _open_reminder_from_view(
+            view, message_id,
+        ))
 
     def _kick_queue() -> None:
         nonlocal queue_running
@@ -2545,7 +2614,7 @@ def _wire_impl(
                     # Explicitly estimate the restored target, not the visible preview.
                     report = await compression.estimate(
                         controller.coordinator().kernel,
-                        settings=_compression_settings(),  # type: ignore[arg-type]
+                        settings=_compression_settings(),
                     )
                     if report.action.value == "block":
                         raise RuntimeError("目标会话上下文接近上限，请压缩后继续队列")
@@ -2645,6 +2714,28 @@ def _wire_impl(
             else:
                 surface.clear_search_matches()
 
+    def _open_reminder_from_view(view: ChatView, message_id: str) -> None:
+        scope = (preview_scope if view is window.history_preview else
+                 detached_scope or (controller.conversation_id, controller.branch_id))
+        if scope is not None and scope[0] is not None and scope[1] is not None:
+            _open_reminder_notification((scope[0], scope[1], message_id))
+
+    async def _resolve_reminder_context(target: tuple[str, str, str]) -> None:
+        if reminders is None or shutting_down or resetting or restoring:
+            return
+        resolved = await history_reader.read(reminders.context_for_notice, *target)
+        if shutting_down or resetting or restoring:
+            return
+        # A prompt may have appeared while disk work was in progress.
+        if (QApplication.activeModalWidget() is not None
+                or QApplication.activePopupWidget() is not None
+                or any(panel.isVisible() for panel in window.findChildren(FloatingPanel))):
+            return
+        if resolved is None:
+            chat.set_status("原约定已无法定位；提醒所属会话或分支可能已被删除。")
+            return
+        await _open_search_target((*resolved, ""), preview_only=True)
+
     def _open_reminder_notification(target: tuple[str, str, str]) -> None:
         if shutting_down or resetting or restoring:
             return
@@ -2664,7 +2755,7 @@ def _wire_impl(
                 return
             window.show_workspace(release_page=False)
         # A click is navigation, not consent to resume/switch a model runtime.
-        _spawn(_open_search_target((*target, ""), preview_only=True))
+        _spawn(_resolve_reminder_context(target))
 
     reminder_notifications.open_requested.connect(_open_reminder_notification)
     sidebar.search_hit_selected.connect(lambda target: _spawn(_open_search_target(target)))
@@ -2734,6 +2825,7 @@ def _wire_impl(
             settings,
             credentials,
             preferences=preferences,
+            voice_service=voice_service,
             appearance_themes=appearance_themes,
             vault=Vault(paths.data_root / "vault.json"),
             request_logs=request_logs,
@@ -2747,6 +2839,7 @@ def _wire_impl(
         page.reminder_notifications_changed.connect(reminder_notifications.configure)
         page.reminder_sound_preview_requested.connect(reminder_notifications.preview_sound)
         page.presence_changed.connect(gentle_presence.configure)
+        page.voice_changed.connect(voice_controller.configure)
 
         def _bind_settings_tab(title: str, _widget: QWidget) -> None:
             # Do not instantiate hidden categories merely to wire their services.
@@ -2929,12 +3022,12 @@ def _wire_impl(
         page.prepare_open(controller.conversation_id, initial_tab)
         window.show_full_page(page)
 
-    async def _on_new_conversation() -> None:
+    async def _on_new_conversation(*, fresh_start: bool = False) -> None:
         nonlocal preview_scope, detached_scope
         if chat.history_loading or queue_dispatching:
             return
         _remember_drafts()
-        if await controller.new_session():
+        if await controller.new_session(fresh_start=fresh_start):
             drafts.pop((None, None), None)
             chat.set_draft(ComposerDraft())
             preview_scope = None
@@ -2942,7 +3035,7 @@ def _wire_impl(
             window.clear_history_preview()
             toolbar.setEnabled(True)
             chat.clear_transcript()
-            chat.set_status("新会话")
+            chat.set_status("翻篇聊天 · 不带入过去" if fresh_start else "新会话")
             permission_preset_draft[0] = PermissionPreset.CHAT_ONLY
             permission_custom_draft.clear()
             chat.set_permission_preset(PermissionPreset.CHAT_ONLY)
@@ -3392,7 +3485,9 @@ def _wire_impl(
                 + "应用将停止当前任务，自动保留现有资料库，再恢复备份并重启；"
                 + "失败会自动回退，无需手动替换文件夹。" + NL + NL
                 + f"恢复前数据保留位置：{prepared.previous}" + NL
-                + "重启后请使用本次备份密码解锁；系统保护恢复需重新启用。",
+                + "重启后请使用本次备份密码解锁；系统保护恢复需重新启用。" + NL
+                + "隐私提醒：旧备份可能不含后来设置的话题禁区和翻篇边界。"
+                + "恢复后请先在记忆面板核对禁区，再发送消息，避免重新召回已排除资料。",
                 _confirm,
                 confirm_text="恢复并重启",
                 danger=True,
@@ -3645,6 +3740,11 @@ def _wire_impl(
         panel.setMinimumHeight(min(560, max(0, window.height() - 28)))
         viewer = MemoryPanel(memories, panel, conversation_id=conversation_id, branch_id=branch_id)
         panel.content_layout.addWidget(viewer, 1)
+        def fresh_chat() -> None:
+            panel.close_panel()
+            _spawn(_on_new_conversation(fresh_start=True))
+
+        viewer.privacy.fresh_requested.connect(fresh_chat)
 
         def _scope_changed(_event: Any) -> None:
             if (controller.conversation_id, controller.branch_id) != (conversation_id, branch_id):
@@ -4336,6 +4436,7 @@ def _wire_impl(
         lambda model_id, endpoint_id: _spawn(_apply_logical_model(model_id, endpoint_id))
     )
     toolbar.compress_requested.connect(lambda: _spawn(_do_compress()))
+    toolbar.compression_history_requested.connect(lambda: _spawn(_show_compression_history()))
     toolbar.attach_requested.connect(_attach_files)
     # 「实际站点」上拉候选框：选行即会话级站点覆盖（§四.3）
     toolbar.endpoint_override_requested.connect(_on_override_endpoint)
@@ -4607,6 +4708,7 @@ def _wire_impl(
     async def _shutdown() -> None:
         nonlocal shutting_down
         shutting_down = True
+        voice_controller.shutdown()
         gentle_presence.shutdown()
         reminder_notifications.shutdown()
         send_queue.clear()

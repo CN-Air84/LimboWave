@@ -86,7 +86,7 @@ def callbacks(monkeypatch):
     compression = SimpleNamespace(
         estimate=estimate,
         get_active=lambda branch_id: active[0],
-        get=lambda version_id: SimpleNamespace(id=version_id, branch_id="b1"),
+        get=lambda version_id: SimpleNamespace(id=version_id, branch_id="b1", profile="task"),
         create_version=lambda *args, **kwargs: SimpleNamespace(id="version", branch_id="b1"),
     )
     namespace = {
@@ -98,7 +98,7 @@ def callbacks(monkeypatch):
         "usage_refresh_generation": {"value": 0},
         "compression_trigger": trigger,
         "compression": compression,
-        "_compression_settings": lambda: SimpleNamespace(auto_preview=True),
+        "_compression_settings": lambda: SimpleNamespace(auto_preview=True, profile="companion"),
         "_run_compression": generate,
         "run_blocking": run_blocking,
         "chat": SimpleNamespace(
@@ -114,7 +114,8 @@ def callbacks(monkeypatch):
     }
     source = Path(__file__).parents[2] / "src/limbowave/app.py"
     tree = ast.parse(source.read_text(encoding="utf-8"))
-    names = {"_do_compress", "_refresh_usage", "_retry_compress", "_abort_compression"}
+    names = {"_do_compress", "_refresh_usage", "_retry_compress", "_abort_compression",
+             "_open_compression_preview"}
     functions = [
         node for node in ast.walk(tree)
         if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)) and node.name in names
@@ -310,3 +311,18 @@ async def test_old_block_usage_cannot_overwrite_post_apply_refresh(callbacks, la
     finally:
         release_old_read.set()
         await asyncio.gather(old, return_exceptions=True)
+
+
+
+async def test_new_compressions_use_default_and_retries_keep_or_change_profile(callbacks):
+    profiles = []
+
+    def create(*args, **kwargs):
+        profiles.append(kwargs["profile"])
+        return SimpleNamespace(id="version", branch_id="b1")
+
+    callbacks.compression.create_version = create
+    await callbacks.namespace["_do_compress"]()
+    await callbacks.namespace["_retry_compress"]("version")
+    await callbacks.namespace["_retry_compress"]("version", "companion")
+    assert profiles == ["companion", "task", "companion"]

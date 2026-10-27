@@ -198,3 +198,43 @@ def test_preview_rollback_clears_active(qtbot: QtBot, service: CompressionServic
 
     assert service.get_active("b1") is None
     assert rolled == ["b1"]
+
+
+
+def test_companion_template_selection_only_affects_new_version(qtbot, service):
+    from limbowave.domain.compaction import CompressionProfile
+
+    version = service.create_version("c1", "b1", tokens_before=100, compression_model_id="m",
+                                     compression_endpoint_id="e",
+                                     profile=CompressionProfile.COMPANION)
+    service.record_result(version.id, "生活事件与偏好", 20)
+    dialog = CompressionPreviewDialog(service, version.id)
+    qtbot.addWidget(dialog)
+    qtbot.waitUntil(lambda: dialog._versions.count() > 0)
+    assert "陪伴记忆" in dialog._meta.text()
+    assert "来源" in dialog._meta.text()
+    assert "提示词 v2" in dialog._versions.item(0).text()
+    assert dialog._profile.currentData() == "companion"
+    dialog._profile.setCurrentIndex(dialog._profile.findData("task"))
+    with qtbot.waitSignal(dialog.retry_requested) as signal:
+        dialog._on_retry()
+    assert signal.args == [version.id, "task"]
+    assert service.get(version.id).profile is CompressionProfile.COMPANION
+
+
+def test_history_selection_keeps_requested_version_and_restores_old(qtbot, service):
+    older = _make_preview_version(service)
+    service.accept(older)
+    newer = _make_preview_version(service)
+    service.accept(newer)
+    dialog = CompressionPreviewDialog(service, newer)
+    qtbot.addWidget(dialog)
+    qtbot.waitUntil(lambda: dialog._versions.count() == 2)
+    assert dialog._version_id == newer
+    dialog._versions.setCurrentRow(0)
+    assert dialog._version_id == older
+    assert dialog._accept_btn.text() == "恢复并启用此版本"
+    with qtbot.waitSignal(dialog.accepted):
+        dialog._on_accept()
+    assert service.get_active("b1").id == older
+    assert len(service.list_versions("b1")) == 2

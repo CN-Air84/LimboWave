@@ -12,6 +12,11 @@ from uuid import uuid4
 
 from limbowave.application.repositories import UnitOfWork, UnitOfWorkFactory
 from limbowave.application.services.configuration_service import ConfigurationService
+from limbowave.application.services.privacy_service import (
+    PrivacyService,
+    allowed_memory,
+    load_policy,
+)
 from limbowave.domain.footprint import MemoryFootprint
 from limbowave.domain.memory import (
     MemoryDocument,
@@ -157,6 +162,7 @@ class MemoryService:
     def __init__(self, uow_factory: UnitOfWorkFactory, configuration: ConfigurationService) -> None:
         self._uow_factory = uow_factory
         self._configuration = configuration
+        self.privacy = PrivacyService(uow_factory)
         self._approvals: dict[tuple[str, str], tuple[MemoryRunContext, str]] = {}
         self._approval_lock = Lock()
         self._mutations: dict[tuple[str, str], tuple[MemoryRunContext, MemoryMutation]] = {}
@@ -447,13 +453,25 @@ class MemoryService:
             uow.commit()
             return item
 
+    def privacy_allows_model_memory(self, context: MemoryRunContext) -> bool:
+        with self._uow_factory() as uow:
+            policy = load_policy(uow, context.conversation_id)
+            if not policy.rules:
+                return True
+            message = uow.messages.get(context.user_message_id)
+            return (message is not None
+                    and not policy.blocks(message.content, message.id))
+
     def prompt_context(self, context: MemoryRunContext, round_number: int) -> dict[str, object]:
         settings = self.settings()
         with _MEMORY_WRITE_LOCK, self._uow_factory() as uow:
             uow.begin_read()
             _validate_scope(uow, context.conversation_id, context.branch_id)
-            global_items = _effective_global(uow, context.conversation_id)
-            session_items = _items(uow.memories.get(_key(context.branch_id)))
+            policy = load_policy(uow, context.conversation_id)
+            global_items = [i for i in _effective_global(uow, context.conversation_id)
+                            if allowed_memory(policy, i, global_item=True)]
+            session_items = [i for i in _items(uow.memories.get(_key(context.branch_id)))
+                             if allowed_memory(policy, i)]
             pad = _scratchpad(uow.memories.get(f"scratchpad:{context.branch_id}"))
         return {
             "run_id": context.run_id,
@@ -463,7 +481,7 @@ class MemoryService:
             "session": [i.content for i in session_items],
             "global_interval": settings.global_interval,
             "session_interval": settings.session_interval,
-            "scratchpad": asdict(pad),
+            "scratchpad": asdict(Scratchpad() if policy.rules else pad),
         }
 
     def search(
@@ -481,6 +499,7 @@ class MemoryService:
         with _MEMORY_WRITE_LOCK, self._uow_factory() as uow:
             uow.begin_read()
             _validate_scope(uow, conversation_id, branch_id)
+            policy = load_policy(uow, conversation_id)
             groups: dict[str, builtins.list[MemoryItem]] = {}
             if scope in {"all", "session"}:
                 groups["session"] = _items(uow.memories.get(_key(branch_id)))
@@ -491,6 +510,8 @@ class MemoryService:
         matches = []
         for kind, items in groups.items():
             for item in items:
+                if not allowed_memory(policy, item, global_item=kind == "global"):
+                    continue
                 text = item.content.casefold()
                 if query.strip() == item.id or all(token in text for token in tokens):
                     title = item.content.splitlines()[0].casefold()

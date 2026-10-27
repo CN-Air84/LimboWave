@@ -409,6 +409,33 @@ class _Messages:
         finally:
             cursor.close()
 
+    def page_chat_history(
+        self, conversation_id: str, branch_id: str, *, limit: int,
+        cursor: tuple[datetime, str] | None = None, forward: bool = False,
+        upper: tuple[datetime, str, bool] | None = None,
+    ) -> list[Message]:
+        clauses = ["conversation_id = ?", "branch_id = ?"]
+        args: list[Any] = [conversation_id, branch_id]
+        if cursor is not None:
+            operator = ">" if forward else "<"
+            clauses.append(f"(created_at, id) {operator} (?, ?)")
+            args.extend((_iso(cursor[0]), cursor[1]))
+        if upper is not None:
+            operator = "<=" if upper[2] else "<"
+            clauses.append(f"(created_at, id) {operator} (?, ?)")
+            args.extend((_iso(upper[0]), upper[1]))
+        args.append(limit)
+        order = "ASC" if forward else "DESC"
+        rows = self._conn.execute(
+            "SELECT id, role, content_enc, created_at, status, run_id FROM messages WHERE "
+            + " AND ".join(clauses) + f" ORDER BY created_at {order}, id {order} LIMIT ?", args,
+        ).fetchall()
+        return [Message(
+            id=r[0], conversation_id=conversation_id, branch_id=branch_id,
+            role=MessageRole(r[1]), content=self._key.decrypt(r[2]),
+            created_at=_parse_iso(r[3]), status=MessageStatus(r[4]), run_id=r[5],
+        ) for r in rows]
+
     def history_position(self, message_id: str) -> tuple[str, str, datetime] | None:
         row = self._conn.execute(
             "SELECT conversation_id, branch_id, created_at FROM messages WHERE id = ?",

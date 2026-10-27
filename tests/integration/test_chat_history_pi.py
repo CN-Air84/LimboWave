@@ -24,8 +24,12 @@ from tests.unit.test_chat_history import history_stack as history_stack
         (PermissionPreset.FULL_ACCESS, DENY),
     ],
 )
+@pytest.mark.parametrize("history_params", [
+    {"query": "Docker", "conversation_id": "other"},
+    {"message_id": "m2", "conversation_id": "other", "before_turns": 2, "after_turns": 3},
+])
 async def test_actual_pi_history_query_respects_approval(
-    mock_models, mock_provider, history_stack, tmp_path, monkeypatch, preset, answer
+    mock_models, mock_provider, history_stack, tmp_path, monkeypatch, preset, answer, history_params
 ):
     port, _log = mock_provider
     _, permissions, gateway, _ = history_stack
@@ -71,7 +75,7 @@ async def test_actual_pi_history_query_respects_approval(
                     {
                         "name": "query_chat_history",
                         "id": f"history-{turn}",
-                        "arguments": {"query": "Docker", "conversation_id": "other"},
+                        "arguments": history_params,
                     }
                 ).encode(),
                 headers={"Content-Type": "application/json"},
@@ -92,3 +96,8 @@ async def test_actual_pi_history_query_respects_approval(
         assert result.ok
         assert result.data["results"][0]["message_id"] == "m2"
         assert "PRIVATE_THINKING" not in json.dumps(result.data)
+
+        if "message_id" in history_params:
+            assert result.data["mode"] == "context"
+            assert result.data["anchor_message_id"] == "m2"
+            assert result.data["requested_after_turns"] == 3

@@ -1,4 +1,4 @@
-"""One-shot reminders; only metadata is stored in plaintext by adapters."""
+"""Persistent reminders; only metadata is stored in plaintext by adapters."""
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
@@ -14,6 +14,15 @@ class ReminderStatus(StrEnum):
 class ReminderContext:
     conversation_id: str
     branch_id: str
+    source_message_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ReminderRecurrence:
+    frequency: str
+    timezone: str
+    local_time: str
+    weekday: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,3 +35,5 @@ class Reminder:
     created_at: datetime
     status: ReminderStatus = ReminderStatus.PENDING
     completed_at: datetime | None = None
+    recurrence: ReminderRecurrence | None = None
+    source_message_id: str | None = None

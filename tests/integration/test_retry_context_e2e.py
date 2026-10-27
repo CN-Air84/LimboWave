@@ -42,9 +42,11 @@ def _user_texts(body: dict) -> list[str]:
         else "".join(block.get("text", "") for block in message["content"])
         for message in body["messages"] if message["role"] == "user"
     ]
-    # Pi maps extension custom messages to role=user. The ephemeral document
-    # manifest is checked separately, and is not an application user turn.
-    return [text for text in texts if not text.startswith("当前分支持久附件清单（")]
+    # Pi maps extension custom messages to role=user. Transient document and
+    # capability overlays are checked separately, not application user turns.
+    return [text for text in texts if not text.startswith((
+        "当前分支持久附件清单（", "运行时能力快照 CAP-01（",
+    ))]
 
 
 @pytest.mark.parametrize("with_document", [False, True])
@@ -111,6 +113,10 @@ async def test_retry_request_context_has_one_copy_of_turn(
         assert [request["http_status"] for request in received] == [503, 503, 200]
         expected = [_compose_prompt("same input", payload.document_note)] * (2 if prior_turn else 1)
         assert [_user_texts(request["body"]) for request in received] == [expected] * 3
+        for request in received:
+            messages_json = json.dumps(request["body"]["messages"], ensure_ascii=False)
+            assert messages_json.count("运行时能力快照 CAP-01") == 1
+            assert "web_search: unknown" in messages_json  # No metadata IPC in this fixture.
         if with_document:
             for request in received:
                 messages_json = json.dumps(request["body"]["messages"], ensure_ascii=False)

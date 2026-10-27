@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from threading import Event
 
 from PySide6.QtCore import QEvent, QEventLoop, QObject, Signal
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QWidget
 
 from limbowave.application.services.configuration_service import ConfigurationService
 from limbowave.application.services.credential_service import CredentialService
@@ -66,6 +66,10 @@ class _Gate(QObject):
         self._credentials = CredentialService(
             SecretStore(key, paths.data_root / "vault" / "secrets.json")
         )
+        self._paths = paths
+        page.configure_optional_settings(
+            voice=self._build_voice_settings, network=self._build_network_settings,
+        )
         self._loop = QEventLoop()
         self._running = False
         self._closed = False
@@ -90,6 +94,20 @@ class _Gate(QObject):
         app = QApplication.instance()
         if app is not None:
             app.installEventFilter(self)
+
+    def _build_voice_settings(self) -> QWidget:
+        from limbowave.application.services.voice_service import VoiceSettingsService
+        from limbowave.ui.voice_settings import VoiceSettingsPage
+
+        return VoiceSettingsPage(VoiceSettingsService(
+            self._paths.data_root / "voice.json", self._credentials,
+        ))
+
+    def _build_network_settings(self) -> QWidget:
+        from limbowave.application.services.network_settings_service import NetworkSettingsService
+        from limbowave.ui.network_settings_page import NetworkSettingsPage
+
+        return NetworkSettingsPage(NetworkSettingsService(self._settings, self._credentials))
 
     def wait(self) -> None:
         if self._closed:
@@ -119,6 +137,11 @@ class _Gate(QObject):
         if self._closed:
             return
         self._closed = True
+        from shiboken6 import isValid
+
+        if isValid(self._page):
+            self._page.clear_optional_secrets()
+            self._page._stop_introduction_activity()
         self._cancelled.set()
         self._limiter.stop()
         self._executor.shutdown(wait=False, cancel_futures=True)

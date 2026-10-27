@@ -147,6 +147,11 @@ class HttpEnvironmentProvider:
                 if _CREDENTIAL_FILTER not in logger.filters:
                     logger.addFilter(_CREDENTIAL_FILTER)
 
+    @property
+    def configured(self) -> bool:
+        """CAP-01 metadata only; never return the provider credential itself."""
+        return self._provider == "open-meteo" or (self._provider == "msn" and bool(self._api_key))
+
     def domains(self, *, has_location: bool) -> tuple[str, ...]:
         host = "api.msn.com" if self._provider == "msn" else "api.open-meteo.com"
         return ("geocoding-api.open-meteo.com", host) if has_location else (host,)

@@ -174,6 +174,8 @@ class AgentKernel(ABC):
 
     async def set_memory_context(self, context: dict[str, object]) -> None:
         """可选的独立记忆上下文通道；不支持的内核不得污染用户原文。"""
+        if context.get("privacy") is not None:
+            raise NotImplementedError("当前内核不支持硬性隐私上下文边界，未发送")
         if context.get("global") or context.get("session"):
             raise NotImplementedError("当前内核不支持记忆上下文")
 

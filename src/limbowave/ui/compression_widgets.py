@@ -17,6 +17,7 @@ from collections.abc import Callable
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QMouseEvent, QTextCursor
 from PySide6.QtWidgets import (
+    QComboBox,
     QDialog,
     QDialogButtonBox,
     QHBoxLayout,
@@ -34,7 +35,12 @@ from PySide6.QtWidgets import (
 from limbowave.application.services.compression_service import (
     CompressionService,
 )
-from limbowave.domain.compaction import CompressionContext, CompressionVersion
+from limbowave.domain.compaction import (
+    CompressionContext,
+    CompressionProfile,
+    CompressionStatus,
+    CompressionVersion,
+)
 from limbowave.ui import theme
 from limbowave.ui.floating import FloatingPanel
 
@@ -50,13 +56,11 @@ class CompressionDivider(QWidget):
         title = "会话已压缩" if context.is_active else "历史压缩"
         detail = "当前生效版本" if context.is_active else "非当前生效版本"
         timestamp = version.created_at.astimezone().strftime("%Y-%m-%d %H:%M")
-        tooltip = (
-            f"{timestamp} · {detail}\n"
-            "此分隔线上方为本次压缩覆盖的历史，原始消息仍保留。"
-        )
+        tooltip = f"{timestamp} · {detail}\n此分隔线上方为本次压缩覆盖的历史，原始消息仍保留。"
         if version.tokens_before > 0 and version.tokens_after > 0:
-            tooltip += (f"\n上下文 tokens（估算）：{version.tokens_before:,}"
-                        f" → {version.tokens_after:,}")
+            tooltip += (
+                f"\n上下文 tokens（估算）：{version.tokens_before:,} → {version.tokens_after:,}"
+            )
         self.setToolTip(tooltip)
         self.setAccessibleName(title)
         self.setAccessibleDescription(tooltip)
@@ -168,7 +172,7 @@ class CompressionPreviewDialog(QDialog):
     apply_requested = Signal(str, str)  # version_id, edited_summary
     rollback_requested = Signal(str)  # branch_id
     accepted = Signal(str)  # version_id
-    retry_requested = Signal(str)  # version_id
+    retry_requested = Signal(str, str)  # version_id, profile for the new version
     rolled_back = Signal(str)  # branch_id
 
     def __init__(
@@ -176,7 +180,8 @@ class CompressionPreviewDialog(QDialog):
         service: CompressionService,
         version_id: str,
         parent: QWidget | None = None,
-        *, runtime_managed: bool = False,
+        *,
+        runtime_managed: bool = False,
     ) -> None:
         super().__init__(parent)
         self._runtime_managed = runtime_managed
@@ -191,8 +196,16 @@ class CompressionPreviewDialog(QDialog):
         self.resize(720, 540)
 
         self._branch_id = ""
+        self._active_version_id: str | None = None
 
         root = QVBoxLayout(self)
+        notice = QLabel(
+            "摘要仅用于当前分支，不会自动写入全局记忆。原始消息保留；"
+            "选择历史版本可恢复，也可回退到未压缩。"
+        )
+        notice.setWordWrap(True)
+        notice.setProperty("hint", True)
+        root.addWidget(notice)
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
         # 左：版本历史
@@ -218,12 +231,25 @@ class CompressionPreviewDialog(QDialog):
         self._summary.setPlaceholderText("摘要内容…")
         right_layout.addWidget(self._summary, 1)
 
+        template_row = QHBoxLayout()
+        template_label = QLabel("重新生成模板")
+        self._profile = QComboBox()
+        self._profile.setAccessibleName("重新生成模板")
+        for profile in (CompressionProfile.COMPANION, CompressionProfile.TASK):
+            self._profile.addItem(profile.label, profile.value)
+        self._profile.setToolTip("只影响重新生成的新版本，不改写所选历史版本")
+        template_label.setBuddy(self._profile)
+        template_row.addWidget(template_label)
+        template_row.addWidget(self._profile)
+        template_row.addStretch(1)
+        right_layout.addLayout(template_row)
+
         ops = QHBoxLayout()
         self._accept_btn = QPushButton("接受并启用")
         self._accept_btn.setProperty("accent", True)
         self._accept_btn.clicked.connect(self._on_accept)
         ops.addWidget(self._accept_btn)
-        retry_btn = QPushButton("重试")
+        retry_btn = QPushButton("重新生成")
         retry_btn.clicked.connect(self._on_retry)
         ops.addWidget(retry_btn)
         reject_btn = QPushButton("拒绝")
@@ -248,7 +274,8 @@ class CompressionPreviewDialog(QDialog):
 
         self.setEnabled(False)
         self._jobs.submit(
-            lambda: service.get(version_id), self._loaded,
+            lambda: service.get(version_id),
+            self._loaded,
             lambda exc: self._meta.setText(str(exc)),
         )
 
@@ -277,8 +304,12 @@ class CompressionPreviewDialog(QDialog):
                 return
             active, versions = data
             self._version_cache = {version.id: version for version in versions}
+            self._active_version_id = active.id if active is not None else None
+            selected = self._version_id
+            self._versions.blockSignals(True)
             self._versions.clear()
-            for v in versions:
+            selected_row = -1
+            for row, v in enumerate(versions):
                 status_text = {
                     "draft": "草稿",
                     "previewed": "预览",
@@ -289,24 +320,42 @@ class CompressionPreviewDialog(QDialog):
                 mark = "● " if active is not None and v.id == active.id else ""
                 error_mark = " ⚠" if v.status.value == "failed" else ""
                 item = QListWidgetItem(
-                    f"{mark}{v.created_at.astimezone():%m-%d %H:%M}  {status_text}{error_mark}"
+                    f"{mark}{v.created_at.astimezone():%Y-%m-%d %H:%M}  {status_text}{error_mark}"
+                    f"\n{v.profile.label} · 提示词 v{v.prompt_version}"
                 )
                 item.setData(Qt.ItemDataRole.UserRole, v.id)
                 self._versions.addItem(item)
+                if v.id == selected:
+                    selected_row = row
+            self._versions.setCurrentRow(selected_row)
+            self._versions.blockSignals(False)
+            if selected in self._version_cache:
+                self._render(self._version_cache[selected])
 
         self._jobs.submit(read, apply, lambda exc: self._meta.setText(str(exc)))
 
     def _render(self, version: CompressionVersion) -> None:
         self._version_id = version.id
+        self._profile.setCurrentIndex(self._profile.findData(version.profile.value))
+        self._accept_btn.setText(
+            "保存并保持启用"
+            if version.id == self._active_version_id
+            else "恢复并启用此版本"
+            if version.status is CompressionStatus.ACCEPTED
+            else "接受并启用"
+        )
         if version.status.value == "failed":
             self._meta.setText(f"生成失败：{version.error or '未知错误'}。原始上下文未改动。")
             self._summary.setPlainText("")
             self._summary.setEnabled(False)
             self._accept_btn.setEnabled(False)
             return
-        self._summary.setEnabled(True)
-        self._accept_btn.setEnabled(True)
+        ready = version.status in {CompressionStatus.PREVIEWED, CompressionStatus.ACCEPTED}
+        self._summary.setEnabled(ready)
+        self._accept_btn.setEnabled(ready)
         self._meta.setText(
+            f"{version.profile.label} · {version.created_at.astimezone():%Y-%m-%d %H:%M:%S}"
+            f" · 来源 {len(version.input_message_ids)} 条消息\n"
             f"压缩前约 {version.tokens_before} tokens"
             f" → 压缩后约 {version.tokens_after} tokens（估算）"
             f"　·　压缩模型 {version.compression_model_id}"
@@ -359,7 +408,7 @@ class CompressionPreviewDialog(QDialog):
         self._change(work, lambda: self.accepted.emit(version_id))
 
     def _on_retry(self) -> None:
-        self.retry_requested.emit(self._version_id)
+        self.retry_requested.emit(self._version_id, self._profile.currentData())
 
     def _on_reject(self) -> None:
         version_id = self._version_id
@@ -371,14 +420,15 @@ class CompressionPreviewDialog(QDialog):
             self.setEnabled(False)
             self.rollback_requested.emit(branch_id)
             return
-        self._change(lambda: self._service.rollback(branch_id),
-                     lambda: self.rolled_back.emit(branch_id))
+        self._change(
+            lambda: self._service.rollback(branch_id), lambda: self.rolled_back.emit(branch_id)
+        )
 
     def finish_runtime_change(self, success: bool, *, rollback: bool = False) -> None:
         """Called only after the runtime transition and database commit have settled."""
         self.setEnabled(True)
         if not success:
-            self._meta.setText('未能应用：请确认当前分支空闲且运行时可恢复。启用版本未擅自改变。')
+            self._meta.setText("未能应用：请确认当前分支空闲且运行时可恢复。启用版本未擅自改变。")
             return
         self._reload_versions()
         if rollback:
@@ -407,9 +457,7 @@ class CompressionThinkingPanel(FloatingPanel):
         super().__init__(parent, "压缩 · 思考过程", width=520)
         header = QHBoxLayout()
         self._status = QLabel(self.THINKING)
-        self._status.setStyleSheet(
-            f"color: {theme.TEXT_SECONDARY}; font-size: {theme.FS_SMALL}px;"
-        )
+        self._status.setStyleSheet(f"color: {theme.TEXT_SECONDARY}; font-size: {theme.FS_SMALL}px;")
         header.addWidget(self._status, 1)
         self._stop = QPushButton("停止")
         self._stop.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -421,9 +469,7 @@ class CompressionThinkingPanel(FloatingPanel):
         self._text = QPlainTextEdit()
         self._text.setReadOnly(True)
         self._text.setFixedHeight(260)  # 定高滚动：流式追加不把面板越撑越高
-        self._text.setStyleSheet(
-            f"color: {theme.TEXT_SECONDARY}; font-size: {theme.FS_SMALL}px;"
-        )
+        self._text.setStyleSheet(f"color: {theme.TEXT_SECONDARY}; font-size: {theme.FS_SMALL}px;")
         self.content_layout.addWidget(self._text)
 
         # 贴底跟随：内容增高靠 rangeChanged 跟进（排版是延迟的，

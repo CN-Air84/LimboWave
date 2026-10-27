@@ -144,7 +144,9 @@ def test_advanced_actions_exclude_details(qtbot: QtBot) -> None:
     bar.set_session_available(True)
     bar.show()
 
-    assert [button.text() for button in bar._action_buttons] == ["压缩", "模式", "步骤", "记忆"]
+    assert [button.text() for button in bar._action_buttons] == [
+        "压缩", "模式", "步骤", "记忆", "版本",
+    ]
     assert all(button.text() != "详情" for button in bar.findChildren(QPushButton))
     assert all(button.isVisible() and button.isEnabled() for button in bar._action_buttons)
 
@@ -833,3 +835,14 @@ def test_thinking_choices_intersect_runtime_capabilities(qtbot, declared, runtim
     # 切换到另一模型时，旧运行时范围不能残留。
     bar.set_thinking_capability(True, runtime_levels=("off", "low"))
     assert not model.item(THINKING_LEVELS.index("high")).isEnabled()
+
+
+
+def test_compression_history_does_not_require_a_model(qtbot):
+    bar = SessionToolbar()
+    qtbot.addWidget(bar)
+    bar.set_session_available(False)
+    bar.show()
+    with qtbot.waitSignal(bar.compression_history_requested):
+        qtbot.mouseClick(bar._compression_history_btn, Qt.MouseButton.LeftButton)
+    assert not bar._action_row.slider_active

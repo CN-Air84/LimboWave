@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
+from io import BytesIO
 from pathlib import Path
 
 import pytest
+from PIL import Image
 
 from limbowave.application.services.run_coordinator import RunContext, RunCoordinator
 from limbowave.domain.run import RunStatus
@@ -16,7 +19,32 @@ from tests.integration.test_pi_adapter import mock_models as _mock_models
 
 route_models = _mock_models
 
-PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a5n8AAAAASUVORK5CYII="
+PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+ip1sAAAAASUVORK5CYII="
+
+
+def test_original_image_fixture_has_valid_png_checksums() -> None:
+    # Only the old fixture's broken IDAT CRC changed; pixel bytes are unchanged.
+    with Image.open(BytesIO(base64.b64decode(PNG, validate=True))) as image:
+        assert image.format == "PNG"
+        assert image.size == (1, 1)
+        image.verify()
+
+
+def assert_original_image_for_turn(body: dict, user_text: str) -> None:
+    # Application custom context can become another wire-level user message.
+    # Match this turn's exact text, never the last user role or any historical image.
+    matching = [
+        message for message in body["messages"]
+        if message["role"] == "user" and isinstance(message["content"], list)
+        and "".join(part["text"] for part in message["content"] if part["type"] == "text")
+        == user_text
+    ]
+    assert len(matching) == 1, f"Expected exactly one user message for {user_text!r}"
+    sent_images = [part for part in matching[0]["content"] if part["type"] == "image_url"]
+    # Exact data URL equality preserves every image byte, not just an image count.
+    assert sent_images == [
+        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{PNG}"}}
+    ]
 
 
 async def settled(coord: RunCoordinator) -> None:
@@ -61,6 +89,9 @@ async def test_replacement_sends_selected_model_and_original_images(
         await coord.start()
         first = await coord.send("original", attachment_ids=["image"], images=images)
         await settled(coord)
+        assert store.runs[first].status is RunStatus.COMPLETED, store.runs[first].error
+        first_wire = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+        assert_original_image_for_turn(first_wire[-1]["body"], "original")
         snapshot = await adapter.export_runtime_state()
         selected = RunContext(
             logical_model_id="flash",
@@ -87,11 +118,9 @@ async def test_replacement_sends_selected_model_and_original_images(
         wire = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
         body = wire[-1]["body"]
         assert body["model"] == "selected-flash"
-        last_user = next(m for m in reversed(body["messages"]) if m["role"] == "user")
-        sent_images = [part for part in last_user["content"] if part["type"] == "image_url"]
-        assert sent_images == [
-            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{PNG}"}}
-        ]
+        assert len(wire) > len(first_wire), "Replacement must produce a new provider request"
+        expected_text = "edited" if replacement == "fork" else "after restore"
+        assert_original_image_for_turn(body, expected_text)
         transport = next(t for t in store.transports.values() if t.run_id == run)
         assert transport.provider == "selected-relay"
         assert transport.model_id == "selected-flash"

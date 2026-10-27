@@ -111,6 +111,11 @@ class EnvironmentService:
         self._cache: OrderedDict[tuple[Any, ...], _Cached] = OrderedDict()
         self._lock = Lock()
 
+    @property
+    def configured(self) -> bool:
+        """Optional provider readiness, without fetching location or weather."""
+        return bool(getattr(self._provider, "configured", True))
+
     def domains(self, params: dict[str, Any]) -> tuple[str, ...]:
         return self._provider.domains(has_location="location" in params)
 

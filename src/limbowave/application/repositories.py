@@ -81,6 +81,14 @@ class MessageRepository(Protocol):
         """Newest-first stored visible content only; no thinking, tools or runtime payloads."""
         ...
 
+    def page_chat_history(
+        self, conversation_id: str, branch_id: str, *, limit: int,
+        cursor: tuple[datetime, str] | None = None, forward: bool = False,
+        upper: tuple[datetime, str, bool] | None = None,
+    ) -> list[Message]:
+        """Bounded keyset public-body projection; cursor is exclusive, upper is a fork bound."""
+        ...
+
     def history_position(self, message_id: str) -> tuple[str, str, datetime] | None:
         """Conversation, owning branch, timestamp; never decrypt message payloads."""
         ...
@@ -258,6 +266,12 @@ class ReminderRepository(Protocol):
     def transition(
         self, reminder_id: str, status: ReminderStatus, completed_at: datetime,
     ) -> bool: ...
+
+    def advance(
+        self, reminder_id: str, expected_time: datetime, next_time: datetime,
+    ) -> bool:
+        """Claim one pending occurrence and advance it atomically."""
+        ...
 
 
 class UnitOfWork(Protocol):

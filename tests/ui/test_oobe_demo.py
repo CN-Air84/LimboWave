@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 from PySide6.QtCore import QPoint, Qt
-from PySide6.QtWidgets import QLabel
+from PySide6.QtWidgets import QLabel, QMenu
 from pytestqt.qtbot import QtBot
 
 from limbowave.ui.oobe_copy import (
@@ -55,6 +55,16 @@ def test_valid_http_url_rejects_bare_scheme() -> None:
     assert not valid_http_url("https://")
     assert not valid_http_url("ftp://example.com")
     assert not valid_http_url("  ")
+
+
+@pytest.mark.parametrize("screen_id", ["welcome", "provider", "key", "done"])
+def test_navigation_actions_stay_in_stage_bottom_right(qtbot: QtBot, screen_id: str) -> None:
+    window = _window(qtbot)
+    window.show_screen(screen_id)
+    qtbot.waitUntil(lambda: window._pages._animation is None)
+    position = window._primary.mapTo(window, QPoint(0, 0))
+    assert window.width() - (position.x() + window._primary.width()) == 48
+    assert window.height() - (position.y() + window._primary.height()) == 32
 
 
 def test_each_screen_shows_its_own_title(qtbot: QtBot) -> None:
@@ -152,8 +162,9 @@ def test_preview_happy_path_requires_a_selected_model(qtbot: QtBot) -> None:
     assert window.screen_id == "success"
     assert "Kimi" in window._body.text()
 
-    qtbot.mouseClick(window._primary, Qt.MouseButton.LeftButton)
-    assert window.screen_id == "done"
+    for expected in ("voice_settings", "voice", "network", "done"):
+        qtbot.mouseClick(window._primary, Qt.MouseButton.LeftButton)
+        assert window.screen_id == expected
 
 
 def test_custom_provider_needs_a_real_url(qtbot: QtBot) -> None:
@@ -262,9 +273,13 @@ def test_live_check_waits_instead_of_pretending_success(qtbot: QtBot) -> None:
     finished: list[bool] = []
     window.finished.connect(lambda: finished.append(True))
     window.show_screen("success")
+    for expected in ("voice_settings", "voice", "network"):
+        qtbot.mouseClick(window._primary, Qt.MouseButton.LeftButton)
+        assert window.screen_id == expected
+        assert not finished
     qtbot.mouseClick(window._primary, Qt.MouseButton.LeftButton)
     assert finished == [True]
-    assert window.screen_id == "success"
+    assert window.screen_id == "network"
 
 
 def test_live_skip_leaves_without_the_demo_ending(qtbot: QtBot) -> None:
@@ -293,7 +308,7 @@ def test_screen_change_animates_the_whole_column(qtbot: QtBot, preview: bool) ->
     window.show_screen("welcome")
     assert window.screen_id == "welcome"
     assert pages._stack.isAncestorOf(window._title)
-    assert pages._stack.isAncestorOf(window._primary)
+    assert not pages.isAncestorOf(window._primary)
     assert pages._outgoing is not None
     assert pages._animation is not None
     assert pages._effect.opacity() == 0.0
@@ -392,8 +407,8 @@ def test_transition_does_not_intercept_button_clicks(qtbot: QtBot, incoming: boo
         assert pages._animation is not None
         pages._animation.setCurrentTime(160)
     # A direct qtbot click bypasses hit-testing and would miss an opaque overlay.
-    center = window._primary.mapTo(pages, window._primary.rect().center())
-    assert pages.childAt(center) is window._primary
+    center = window._primary.mapTo(window, window._primary.rect().center())
+    assert window.childAt(center) is window._primary
 
 
 def test_transition_keeps_the_stage_background_transparent(qtbot: QtBot) -> None:
@@ -480,3 +495,67 @@ def test_preview_rail_models_uses_mock_catalog_and_retains_choice(qtbot: QtBot) 
     qtbot.waitUntil(lambda: window.screen_id == "models", timeout=2000)
     assert window._default_model.currentData() == "demo-chat"
     assert window._primary.isEnabled()
+
+
+def _triple_alt(qtbot: QtBot, widget: OobeDemo) -> None:
+    for _ in range(3):
+        qtbot.keyClick(widget, Qt.Key.Key_Alt)
+
+
+def test_triple_alt_forces_single_successor_without_primary_side_effects(qtbot: QtBot) -> None:
+    window = _window(qtbot)
+    window.show_screen("key")
+    requested: list[tuple[int, str, str]] = []
+    window.check_requested.connect(lambda *args: requested.append(args))
+
+    window._key.setFocus()
+    _triple_alt(qtbot, window._key)
+
+    assert window.screen_id == "checking"
+    assert requested == []
+    assert not window._check_timer.isActive()
+
+
+def test_triple_alt_sequence_expires(qtbot: QtBot) -> None:
+    window = _window(qtbot)
+    window.show_screen("key")
+
+    qtbot.keyClick(window._key, Qt.Key.Key_Alt)
+    qtbot.keyClick(window._key, Qt.Key.Key_Alt)
+    qtbot.wait(1000)
+    qtbot.keyClick(window._key, Qt.Key.Key_Alt)
+
+    assert window.screen_id == "key"
+
+
+def test_triple_alt_shows_branch_menu_and_uses_selected_target(qtbot: QtBot) -> None:
+    window = _window(qtbot)
+    window.show_screen("welcome")
+
+    _triple_alt(qtbot, window)
+
+    qtbot.waitUntil(lambda: window._skip_menu is not None and window._skip_menu.isVisible())
+    menu = window._skip_menu
+    assert isinstance(menu, QMenu)
+    actions = menu.actions()
+    assert [action.data() for action in actions] == ["provider", "browse"]
+    actions[1].trigger()
+    assert window.screen_id == "browse"
+    assert not menu.isVisible()
+
+
+def test_triple_alt_live_done_skips_without_finishing(qtbot: QtBot) -> None:
+    window = OobeDemo(preview=False)
+    qtbot.addWidget(window)
+    window.resize(1080, 740)
+    window.show()
+    window.show_screen("network_settings")
+    skipped: list[bool] = []
+    finished: list[bool] = []
+    window.skipped.connect(lambda: skipped.append(True))
+    window.finished.connect(lambda: finished.append(True))
+
+    _triple_alt(qtbot, window)
+
+    assert skipped == [True]
+    assert finished == []

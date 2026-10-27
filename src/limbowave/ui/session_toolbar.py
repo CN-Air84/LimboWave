@@ -210,6 +210,7 @@ class SessionToolbar(QFrame):
     thinking_force_requested = Signal(str)
     endpoint_override_requested = Signal(str)  # endpoint_id；空串 = 清除覆盖回默认
     compress_requested = Signal()
+    compression_history_requested = Signal()
     attach_requested = Signal()
     mode_toggle_requested = Signal()  # 切换执行模式（内置工具 ↔ 直接终端）
     permissions_requested = Signal()  # 查看/撤销本会话授权
@@ -365,11 +366,17 @@ class SessionToolbar(QFrame):
         self._memory_btn = QPushButton("记忆")
         self._memory_btn.setProperty("flat", True)
         self._memory_btn.clicked.connect(self.memory_requested.emit)
+        self._compression_history_btn = QPushButton("版本")
+        self._compression_history_btn.setProperty("flat", True)
+        self._compression_history_btn.setAccessibleName("压缩记忆版本历史")
+        self._compression_history_btn.setToolTip("查看、编辑或回退压缩记忆版本；无需调用模型")
+        self._compression_history_btn.clicked.connect(self.compression_history_requested.emit)
         self._action_buttons = (
             self._compress_btn,
             self._mode_btn,
             self._steps_btn,
             self._memory_btn,
+            self._compression_history_btn,
         )
         # 切换提示：点「模式」/「步骤」后，其余按钮渐隐，被点的按钮滑到行首，
         # 右侧空出来的地方渐显切换结果；过一会儿按原路退回。

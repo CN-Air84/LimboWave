@@ -143,9 +143,9 @@ class SessionController:
         """续接既有会话（应用重启后）。下一轮 send 写入该分支而非另开新会话。"""
         return await self._coordinator.switch_conversation(conversation_id, branch_id)
 
-    async def new_session(self) -> bool:
+    async def new_session(self, *, fresh_start: bool = False) -> bool:
         """新建空内核会话，成功后清空应用定位。运行中拒绝。"""
-        return await self._coordinator.new_session()
+        return await self._coordinator.new_session(fresh_start=fresh_start)
 
     async def ensure_session(self) -> bool:
         """准备发送前的会话设置作用域，不发送消息。"""

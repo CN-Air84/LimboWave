@@ -80,12 +80,18 @@ RAIL_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "checking",
             "models",
             "success",
+            "voice_settings",
+            "voice",
+            "network",
             "done",
         ),
     ),
     ("没连上", ("error_key", "error_network", "error_timeout")),
     ("先不设置", ("browse", "later")),
+    ("可选配置", ("network_settings",)),
 )
+
+INTRODUCTION_SEQUENCE = ("success", "voice_settings", "voice", "network")
 
 SAMPLE_PROVIDER_ID = "deepseek"
 
@@ -285,8 +291,28 @@ SCREENS: dict[str, ScreenCopy] = {
             "现在就可以用{name}了。你选好的模型已设为默认。\n"
             "想换模型，或再加一家做备用的话，可以到设置里调。"
         ),
-        primary="开始聊天",
+        primary="下一步，设置语音",
         secondary="调整模型",
+    ),
+    "voice_settings": ScreenCopy(
+        rail="语音配置", eyebrow="可选 · 可以跳过",
+        title="给声音，留一个入口。", body="转写和朗读可以分别配置；只有点击保存才会生效。",
+        primary="下一步，看看怎么用", secondary="跳过设置",
+        hint="不录音、不试连。密钥保存到加密资料库；不影响继续配置文字聊天。",
+    ),
+    "voice": ScreenCopy(
+        rail="语音陪伴", eyebrow="可选的陪伴方式",
+        title="不想打字的时候，\n也可以说给我听。",
+        body="按住说话，松开转成文字。\n看一眼、改一改，再决定要不要发送。",
+        primary="继续，看看联网", secondary="上一步",
+        hint="不用现在配置。以后随时在「设置 → 语音」中开启。",
+    ),
+    "network": ScreenCopy(
+        rail="联网查证", eyebrow="让现实信息可核验",
+        title="新消息，\n我们一起查证。",
+        body="遇到刚发布的新闻或新框架，\n不知道的，不装作知道。",
+        primary="开始聊天", secondary="上一步",
+        hint="搜索默认关闭；配置不等于联网授权，模拟允许也不会保存为实际权限。",
     ),
     "done": ScreenCopy(
         rail="开始聊天",
@@ -334,6 +360,14 @@ SCREENS: dict[str, ScreenCopy] = {
         body="演示到此。正式版会进入主界面，输入框要等连接完成才能发送。",
         primary="返回欢迎页",
     ),
+    "network_settings": ScreenCopy(
+        rail="联网配置", eyebrow="可选 · 随时可以返回",
+        title="想查证时，再连接。",
+        body="选择搜索服务并主动保存；不会发起试查，也不会给予工具授权。",
+        primary="返回联网介绍", secondary="暂时不用",
+        hint="只在点击保存时修改配置；可保留默认关闭，稍后再设置。",
+    ),
+
 }
 
 

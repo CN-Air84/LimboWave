@@ -76,6 +76,11 @@ from limbowave.application.services.compression_context import (
 )
 from limbowave.application.services.compression_inheritance import inherit_compressions
 from limbowave.application.services.memory_service import MemoryService, capture_memory, fork_memory
+from limbowave.application.services.privacy_service import (
+    PrivacyService,
+    allowed_messages,
+    load_policy,
+)
 from limbowave.application.services.public_tool_steps import public_tool_steps
 from limbowave.application.services.run_origin import RUN_ORIGIN
 from limbowave.application.services.runtime_recovery_coordinator import RuntimeRecoveryCoordinator
@@ -787,7 +792,7 @@ class RunCoordinator:
         return await self.switch_conversation(conversation_id, branch_id)
 
     @_arbitrated
-    async def new_session(self) -> bool:
+    async def new_session(self, *, fresh_start: bool = False) -> bool:
         """等待旧轮收尾，再新建空内核会话；成功后才清空应用定位。"""
         if self.busy:
             return False
@@ -803,6 +808,12 @@ class RunCoordinator:
                 self._last_run_id = None
                 if self.memory_service is not None:
                     self.memory_service.clear_approvals()
+                if fresh_start:
+                    ids = await self._storage_call(
+                        "_persist_empty_session", self._tick(),
+                        self._context().logical_model_id, fresh_start=True,
+                    )
+                    self._active_conversation_id, self._active_branch_id = ids
                 self._runtime_valid = True
             return True
         except Exception as exc:
@@ -830,7 +841,9 @@ class RunCoordinator:
             self._emit(ERROR, message=f"准备会话失败（存储不可用）：{redact_text(str(exc))}")
             return False
 
-    def _persist_empty_session(self, now: datetime, logical_model_id: str) -> tuple[str, str]:
+    def _persist_empty_session(
+        self, now: datetime, logical_model_id: str, *, fresh_start: bool = False,
+    ) -> tuple[str, str]:
         # 成功提交后才由调用方切换定位；失败不能留下指向不存在记录的会话 ID。
         conversation_id, branch_id = self._new_id("conv"), self._new_id("branch")
         with self._uow_factory() as uow:
@@ -839,6 +852,8 @@ class RunCoordinator:
                 default_logical_model_id=logical_model_id,
             ))
             uow.branches.add(Branch(id=branch_id, conversation_id=conversation_id, created_at=now))
+            if fresh_start:
+                PrivacyService.mark_fresh(uow, conversation_id)
             uow.commit()
         return conversation_id, branch_id
 
@@ -860,7 +875,8 @@ class RunCoordinator:
             runs = uow.runs.list_for_conversation(conversation_id)
             metadata = uow.runtime.list_metadata_for_conversation(conversation_id)
             active_compression = (
-                uow.compressions.get_active(branch_id) if include_compression else None
+                uow.compressions.get_active(branch_id)
+                if include_compression and not load_policy(uow, conversation_id).active else None
             )
             compression_messages = (
                 branch_path.branch_messages(uow, branch_id) if active_compression else []
@@ -998,6 +1014,9 @@ class RunCoordinator:
         conversation_id = self._active_conversation_id
         if conversation_id is None:
             raise ValueError("还没有会话可压缩")
+        with self._uow_factory() as uow:
+            if load_policy(uow, conversation_id).active:
+                raise ValueError("翻篇或话题禁区已启用：使用安全原文上下文，不复用压缩摘要。")
         prepared = self._prepare_switch(conversation_id, branch_id, None, include_compression=False)
         if prepared.snapshot is None:
             raise ValueError("缺少可恢复的运行时记录，未修改上下文")
@@ -1158,12 +1177,16 @@ class RunCoordinator:
 
     def _prepare_retry(
         self, message_id: str, *, rebuild_attachments: bool = True,
+        allow_explicit_input: bool = False,
     ) -> tuple[str, AttachmentPayload, _SwitchPreparation]:
         """恢复边界按消息 ID/重试链计算，绝不按重复文本删历史。"""
         with self._uow_factory() as uow:
             message = uow.messages.get(message_id)
             if message is None or message.role is not MessageRole.USER:
                 raise ValueError("找不到要重试的用户消息")
+            policy = load_policy(uow, message.conversation_id)
+            if not allow_explicit_input and policy.blocks(message.content, message.id):
+                raise ValueError("该历史消息受话题禁区保护，不能自动复用；请明确输入新消息。")
             messages = branch_path.branch_messages(uow, self._active_branch_id or "")
             users = [m for m in messages if m.role is MessageRole.USER]
             if (
@@ -1392,6 +1415,8 @@ class RunCoordinator:
             if not users:
                 raise ValueError("找不到可重生成的用户消息")
             source = (uow.messages.get(run.user_message_id) if run else None) or users[-1]
+            if load_policy(uow, source.conversation_id).blocks(source.content, source.id):
+                raise ValueError("原消息受话题禁区保护，不能直接重新生成；请明确输入新消息。")
             retry = target.status in {MessageStatus.PARTIAL, MessageStatus.FAILED} or (
                 run is not None
                 and run.status in {RunStatus.FAILED, RunStatus.ABORTED, RunStatus.INTERRUPTED}
@@ -1798,11 +1823,13 @@ class RunCoordinator:
     async def _sync_prompt_context(self, live: _LiveRun) -> bool:
         """Session restore clears extension context; rebind it on every attempt."""
         assert self._kernel is not None
-        if self.memory_service is not None and self.memory_context is not None:
+        if self.memory_service is not None:
             self.memory_service.clear_approvals()
-            await self._kernel.set_memory_context(
-                await self._storage_call("_memory_prompt", self.memory_context)
-            )
+        context = MemoryRunContext(live.run_id, live.conversation_id,
+                                   live.branch_id, live.user_message_id)
+        memory = await self._storage_call("_memory_prompt", context)
+        if memory:
+            await self._kernel.set_memory_context(memory)
         if self._cancel_before_prompt(live):
             return False
         await self._kernel.set_attachment_context(
@@ -1858,7 +1885,11 @@ class RunCoordinator:
         documents: list[dict[str, object]] = []
         seen: set[str] = set()
         with self._uow_factory() as uow:
+            branch = uow.branches.get(branch_id)
+            policy = load_policy(uow, branch.conversation_id if branch else None)
             for message in branch_path.branch_messages(uow, branch_id):
+                if policy.active and message.run_id != run_id:
+                    continue
                 if message.role is not MessageRole.USER or message.run_id is None:
                     continue
                 intent = uow.snapshots.get_intent(message.run_id)
@@ -1879,13 +1910,33 @@ class RunCoordinator:
         return {"run_id": run_id, "branch_id": branch_id, "documents": documents}
 
     def _memory_prompt(self, context: MemoryRunContext) -> dict[str, object]:
-        assert self.memory_service is not None
         with self._uow_factory() as uow:
-            round_number = sum(
-                m.role is MessageRole.USER
-                for m in branch_path.branch_messages(uow, context.branch_id)
-            )
-        return self.memory_service.prompt_context(context, round_number)
+            uow.begin_read()
+            policy = load_policy(uow, context.conversation_id)
+            messages = branch_path.branch_messages(uow, context.branch_id)
+        round_number = max(1, sum(m.role is MessageRole.USER for m in messages))
+        if self.memory_service is not None:
+            result = self.memory_service.prompt_context(context, round_number)
+        elif policy.active:
+            result = {"run_id": context.run_id, "branch_id": context.branch_id,
+                      "round": round_number, "global": [], "session": [],
+                      "global_interval": 1, "session_interval": 1}
+        else:
+            return {}
+        if policy.active:
+            # Runtime tool traces, thinking, old image bytes and summaries are not sources.
+            prefix = []
+            for message in messages:
+                if message.id == context.user_message_id:
+                    break
+                prefix.append(message)
+            result["privacy"] = {
+                "history": "\n\n".join(
+                    f"[{m.role.value}]\n{m.content}" for m in allowed_messages(policy, prefix)
+                ),
+                "terms": [term for rule in policy.rules for term in (rule.topic, *rule.aliases)],
+            }
+        return result
 
     def _persist_run_start(
         self,
@@ -2331,6 +2382,7 @@ class RunCoordinator:
                 try:
                     _, _, prepared = await self._storage_call(
                         "_prepare_retry", live.user_message_id, rebuild_attachments=False,
+                        allow_explicit_input=True,
                     )
                     if self._cancel_before_prompt(live):
                         return

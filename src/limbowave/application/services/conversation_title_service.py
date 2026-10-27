@@ -9,6 +9,7 @@ from collections.abc import Sequence
 from typing import Any
 
 from limbowave.application.kernel import AgentKernel, KernelEvent
+from limbowave.application.services.privacy_service import PrivacyService, privacy_model_request
 from limbowave.domain.conversation import Message
 
 _MAX_SOURCE_CHARS = 4_000
@@ -18,8 +19,9 @@ _MAX_TITLE_CHARS = 40
 class ConversationTitleService:
     """生成标题候选，但不直接修改会话，也不触碰当前内核上下文。"""
 
-    def __init__(self, *, timeout: float = 60.0) -> None:
+    def __init__(self, *, timeout: float = 60.0, privacy: PrivacyService | None = None) -> None:
         self._timeout = timeout
+        self._privacy = privacy
 
     async def suggest(
         self,
@@ -30,6 +32,8 @@ class ConversationTitleService:
         provider: str,
         model_id: str,
     ) -> str | None:
+        if self._privacy is not None and self._privacy.policy().rules:
+            return None  # Raw turn text has no source IDs/provenance.
         return await self._suggest_prompt(
             kernel,
             _title_prompt([
@@ -49,6 +53,8 @@ class ConversationTitleService:
         model_id: str,
     ) -> str | None:
         """手动命名使用完整分支的所有轮次，不截断为首轮或混入工具/思考内容。"""
+        if self._privacy is not None:
+            messages = self._privacy.filter_messages(messages)
         source = [
             (message.role.value, message.content)
             for message in messages
@@ -61,6 +67,14 @@ class ConversationTitleService:
         )
 
     async def _suggest_prompt(
+        self, kernel: AgentKernel, prompt: str, *, provider: str, model_id: str,
+    ) -> str | None:
+        with privacy_model_request():
+            return await self._send_title_prompt(
+                kernel, prompt, provider=provider, model_id=model_id,
+            )
+
+    async def _send_title_prompt(
         self,
         kernel: AgentKernel,
         prompt: str,

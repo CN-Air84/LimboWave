@@ -18,7 +18,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 # 当前 schema 版本。新增迁移时递增。
-CURRENT_VERSION = 19
+CURRENT_VERSION = 20
 
 MIGRATION_RECOVERY_MESSAGE = (
     "资料库升级失败，应用未继续打开资料库。请先保留当前数据目录及备份，"
@@ -644,6 +644,12 @@ def _migration_019(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX idx_reminders_owner ON reminders(conversation_id, due_at, id)")
 
 
+def _migration_020(conn: sqlite3.Connection) -> None:
+    if not conn.in_transaction:
+        conn.execute("BEGIN")
+    conn.execute("ALTER TABLE reminders ADD COLUMN details_enc TEXT")
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(
         from_version=0,
@@ -704,6 +710,7 @@ MIGRATIONS: tuple[Migration, ...] = (
         apply=_migration_018,
     ),
     Migration(from_version=18, description="持久化一次性会话提醒", apply=_migration_019),
+    Migration(from_version=19, description="周期提醒与加密来源锚点", apply=_migration_020),
 )
 
 

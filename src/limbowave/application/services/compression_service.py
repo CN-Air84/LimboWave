@@ -26,11 +26,19 @@ from limbowave.application.background import run_blocking
 from limbowave.application.branch_path import branch_messages
 from limbowave.application.kernel import AgentKernel, ContextUsage, KernelEvent
 from limbowave.application.repositories import UnitOfWorkFactory
+from limbowave.application.services.privacy_service import load_policy, privacy_model_request
 from limbowave.domain.compaction import (
-    COMPRESSION_PROMPT_VERSION,
+    CompressionProfile,
     CompressionStatus,
     CompressionVersion,
     build_compression_prompt,
+    compression_prompt_version,
+)
+from limbowave.domain.companion_compaction import (
+    COMPANION_SUMMARY_CHARS,
+    CompanionBatch,
+    companion_batches,
+    source_label,
 )
 from limbowave.domain.configuration import CompressionSettings
 from limbowave.domain.conversation import Message, MessageRole
@@ -147,9 +155,15 @@ class CompressionService:
         tokens_before: int,
         compression_model_id: str,
         compression_endpoint_id: str,
+        profile: CompressionProfile = CompressionProfile.TASK,
     ) -> CompressionVersion:
         """创建一个新的压缩版本（draft）。输入范围 = 当前分支完整对话（含继承前缀）。"""
         with self._uow_factory() as uow:
+            branch = uow.branches.get(branch_id)
+            if branch is None or branch.conversation_id != conversation_id:
+                raise ValueError("压缩分支不属于当前会话")
+            if load_policy(uow, branch.conversation_id if branch else None).rules:
+                raise ValueError("话题禁区已启用：旧摘要来源不完整，暂不生成或复用压缩摘要。")
             messages = branch_messages(uow, branch_id)
             whitelist = tuple(m.id for m in messages if m.is_whitelisted)
             # Sort key is (created_at, id) and id is random: on coarse clocks two versions
@@ -170,12 +184,28 @@ class CompressionService:
                 tokens_before=tokens_before,
                 compression_model_id=compression_model_id,
                 compression_endpoint_id=compression_endpoint_id,
-                prompt_version=COMPRESSION_PROMPT_VERSION,
+                prompt_version=compression_prompt_version(profile),
                 whitelist_message_ids=whitelist,
             )
             uow.compressions.add(version)
             uow.commit()
             return version
+
+    def _prompt_messages(
+        self, branch_id: str, message_ids: tuple[str, ...] | None = None,
+    ) -> list[Message]:
+        with self._uow_factory() as uow:
+            branch = uow.branches.get(branch_id)
+            if branch is None:
+                raise ValueError("压缩分支不存在")
+            if load_policy(uow, branch.conversation_id).rules:
+                raise ValueError("话题禁区已启用：旧摘要来源不完整，暂不生成或复用压缩摘要。")
+            messages = branch_messages(uow, branch_id)
+        if message_ids is not None:
+            if tuple(m.id for m in messages[:len(message_ids)]) != message_ids:
+                raise ValueError("压缩版本的消息范围已变化，请重新生成预览")
+            messages = messages[:len(message_ids)]
+        return messages
 
     def build_prompt(
         self,
@@ -184,36 +214,51 @@ class CompressionService:
         goal: str = "",
         tasks: str = "",
         message_ids: tuple[str, ...] | None = None,
+        profile: CompressionProfile = CompressionProfile.TASK,
     ) -> str:
-        """组装压缩提示词（Task 5.2 的全部组成部分）。
-
-        白名单消息原文注入，文件引用与目标/任务如实呈现。
-        """
-        with self._uow_factory() as uow:
-            messages = branch_messages(uow, branch_id)
-        if message_ids is not None:
-            by_id = {m.id: m for m in messages}
-            messages = [by_id[mid] for mid in message_ids]
-        whitelist_texts = [m.content for m in messages if m.is_whitelisted]
-        file_refs = sorted(
-            {
-                f"[{m.id}]"
-                for m in messages
-                if m.role is MessageRole.USER  # 文件引用跟随用户消息
-            }
-        )
+        """Task compatibility entry; companion generation uses bounded batches below."""
+        messages = self._prompt_messages(branch_id, message_ids)
+        companion = CompressionProfile(profile) is CompressionProfile.COMPANION
+        whitelist_texts = [
+            (source_label(m) + "\n" if companion else "") + m.content
+            for m in messages if m.is_whitelisted
+        ]
+        file_refs = sorted({f"[{m.id}]" for m in messages if m.role is MessageRole.USER})
         compressible = [
-            f"{'用户' if m.role is MessageRole.USER else '助手'}: {m.content}"
-            for m in messages
-            if not m.is_whitelisted  # 白名单不重复出现在待压缩区
+            (source_label(m) + "\n" if companion else
+             f"{'用户' if m.role is MessageRole.USER else '助手'}: ") + m.content
+            for m in messages if not m.is_whitelisted
         ]
         return build_compression_prompt(
-            goal=goal,
-            tasks=tasks,
-            file_refs=", ".join(file_refs) if file_refs else "",
-            whitelist=whitelist_texts,
-            messages=compressible,
+            goal=goal, tasks=tasks, file_refs=", ".join(file_refs),
+            whitelist=whitelist_texts, messages=compressible, profile=profile,
         )
+
+    def _companion_input(
+        self, version: CompressionVersion,
+    ) -> tuple[list[CompanionBatch], str, list[str]]:
+        messages = self._prompt_messages(version.branch_id, version.input_message_ids)
+        # Respect both the preview-time whitelist snapshot and newly pinned messages.
+        from dataclasses import replace
+
+        messages = [replace(m, is_whitelisted=True)
+                    if m.id in version.whitelist_message_ids else m for m in messages]
+        whitelist = [m.content for m in messages if m.is_whitelisted and m.content]
+        if sum(map(len, whitelist)) > COMPANION_SUMMARY_CHARS:
+            raise ValueError("白名单原文超过摘要预算，请先调整白名单；未截断任何原文")
+        previous = ""
+        active = self.get_active(version.branch_id)
+        if (active is not None and active.status is CompressionStatus.ACCEPTED
+                and active.profile is CompressionProfile.COMPANION
+                and active.input_message_ids
+                and version.input_message_ids[:len(active.input_message_ids)]
+                == active.input_message_ids):
+            previous = active.effective_summary.strip()
+            if previous:
+                if len(previous) > COMPANION_SUMMARY_CHARS:
+                    raise ValueError("已启用摘要超过分段预算，请先编辑缩短；未丢弃用户编辑")
+                messages = messages[len(active.input_message_ids):]
+        return companion_batches(messages), previous, whitelist
 
     async def generate_isolated(
         self,
@@ -226,6 +271,10 @@ class CompressionService:
         """Generate a preview in a disposable kernel; never fall back to the live chat."""
         import asyncio
         import contextlib
+
+        version = await run_blocking(self.get, version_id)
+        if version is None or version.status is not CompressionStatus.DRAFT:
+            return False
 
         isolated: AgentKernel | None = None
         unsubscribe: Callable[[], None] | None = None
@@ -242,7 +291,7 @@ class CompressionService:
                 if state.provider and state.model_id:
                     await isolated.set_model(state.provider, state.model_id)
                 await isolated.set_thinking_level(state.thinking_level)
-                return await self.generate(version_id, isolated, timeout=timeout)
+            return await self.generate(version_id, isolated, timeout=timeout)
         except asyncio.CancelledError:
             await run_blocking(self.record_failure, version_id, "压缩已取消")
             raise
@@ -258,6 +307,13 @@ class CompressionService:
                     await asyncio.wait_for(isolated.shutdown(), timeout=10.0)
 
     async def generate(
+        self, version_id: str, kernel: AgentKernel, *, goal: str = "", tasks: str = "",
+        timeout: float = 120.0,
+    ) -> bool:
+        with privacy_model_request():
+            return await self._generate(version_id, kernel, goal=goal, tasks=tasks, timeout=timeout)
+
+    async def _generate(
         self,
         version_id: str,
         kernel: AgentKernel,
@@ -277,16 +333,63 @@ class CompressionService:
         import asyncio
 
         version = await run_blocking(self.get, version_id)
-        if version is None:
+        if version is None or version.status is not CompressionStatus.DRAFT:
             return False
 
-        prompt = await run_blocking(
-            self.build_prompt,
-            version.branch_id,
-            goal=goal,
-            tasks=tasks,
-            message_ids=version.input_message_ids,
-        )
+        try:
+            batches: list[CompanionBatch] = []
+            summary = ""
+            whitelist: list[str] = []
+            if version.profile is CompressionProfile.COMPANION:
+                batches, summary, whitelist = await run_blocking(self._companion_input, version)
+            # Allow long-history distillation more than a single model response's time,
+            # while retaining a bounded total duration and per-request timeout.
+            async with asyncio.timeout(min(timeout * max(1, len(batches)), 600.0)):
+                if version.profile is CompressionProfile.COMPANION:
+                    for index, batch in enumerate(batches):
+                        if index:
+                            # No accumulated raw history or previous model output in the kernel.
+                            await kernel.new_session()
+                        prompt = build_compression_prompt(
+                            goal=goal, tasks=tasks, file_refs="",
+                            whitelist=list(batch.whitelist), messages=list(batch.messages),
+                            profile=version.profile, previous_summary=summary,
+                        )
+                        summary = await self._request_summary(kernel, prompt, timeout=timeout)
+                        if len(summary) > COMPANION_SUMMARY_CHARS:
+                            raise ValueError("陪伴摘要超过分段预算，请重试或调整白名单；未截断摘要")
+                    missing = [text for text in whitelist if text not in summary]
+                    if missing:
+                        summary += "\n\n### 白名单原文（补全）\n" + "\n\n".join(missing)
+                    if len(summary) > COMPANION_SUMMARY_CHARS:
+                        raise ValueError("白名单与摘要合并后超过预算，请调整白名单后重试")
+                else:
+                    prompt = await run_blocking(
+                        self.build_prompt, version.branch_id, goal=goal, tasks=tasks,
+                        message_ids=version.input_message_ids, profile=version.profile,
+                    )
+                    summary = await self._request_summary(kernel, prompt, timeout=timeout)
+                # Recheck boundaries before publishing. An intermediate batch is never a preview.
+                await run_blocking(
+                    self._prompt_messages, version.branch_id, version.input_message_ids
+                )
+                return await run_blocking(
+                    self.record_result, version_id, summary, max(1, len(summary) // 2)
+                )
+        except asyncio.CancelledError:
+            await run_blocking(self.record_failure, version_id, "压缩已取消")
+            raise
+        except Exception as exc:
+            await run_blocking(
+                self.record_failure, version_id,
+                "压缩生成超时" if isinstance(exc, TimeoutError) else redact_text(str(exc)),
+            )
+            return False
+
+    @staticmethod
+    async def _request_summary(kernel: AgentKernel, prompt: str, *, timeout: float) -> str:
+        import asyncio
+
         chunks: list[str] = []
         settled = asyncio.Event()
         runtime_error: list[str] = []
@@ -297,6 +400,10 @@ class CompressionService:
             if kind == "message.end":
                 message = payload.get("message") or {}
                 if message.get("role") == "assistant":
+                    if message.get("stopReason") == "length":
+                        runtime_error.append("压缩模型输出被截断，请调整输出上限后重新生成")
+                        settled.set()
+                        return
                     if message.get("stopReason") in {"error", "aborted"}:
                         chunks.clear()
                         return
@@ -318,28 +425,17 @@ class CompressionService:
 
         unsubscribe = kernel.subscribe(_on_event)
         try:
-            await kernel.send_message(prompt)
-            await asyncio.wait_for(settled.wait(), timeout=timeout)
-            if runtime_error:
-                raise RuntimeError(runtime_error[0])
-        except Exception as exc:
-            await run_blocking(
-                self.record_failure,
-                version_id,
-                "压缩生成超时" if isinstance(exc, TimeoutError) else redact_text(str(exc)),
-            )
-            return False
+            async with asyncio.timeout(timeout):
+                await kernel.send_message(prompt)
+                await settled.wait()
+                if runtime_error:
+                    raise RuntimeError(runtime_error[0])
         finally:
             unsubscribe()
-
         summary = "".join(chunks).strip()
         if not summary:
-            await run_blocking(self.record_failure, version_id, "压缩模型没有产出内容")
-            return False
-        # 压缩后 token 估算：按字符数粗估（中英混合约 2 字符/token），如实标记为估算
-        return await run_blocking(
-            self.record_result, version_id, summary, max(1, len(summary) // 2)
-        )
+            raise ValueError("压缩模型没有产出内容")
+        return summary
 
     def record_result(self, version_id: str, summary: str, tokens_after: int) -> bool:
         """生成完成：落摘要，状态转 previewed。"""
@@ -353,6 +449,7 @@ class CompressionService:
                 generated_summary=summary,
                 tokens_after=tokens_after,
             ),
+            expected_status=CompressionStatus.DRAFT,
         )
 
     def record_failure(self, version_id: str, error: str) -> bool:
@@ -362,6 +459,7 @@ class CompressionService:
         return self._update(
             version_id,
             lambda v: replace(v, status=CompressionStatus.FAILED, error=error),
+            expected_status=CompressionStatus.DRAFT,
         )
 
     def edit_summary(self, version_id: str, edited: str) -> bool:
@@ -378,7 +476,11 @@ class CompressionService:
         """接受版本：状态转 accepted 并设为当前分支启用版本。"""
         with self._uow_factory() as uow:
             version = uow.compressions.get(version_id)
-            if version is None or version.status is CompressionStatus.FAILED:
+            if (
+                version is None
+                or version.status not in {CompressionStatus.PREVIEWED, CompressionStatus.ACCEPTED}
+                or not version.effective_summary.strip()
+            ):
                 return False
             from dataclasses import replace
 
@@ -390,7 +492,10 @@ class CompressionService:
     def reject(self, version_id: str) -> bool:
         from dataclasses import replace
 
-        return self._update(version_id, lambda v: replace(v, status=CompressionStatus.REJECTED))
+        return self._update(
+            version_id, lambda v: replace(v, status=CompressionStatus.REJECTED),
+            expected_status=CompressionStatus.PREVIEWED,
+        )
 
     def rollback(self, branch_id: str) -> bool:
         """回退：取消当前启用版本，回到未压缩状态。"""
@@ -421,11 +526,13 @@ class CompressionService:
         self,
         version_id: str,
         transform: Callable[[CompressionVersion], CompressionVersion],
+        *, expected_status: CompressionStatus | None = None,
     ) -> bool:
         """读-改-写。``transform`` 是纯函数（如 ``lambda v: replace(v, status=...)``）。"""
         with self._uow_factory() as uow:
             version = uow.compressions.get(version_id)
-            if version is None:
+            if (version is None
+                    or (expected_status is not None and version.status is not expected_status)):
                 return False
             uow.compressions.update(transform(version))
             uow.commit()

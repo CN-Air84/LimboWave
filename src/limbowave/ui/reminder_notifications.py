@@ -104,8 +104,8 @@ class ReminderNotifications(QObject):
         if self.settings.desktop_enabled:
             target = next(reversed(pending.values()))
             count = len(pending)
-            body = ("你设置的提醒已到时间。点击回到灵波查看。" if count == 1 else
-                    f"{count} 条定时提醒已送达。点击查看最近一条，其余提醒保留在原会话。")
+            body = ("你设置的提醒已到时间。点击回到当初的约定。" if count == 1 else
+                    f"{count} 条定时提醒已送达。点击回到最近一条的约定，其余提醒保留在原会话。")
             try:
                 if self._balloons is None:
                     self._balloons = self._balloon_factory()
@@ -180,7 +180,7 @@ class ReminderNotificationSettingsPage(QWidget):
         note = QLabel(
             "提示音短暂、低音量；多条提醒同时补发时合并提示，不连续响铃。\n"
             "Windows 气泡不显示提醒正文，以免在锁屏或共享屏幕上泄露内容。"
-            "点击后打开对应会话；不会打断正在生成的回复。\n"
+            "点击后回到设定时的上下文；不会打断正在生成的回复。\n"
             "Windows 气泡遵循系统通知设置；提示音由上方开关独立控制。"
             "无音频设备或通知不可用时，提醒仍会保留在会话中。\n"
             "这不是后台服务：应用退出或电脑休眠期间无法准点通知，恢复后补发。"

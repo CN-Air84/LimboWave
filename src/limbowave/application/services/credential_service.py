@@ -36,5 +36,8 @@ class CredentialService:
     def store_secret(self, ref: str, secret: str) -> None:
         self._store.set(ref, secret)
 
+    def delete_secret(self, ref: str) -> None:
+        self._store.delete(ref)
+
     def list_refs(self) -> list[str]:
         return self._store.refs()

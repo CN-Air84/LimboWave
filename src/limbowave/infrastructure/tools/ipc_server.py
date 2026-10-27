@@ -88,9 +88,11 @@ class ToolIpcServer:
         conversation_provider: Callable[[], str | None] | None = None,
         host: str = "127.0.0.1",
         rate_limit: Callable[[str], float] | None = None,
+        capability_snapshot: Callable[[str, str], Awaitable[dict[str, Any]]] | None = None,
     ) -> None:
         self._dispatch = dispatch
         self._rate_limit = rate_limit
+        self._capability_snapshot = capability_snapshot
         self._rate_session: ToolIpcSession | None = None
         # 会话标识**只由服务端提供**（运行时可能切换，不能烘进 session）
         self._conversation_provider = conversation_provider or (lambda: None)
@@ -202,6 +204,21 @@ class ToolIpcServer:
         if not isinstance(token, str) or not secrets.compare_digest(token, session.token):
             self.stats.rejected += 1
             return {"ok": False, "error": "认证失败", "_close": True}
+
+        # Internal metadata operation, not a model tool or permission bypass.
+        # Authentication above and the application's live-run check both apply.
+        if request.get("operation") == "capability_snapshot":
+            run_id = request.get("run_id")
+            conversation_id = self._conversation_provider() or ""
+            if (self._capability_snapshot is None or not conversation_id
+                    or not isinstance(run_id, str) or not run_id.strip() or len(run_id) > 200):
+                return {"ok": False, "error": "运行时能力快照未就绪"}
+            try:
+                data = await self._capability_snapshot(conversation_id, run_id)
+            except Exception:
+                # Do not expose service exceptions, credentials or private content.
+                return {"ok": False, "error": "运行时能力快照不可用"}
+            return {"ok": True, "data": data}
 
         tool = request.get("tool")
         params = request.get("params")

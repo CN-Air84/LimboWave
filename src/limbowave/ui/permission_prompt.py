@@ -73,6 +73,13 @@ def describe_request(
     lines.extend(f"域名：{domain}" for domain in request.scope.domains if domain)
     if request.scope.command:
         lines.append(f"命令：{_clip(request.scope.command, COMMAND_PREVIEW_CHARS)}")
+    if request.tool_name == "query_chat_history" and "message_id" in request.raw_params:
+        anchor = json.dumps(request.raw_params["message_id"], ensure_ascii=False)
+        lines.append(f"历史锚点：{anchor}")
+        lines.append(
+            f"读取窗口：前 {request.raw_params.get('before_turns', 2)} 轮 + 锚点所在轮"
+            f" + 后 {request.raw_params.get('after_turns', 2)} 轮"
+        )
     preview = _params_preview(request.raw_params)
     if preview is not None:
         lines.append(f"参数：{preview}")

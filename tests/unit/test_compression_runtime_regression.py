@@ -43,7 +43,7 @@ class ChatKernel(TreeKernel):
         return await super().restore_runtime_state(snapshot)
 
 
-async def setup_chat(factory=None):
+async def setup_chat(factory=None, *, draft=False):
     if factory is None:
         factory = in_memory_uow_factory(InMemoryStore())
     kernel = ChatKernel()
@@ -57,12 +57,13 @@ async def setup_chat(factory=None):
         compression_model_id="test",
         compression_endpoint_id="test",
     )
-    service.record_result(version.id, "accepted summary", 8)
+    if not draft:
+        service.record_result(version.id, "accepted summary", 8)
     return factory, kernel, coord, service, version
 
 
 async def test_preview_is_isolated_and_shut_down():
-    _, kernel, coord, service, version = await setup_chat()
+    _, kernel, coord, service, version = await setup_chat(draft=True)
     before = deepcopy(kernel.path)
     sent = list(kernel.sent)
     assert await service.generate_isolated(version.id, kernel)
@@ -137,7 +138,7 @@ async def test_failed_apply_restores_chat_and_does_not_activate():
 
 
 async def test_preview_timeout_closes_child_without_mutating_chat():
-    _, kernel, _, service, version = await setup_chat()
+    _, kernel, _, service, version = await setup_chat(draft=True)
     original = deepcopy(kernel.path)
 
     async def never_reply(*args, **kwargs):
@@ -182,7 +183,7 @@ async def test_whitelist_is_preserved_even_when_user_removes_it_from_summary():
 
 
 async def test_preview_cancellation_closes_only_child():
-    _, kernel, _, service, version = await setup_chat()
+    _, kernel, _, service, version = await setup_chat(draft=True)
     entered = asyncio.Event()
     before = deepcopy(kernel.path)
 
@@ -201,7 +202,7 @@ async def test_preview_cancellation_closes_only_child():
 
 
 async def test_partial_summary_without_settlement_is_failure():
-    _, kernel, _, service, version = await setup_chat()
+    _, kernel, _, service, version = await setup_chat(draft=True)
 
     async def partial(*args, **kwargs):
         kernel.preview.emit(
@@ -216,7 +217,7 @@ async def test_partial_summary_without_settlement_is_failure():
 
 
 async def test_preview_runtime_exit_is_failure_even_with_text():
-    _, kernel, _, service, version = await setup_chat()
+    _, kernel, _, service, version = await setup_chat(draft=True)
 
     async def exit_early(*args, **kwargs):
         kernel.preview.emit(
@@ -231,7 +232,7 @@ async def test_preview_runtime_exit_is_failure_even_with_text():
 
 
 async def test_preview_prompt_uses_frozen_message_range():
-    _, kernel, coord, service, version = await setup_chat()
+    _, kernel, coord, service, version = await setup_chat(draft=True)
     await _turn(kernel, coord, "future message not covered", "future reply")
     assert await service.generate_isolated(version.id, kernel)
     assert "future message not covered" not in kernel.preview.sent[-1]
