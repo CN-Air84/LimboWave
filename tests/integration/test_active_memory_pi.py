@@ -225,8 +225,9 @@ async def test_global_delete_reports_scope_error_not_missing_permission(
 
 
 @pytest.mark.parametrize("accept", [True, False])
-async def test_global_update_reaches_consent_and_changes_only_global_original(
-    mock_models, mock_provider, tmp_path, memory_stack, monkeypatch, accept,
+@pytest.mark.parametrize("full_access", [True, False])
+async def test_global_update_respects_preset_and_changes_only_global_original(
+    mock_models, mock_provider, tmp_path, memory_stack, monkeypatch, accept, full_access,
 ):
     from limbowave.domain.permissions import PermissionPreset
     from tests.unit.test_memory_service import _second_conversation
@@ -236,7 +237,8 @@ async def test_global_update_reaches_consent_and_changes_only_global_original(
     original = service.save("GLOBAL_ORIGINAL_TEST")
     service.save_session_global(original.id, "LOCAL_OVERRIDE_TEST", "c")
     permissions = PermissionService(factory)
-    permissions.set_preset("c", PermissionPreset.FULL_ACCESS)
+    permissions.set_preset("c", PermissionPreset.FULL_ACCESS if full_access
+                           else PermissionPreset.READ_ONLY)
     context = MemoryRunContext("global-run", "c", "b", "msg")
     gateway = ToolGateway(permissions, tmp_path)
     gateway.memory_service = service
@@ -283,14 +285,19 @@ async def test_global_update_reaches_consent_and_changes_only_global_original(
     finally:
         await adapter.shutdown()
         await server.stop()
-    assert len(prompts) == 1 and prompts[0][0] == "更新全局记忆？"
-    assert "GLOBAL_ORIGINAL_TEST" in prompts[0][1] and "GLOBAL_UPDATED_TEST" in prompts[0][1]
-    assert "所有继承" in prompts[0][1] and "自定义覆盖" in prompts[0][1]
-    assert service.list()[0].content == ("GLOBAL_UPDATED_TEST" if accept else original.content)
+    expected = full_access or accept
+    if full_access:
+        assert prompts == []
+        assert all(not audit.user_confirmed for audit in permissions.list_audit("c"))
+    else:
+        assert len(prompts) == 1 and prompts[0][0] == "更新全局记忆？"
+        assert "GLOBAL_ORIGINAL_TEST" in prompts[0][1] and "GLOBAL_UPDATED_TEST" in prompts[0][1]
+        assert "所有继承" in prompts[0][1] and "自定义覆盖" in prompts[0][1]
+    assert service.list()[0].content == ("GLOBAL_UPDATED_TEST" if expected else original.content)
     assert service.effective_global("second")[0] == service.list()[0]
     assert service.effective_global("c")[0].content == "LOCAL_OVERRIDE_TEST"
     assert not service.list("c", "b")
-    if accept:
+    if expected:
         assert results[-1][0] == "update_memory" and results[-1][1].ok
         assert results[-1][1].data["scope"] == "global"
     else:
