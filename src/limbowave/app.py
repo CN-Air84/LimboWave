@@ -1610,7 +1610,14 @@ def _wire_impl(
     sent_ids_by_message: dict[str, tuple[str, ...]] = {}
     from limbowave.application.services.bounded_cache import BoundedCache
 
-    sent_items: BoundedCache[str, SentAttachment | None] = BoundedCache(128)
+    def _attachment_weight(item: SentAttachment | None) -> int:
+        if item is None or item.thumbnail is None:
+            return 1
+        return item.thumbnail.width() * item.thumbnail.height() * 4
+
+    sent_items: BoundedCache[str, SentAttachment | None] = BoundedCache(
+        128, max_weight=24 * 1024 * 1024, weight=_attachment_weight
+    )
 
     def _read_sent_attachment(attachment_id: str) -> tuple[str, str, QImage | None] | None:
         # QImage 解码可在线程中执行；QPixmap 只能在下面的 GUI 应用阶段创建。
@@ -1623,7 +1630,6 @@ def _wire_impl(
                     Path(image.source_path).name if image.source_path else image.id,
                     f"{image.format.value.upper()} · {image.dimensions} · {summary.size_text}"
                     f" · ~{summary.context_tokens_estimate} tokens(估算)",
-                    # 预览与附件 chip 共用此图；这里只解码原图，缩略图由 chip 自行生成。
                     decoded if not decoded.isNull() else None,
                 )
             if files is not None and (document := files.get(attachment_id)) is not None:
@@ -1636,10 +1642,19 @@ def _wire_impl(
             pass  # 附件已被删除或读不出：不影响消息本身。
         return None
 
-    def _display_attachment(data: tuple[str, str, QImage | None] | None) -> SentAttachment | None:
+    def _display_attachment(
+        data: tuple[str, str, QImage | None] | None, *, bounded: bool = True,
+    ) -> SentAttachment | None:
         if data is None:
             return None
         title, detail, image = data
+        if bounded and image is not None and not image.isNull() and (
+            image.width() > 1920 or image.height() > 1920
+        ):
+            image = image.scaled(
+                1920, 1920, Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
         return SentAttachment(
             title, detail, QPixmap.fromImage(image) if image is not None else None
         )
@@ -1685,8 +1700,8 @@ def _wire_impl(
     chat.attachments.attachment_removed.connect(lambda aid: sent_items.pop(aid, None))
 
     def _add_imported_attachment(attachment_id: str, data: Any) -> None:
-        item = _display_attachment(data)
-        sent_items[attachment_id] = item
+        item = _display_attachment(data, bounded=False)
+        sent_items[attachment_id] = _display_attachment(data)
         if item is not None:
             chat.attachments.add_attachment(
                 attachment_id, item.title, item.detail, thumbnail=item.thumbnail
