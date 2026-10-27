@@ -1533,7 +1533,7 @@ class _PermissionMenu(QMenu):
         rows = (
             (PermissionPreset.CHAT_ONLY, "仅聊天", "不允许模型调用工具"),
             (PermissionPreset.READ_ONLY, "自由读取", "可读工作区与网络，不可写入或执行命令"),
-            (PermissionPreset.FULL_ACCESS, "完全访问", "允许读取、写入、终端与联网"),
+            (PermissionPreset.FULL_ACCESS, "完全访问", "免确认放行所有本地工具"),
         )
         for preset, title, detail in rows:
             action = self.addAction(f"{title}    {detail}")
