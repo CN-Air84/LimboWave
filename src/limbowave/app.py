@@ -40,7 +40,6 @@ from qasync import QEventLoop
 from limbowave import __version__
 from limbowave.application.background import run_blocking
 from limbowave.application.events import FIRST_RESPONSE_COMPLETED
-from limbowave.application.history_view_payload import HistoryViewPayload, load_history_view
 from limbowave.application.kernel import AgentKernel, KernelEvent, KernelSetup
 from limbowave.application.services.history_reader import HistoryReader
 from limbowave.application.services.memory_service import (
@@ -58,9 +57,6 @@ from limbowave.bootstrap import APP_DISPLAY_NAME, APP_NAME, AppContext, AppPaths
 from limbowave.domain.conversation import Message
 from limbowave.domain.files import ATTACHMENT_FILE_FILTER, DOCUMENT_FILE_FILTER, FileKind
 from limbowave.domain.redaction import redact_text
-from limbowave.infrastructure.crypto.secret_store import migrate_legacy_secrets
-from limbowave.infrastructure.crypto.vault import InvalidPassword, Vault, VaultKey
-from limbowave.infrastructure.database.sqlite_repositories import sqlite_uow_factory
 from limbowave.infrastructure.diagnostics import LogConfig, LogLevel
 from limbowave.infrastructure.diagnostics.runtime import DiagnosticRuntime
 from limbowave.infrastructure.memory_repositories import in_memory_uow_factory
@@ -80,20 +76,55 @@ from limbowave.ui.model_selector import ModelSite
 from limbowave.ui.session_toolbar import RouteCandidate
 
 if TYPE_CHECKING:
+    from limbowave.application.history_view_payload import HistoryViewPayload
     from limbowave.application.repositories import UnitOfWorkFactory
     from limbowave.application.services.data_reset_service import DataResetService, ResetScope
     from limbowave.application.services.restore_service import PreparedRestore
     from limbowave.application.services.tool_gateway import ToolGateway
     from limbowave.domain.permissions import GrantScope, ToolRequest
+    from limbowave.infrastructure.crypto.vault import Vault, VaultKey
     from limbowave.ui.data_reset_panel import DataResetPanel
     from limbowave.ui.settings_panel import SettingsPage
     from limbowave.web.server import WebServer
 
 SMOKE_EXIT_MS = 400
 _LOG = logging.getLogger(__name__)
+_STARTUP_EXECUTOR = ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="limbowave-startup"
+)
 
 # 换行常量：多行文本拼接用它，避免转义在不同工具链里被吃掉
 NL = chr(10)
+
+
+def load_history_view(*args: Any, **kwargs: Any) -> Any:
+    """Load the heavy history projection stack only when history is opened."""
+    from limbowave.application.history_view_payload import load_history_view as implementation
+
+    return implementation(*args, **kwargs)
+
+
+def Vault(*args: Any, **kwargs: Any) -> Any:
+    from limbowave.infrastructure.crypto.vault import Vault as implementation
+
+    return implementation(*args, **kwargs)
+
+
+def migrate_legacy_secrets(*args: Any, **kwargs: Any) -> Any:
+    from limbowave.infrastructure.crypto.secret_store import (
+        migrate_legacy_secrets as implementation,
+    )
+
+    return implementation(*args, **kwargs)
+
+
+def sqlite_uow_factory(*args: Any, **kwargs: Any) -> Any:
+    from limbowave.infrastructure.database.sqlite_repositories import (
+        sqlite_uow_factory as implementation,
+    )
+
+    return implementation(*args, **kwargs)
+
 
 
 def build_application(argv: Sequence[str]) -> QApplication:
@@ -176,12 +207,11 @@ def _run_startup_task[T](work: Callable[[], T]) -> T:
     sub = QEventLoop()
     completion = _StartupTaskCompletion()
     completion.finished.connect(sub.quit, Qt.ConnectionType.QueuedConnection)
-    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="limbowave-startup") as executor:
-        future = executor.submit(work)
-        future.add_done_callback(lambda _future: completion.finished.emit())
-        if not future.done():
-            sub.exec()
-        return future.result()
+    future = _STARTUP_EXECUTOR.submit(work)
+    future.add_done_callback(lambda _future: completion.finished.emit())
+    if not future.done():
+        sub.exec()
+    return future.result()
 
 
 def _ask_password(parent: QWidget, title: str, label: str) -> str | None:
@@ -281,6 +311,8 @@ def _unlock_vault(paths: AppPaths, parent: QWidget) -> VaultKey | None:
     - 取消/失败返回 None——应用进入「未解锁」降级模式（不持久化、无内核）。
     解锁成功后顺带迁移 Phase 1A 旧格式密钥。
     """
+    from limbowave.infrastructure.crypto.vault import InvalidPassword
+
     vault = Vault(paths.data_root / "vault.json")
     if not vault.exists:
         password = _ask_password(
@@ -810,6 +842,7 @@ def _open_data_reset(
     from shiboken6 import isValid
 
     from limbowave.application.services.data_reset_service import DataResetError, DataResetService
+    from limbowave.infrastructure.crypto.vault import InvalidPassword
     from limbowave.ui.data_reset_panel import DataResetPanel
 
     panel = DataResetPanel(parent, str(data_root))
@@ -978,7 +1011,6 @@ def _wire_impl(
     from limbowave.application.services.tool_gateway import ToolGateway
     from limbowave.infrastructure.configuration.json_config_repository import JsonConfigRepository
     from limbowave.infrastructure.crypto.secret_store import SecretStore
-    from limbowave.infrastructure.network_backend import create_network_tools
 
     settings = SettingsService(
         ConfigurationService(JsonConfigRepository(paths.data_root / "config.json"))
@@ -1000,19 +1032,26 @@ def _wire_impl(
 
         blob_store = BlobStore(paths.data_root / "blobs", key)
         files = FileService(uow_factory, blob_store=blob_store)
-    from limbowave.application.services.tool_gateway import TerminalTools
-    from limbowave.infrastructure.shell import create_executor, probe_shell
+    def _prepare_tool_backends() -> tuple[Any, Any, Any, Any]:
+        from limbowave.application.services.tool_gateway import TerminalTools
+        from limbowave.infrastructure.environment import create_environment_service
+        from limbowave.infrastructure.network_backend import create_network_tools
+        from limbowave.infrastructure.shell import create_executor, probe_shell
 
-    shell_env = _run_startup_task(partial(probe_shell, paths.data_root))
-    terminal = TerminalTools(create_executor(shell_env)) if shell_env is not None else None
+        shell_env = probe_shell(paths.data_root)
+        terminal = TerminalTools(create_executor(shell_env)) if shell_env is not None else None
+        network=create_network_tools(settings, credentials)
+        return shell_env, terminal, network, create_environment_service()
+
+    shell_env, terminal, network_tools, environment_service = _run_startup_task(
+        _prepare_tool_backends
+    )
     from limbowave.application.services.chat_history_service import ChatHistoryService
-    from limbowave.infrastructure.environment import create_environment_service
 
-    environment_service = create_environment_service()
     tool_gateway = ToolGateway(
         permissions, paths.data_root, documents=files, terminal=terminal,
-        network=create_network_tools(settings, credentials),
-        chat_history=ChatHistoryService(uow_factory), environment=environment_service,
+        network=network_tools, chat_history=ChatHistoryService(uow_factory),
+        environment=environment_service,
     )
     # 装配可观测：read_document 报「文档服务未配置」时，先看这条日志——
     # documents=False 意味着这个进程跑在未解锁状态，或是修复前的旧进程。

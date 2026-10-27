@@ -146,6 +146,12 @@ def test_prepared_appearance_is_not_reapplied(qtbot, tmp_path: Path, monkeypatch
         asyncio.set_event_loop(None)
 
 
+def test_startup_tasks_reuse_one_worker_thread(qtbot):
+    threads = [app._run_startup_task(threading.get_ident) for _ in range(6)]
+    assert len(set(threads)) == 1
+    assert threads[0] != threading.get_ident()
+
+
 def test_instant_startup_results_do_not_lose_completion(qtbot):
     expected = object()
     for _ in range(30):
@@ -233,6 +239,31 @@ def test_startup_does_not_load_opt_in_lan_or_warm_storage(
             loop.run_until_complete(shutdown())
         loop.close()
         asyncio.set_event_loop(None)
+
+
+def test_app_import_defers_storage_and_crypto_implementations() -> None:
+    result = __import__("subprocess").run(
+        [__import__("sys").executable, "-c", (
+            "import sys; from limbowave import app; "
+            "assert 'limbowave.infrastructure.crypto.vault' not in sys.modules; "
+            "assert 'limbowave.infrastructure.crypto.secret_store' not in sys.modules; "
+            "assert 'limbowave.infrastructure.database.sqlite_repositories' not in sys.modules"
+        )],
+        capture_output=True, text=True, timeout=20,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_app_import_defers_history_projection_stack() -> None:
+    result = __import__("subprocess").run(
+        [__import__("sys").executable, "-c", (
+            "import sys; from limbowave import app; "
+            "assert 'limbowave.application.history_view_payload' not in sys.modules; "
+            "assert 'limbowave.application.history_payload' not in sys.modules"
+        )],
+        capture_output=True, text=True, timeout=20,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_ready_path_does_not_prewarm_settings():
