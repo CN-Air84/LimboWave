@@ -238,3 +238,7 @@ def test_transaction_failure_also_releases_owned_connection(
     with pytest.raises(sqlite3.ProgrammingError):
         unit.conversations.list_all()
     factory.close()
+
+
+def test_full_reset_explicitly_includes_mcp_configuration():
+    assert "mcp.json" in RESET_FILES
