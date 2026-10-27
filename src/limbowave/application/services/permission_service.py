@@ -25,7 +25,6 @@ from limbowave.domain.permissions import (
     PermissionDecision,
     PermissionGrant,
     PermissionPreset,
-    RiskLevel,
     ToolRequest,
     evaluate,
 )
@@ -158,17 +157,16 @@ class PermissionService:
         """
         with self._uow_factory() as uow:
             grants = uow.permissions.list_grants(conversation_id)
-            conversation = (
-                uow.conversations.get(conversation_id)
-                if request.capability is Capability.HISTORY_READ else None
-            )
+            conversation = uow.conversations.get(conversation_id)
 
         decision = evaluate(request, grants, mode=mode)
-        if (request.capability is Capability.HISTORY_READ and conversation is not None
+        if (conversation is not None
                 and conversation.permission_preset is PermissionPreset.FULL_ACCESS):
-            decision = PermissionDecision(
-                decision=Decision.ALLOW, risk=RiskLevel.NORMAL,
-                reason="完全访问允许查询既有聊天记录", matched_rule="history.full_access",
+            # A persisted local preset authorizes every capability, not merely the UI gate.
+            # Keep the original risk classification and explicit-denial override for audit.
+            decision = replace(
+                decision, decision=Decision.ALLOW,
+                reason="完全访问自动允许所有工具操作", matched_rule="preset.full_access",
             )
         if user_denied:
             user_confirmed = False
