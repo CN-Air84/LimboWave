@@ -412,3 +412,26 @@ async def test_normalized_user_anchor_roundtrips_through_storage_process(process
     await coord.wait_idle()
     assert kernel.sent == ["image question", "image question"]
     assert HistoryService(factory).branch_messages(original_branch) == original
+
+
+async def test_idle_worker_releases_process_and_restarts(tmp_path, vault_key, monkeypatch):
+    database = tmp_path / "idle.db"
+    factory = sqlite_uow_factory(database, vault_key)
+    worker = ConversationProcess(
+        ConversationProcessConfig(database, tmp_path, vault_key.key_bytes())
+    )
+    monkeypatch.setattr(worker, "IDLE_SECONDS", 0.01)
+    try:
+        first = await worker.call("pid", (None, None))
+        for _ in range(100):
+            if worker._executor is None and worker._idle_task is None:
+                break
+            await asyncio.sleep(0.01)
+        assert worker._executor is None
+        second = await worker.call("pid", (None, None))
+        assert second != os.getpid()
+        assert worker._executor is not None
+        assert first != second
+    finally:
+        await worker.close()
+        factory.close()

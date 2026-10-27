@@ -108,10 +108,14 @@ def _execute(
 
 
 class ConversationProcess:
+    IDLE_SECONDS = 180.0
+
     def __init__(self, config: ConversationProcessConfig) -> None:
         self._config = config
         self._executor: ProcessPoolExecutor | None = None
         self._closed = False
+        self._calls = 0
+        self._idle_task: asyncio.Task[None] | None = None
 
     async def warm(self) -> int:
         """Optional diagnostic/prewarm hook; production intentionally starts lazily."""
@@ -123,13 +127,18 @@ class ConversationProcess:
     ) -> Any:
         if self._closed:
             raise RuntimeError("Conversation storage process is closed")
+        if self._idle_task is not None:
+            self._idle_task.cancel()
+            self._idle_task = None
         if self._executor is None:
             self._executor = ProcessPoolExecutor(
                 max_workers=1, mp_context=multiprocessing.get_context("spawn"),
                 initializer=_initialize, initargs=(self._config,),
             )
+        executor = self._executor
+        self._calls += 1
         pending = asyncio.get_running_loop().run_in_executor(
-            self._executor, partial(_execute, operation, location, args, kwargs)
+            executor, partial(_execute, operation, location, args, kwargs)
         )
         try:
             return await asyncio.shield(pending)
@@ -137,14 +146,41 @@ class ConversationProcess:
             # Do not close the vault/reset files while a submitted transaction is still running.
             await asyncio.gather(pending, return_exceptions=True)
             raise
+        finally:
+            self._calls -= 1
+            if not self._closed and self._calls == 0 and self._executor is executor:
+                self._idle_task = asyncio.create_task(self._release_when_idle(executor))
+
+
+    async def _release_when_idle(self, executor: ProcessPoolExecutor) -> None:
+        try:
+            await asyncio.sleep(self.IDLE_SECONDS)
+            if self._closed or self._calls or self._executor is not executor:
+                return
+            self._executor = None
+            await asyncio.to_thread(executor.shutdown, wait=True, cancel_futures=True)
+        except asyncio.CancelledError:
+            return
+        finally:
+            if self._idle_task is asyncio.current_task():
+                self._idle_task = None
 
     async def close(self) -> None:
         self._closed = True
-        if self._executor is not None:
-            await asyncio.to_thread(self._executor.shutdown, wait=True, cancel_futures=True)
+        if self._idle_task is not None:
+            self._idle_task.cancel()
+            await asyncio.gather(self._idle_task, return_exceptions=True)
+            self._idle_task = None
+        executor, self._executor = self._executor, None
+        if executor is not None:
+            await asyncio.to_thread(executor.shutdown, wait=True, cancel_futures=True)
 
     def close_unstarted(self) -> None:
         """Startup rollback only: no jobs have been submitted before first use."""
         self._closed = True
-        if self._executor is not None:
-            self._executor.shutdown(wait=False, cancel_futures=True)
+        if self._idle_task is not None:
+            self._idle_task.cancel()
+            self._idle_task = None
+        executor, self._executor = self._executor, None
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
