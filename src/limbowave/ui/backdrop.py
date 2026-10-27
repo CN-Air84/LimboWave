@@ -24,11 +24,11 @@ from PySide6.QtWidgets import QWidget
 
 from limbowave.domain.appearance import BackgroundSettings
 
-MAX_RENDER_WIDTH = 3840
-MAX_RENDER_HEIGHT = 2160
+MAX_RENDER_WIDTH = 2560
+MAX_RENDER_HEIGHT = 1440
 MAX_SOURCE_PIXELS = 64_000_000
 MAX_IMAGE_BYTES = 32 * 1024 * 1024
-MAX_CACHE_BYTES = 192 * 1024 * 1024
+MAX_CACHE_BYTES = 48 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -225,13 +225,16 @@ class BackdropEngine(QObject):
 
     def clear(self) -> None:
         self.discard_pending()
+        self._future = None
         self._frame = QPixmap()
         self._frames.clear()
+        self._cache.clear()
+        self._cache_bytes = 0
         self.changed.emit()
 
     def close(self) -> None:
         self._closed = True
-        self.discard_pending()
+        self.clear()
         self._executor.shutdown(wait=False, cancel_futures=True)
 
     def prepare(self, image_path: str, radius: int) -> bool:
@@ -356,6 +359,7 @@ class BackdropEngine(QObject):
         generation, keys, payload = cast(
             tuple[int, tuple[_RenderKey, ...], dict[int, tuple[bytes, int, int]]], result
         )
+        self._future = None
         self._install(generation, keys, payload)
 
     def _install(

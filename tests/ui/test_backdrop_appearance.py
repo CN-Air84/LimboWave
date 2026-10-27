@@ -552,3 +552,33 @@ def test_imported_font_is_managed_and_survives_reload(
     assert Path(saved.font_file).parent == preferences.path.parent / "fonts"
     editor.reload()
     assert editor._family.currentData() == saved.font_family
+
+
+def test_clear_releases_cached_frames_and_finished_payload(qtbot: QtBot, tmp_path: Path) -> None:
+    image = tmp_path / "wall.png"
+    _image(image)
+    workspace = QWidget()
+    qtbot.addWidget(workspace)
+    workspace.resize(500, 300)
+    engine = BackdropEngine(workspace)
+    assert engine.prepare(str(image), 14)
+    assert engine._cache_bytes > 0
+    engine.clear()
+    assert engine._cache_bytes == 0
+    assert not engine._cache
+    assert not engine._frames
+    engine.close()
+
+
+def test_large_backdrop_render_is_memory_bounded(qtbot: QtBot, tmp_path: Path) -> None:
+    image = tmp_path / "large.png"
+    Image.new("RGB", (3840, 2160), "#446688").save(image)
+    workspace = QWidget()
+    qtbot.addWidget(workspace)
+    workspace.resize(3840, 2160)
+    engine = BackdropEngine(workspace)
+    assert engine.prepare(str(image), 18)
+    assert engine._frame.width() <= 2560
+    assert engine._frame.height() <= 1440
+    assert engine._cache_bytes <= 48 * 1024 * 1024
+    engine.close()
