@@ -207,3 +207,31 @@ async def test_schema_error_and_missing_tool_never_execute():
         with pytest.raises(McpError):
             await _exchange(client, name, args)
     client.call_tool.assert_not_awaited()
+
+
+async def test_redirect_rejected_before_sdk_can_replay_post():
+    import httpx
+
+    from limbowave.infrastructure.mcp_client import _reject_redirect
+
+    response = httpx.Response(307, headers={"location": "https://example.org/secret"},
+                              request=httpx.Request("POST", "https://example.org/mcp"))
+    with pytest.raises(McpError) as error:
+        await _reject_redirect(response)
+    assert "secret" not in str(error.value)
+    assert response.is_closed
+
+
+def test_transport_log_filter_is_scoped_and_never_formats_payload():
+    import logging
+
+    from limbowave.infrastructure.mcp_client import _LOG_FILTER, _LOG_SCOPE
+
+    record = logging.LogRecord("httpx", logging.INFO, "", 1, "token=secret", (), None)
+    assert _LOG_FILTER.filter(record)
+    token = _LOG_SCOPE.set(True)
+    try:
+        assert not _LOG_FILTER.filter(record)
+    finally:
+        _LOG_SCOPE.reset(token)
+    assert _LOG_FILTER.filter(record)

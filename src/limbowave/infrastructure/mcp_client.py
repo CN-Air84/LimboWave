@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from contextlib import AsyncExitStack
+from contextvars import ContextVar
 from datetime import timedelta
 from typing import Any
 
@@ -19,6 +21,33 @@ from mcp.types import Tool
 from limbowave.application.services.mcp_service import mcp_cancelled
 from limbowave.application.services.network_privacy import check_network_destination
 from limbowave.domain.mcp import MAX_CATALOG_BYTES, MAX_TOOLS, McpError, McpServer
+
+_LOG_SCOPE: ContextVar[bool] = ContextVar("mcp_transport_log_scope", default=False)
+
+
+class _PrivateTransportLogs(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        # SDK diagnostics can contain raw responses, full URLs and session credentials.
+        # Filters are context-local: unrelated HTTP/application logging stays intact.
+        return not _LOG_SCOPE.get()
+
+
+_LOG_FILTER = _PrivateTransportLogs()
+for _logger in ("", "client", "mcp.client.stdio", "mcp.client.streamable_http", "httpx",
+                "httpcore.connection", "httpcore.http11", "httpcore.http2", "httpcore.proxy"):
+    logging.getLogger(_logger).addFilter(_LOG_FILTER)
+
+
+async def _check_request(request: httpx.Request) -> None:
+    check_network_destination(str(request.url))
+
+
+async def _reject_redirect(response: httpx.Response) -> None:
+    # The SDK follows same-origin 307/308 itself, even with follow_redirects=False.
+    # Reject before its manual redirect code can replay a mutating POST.
+    if 300 <= response.status_code < 400:
+        await response.aclose()
+        raise McpError("MCP 地址发生重定向，已停止；请在设置中填写最终地址。")
 
 
 def _environment_refs(refs: dict[str, str]) -> dict[str, str]:
@@ -140,6 +169,7 @@ async def perform(server: McpServer, tool: str | None, arguments: dict[str, Any]
 async def _perform_session(
     server: McpServer, tool: str | None, arguments: dict[str, Any],
 ) -> dict[str, Any]:
+    log_token = _LOG_SCOPE.set(True)
     try:
         # anyio scopes surround SDK task groups, and exit in the same task/order.
         with anyio.fail_after(server.timeout_seconds):
@@ -168,6 +198,8 @@ async def _perform_session(
                             timeout=httpx.Timeout(server.timeout_seconds),
                             follow_redirects=False,
                             trust_env=False,
+                            event_hooks={"request": [_check_request],
+                                         "response": [_reject_redirect]},
                         )
                     )
                     read, write, _ = await stack.enter_async_context(
@@ -196,3 +228,5 @@ async def _perform_session(
         raise McpError(
             "MCP 连接或调用失败；请检查服务器、认证环境变量与参数。未自动重试。"
         ) from None
+    finally:
+        _LOG_SCOPE.reset(log_token)
