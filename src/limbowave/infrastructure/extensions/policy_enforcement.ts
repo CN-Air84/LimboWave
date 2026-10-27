@@ -231,6 +231,7 @@ async function callAppTool(
   tool: string,
   params: Record<string, unknown>,
   confirmed: boolean,
+  signal?: AbortSignal,
 ): Promise<ToolCallResponse> {
   const ipc = loadToolIpc();
   if (!ipc) {
@@ -238,7 +239,7 @@ async function callAppTool(
   }
 
   const request: ToolCallRequest = { token: ipc.token, tool, params, confirmed };
-  return await callAppIpc(ipc, request);
+  return await callAppIpc(ipc, request, signal);
 }
 
 async function callAppIpc(
@@ -415,8 +416,11 @@ function registerProxiedTool(
         definition.name,
         MEMORY_CONTEXT_TOOLS.has(definition.name)
           ? { ...(params ?? {}), call_id: _toolCallId, run_id: memoryContext?.run_id ?? "" }
-          : (params ?? {}) as Record<string, unknown>,
+          : ["list_mcp_tools", "call_mcp_tool"].includes(definition.name)
+            ? { ...(params ?? {}), run_id: runId ?? "" }
+            : (params ?? {}) as Record<string, unknown>,
         true,
+        _signal,
       );
       if (response.ok && memoryContext?.run_id === runId && memoryContext &&
           ["read_scratchpad", "write_scratchpad"].includes(definition.name) &&

@@ -87,3 +87,35 @@ async def test_real_streamable_http(http_server):
     )
     result = await perform(server, "echo", {"text": "http roundtrip"})
     assert result["content"][0]["text"] == "http roundtrip"
+
+
+async def test_run_cancellation_closes_stdio_promptly():
+    import asyncio
+    from threading import Event
+
+    from limbowave.application.services.mcp_service import mcp_run_scope
+
+    cancelled = Event()
+    start = time.monotonic()
+    with mcp_run_scope(cancelled):
+        task = asyncio.create_task(perform(stdio(timeout_seconds=30), "slow", {}))
+        await asyncio.sleep(2)
+        cancelled.set()
+        with pytest.raises(McpError, match="取消"):
+            await task
+    assert time.monotonic() - start < 10
+
+
+async def test_cancelled_run_never_starts_transport(monkeypatch):
+    from threading import Event
+    from unittest.mock import AsyncMock
+
+    from limbowave.application.services.mcp_service import mcp_run_scope
+
+    cancelled = Event()
+    cancelled.set()
+    transport = AsyncMock()
+    monkeypatch.setattr("limbowave.infrastructure.mcp_client._perform_session", transport)
+    with mcp_run_scope(cancelled), pytest.raises(McpError, match="停止"):
+        await perform(stdio(), None, {})
+    transport.assert_not_called()

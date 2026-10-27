@@ -16,6 +16,7 @@ from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamable_http_client
 from mcp.types import Tool
 
+from limbowave.application.services.mcp_service import mcp_cancelled
 from limbowave.application.services.network_privacy import check_network_destination
 from limbowave.domain.mcp import MAX_CATALOG_BYTES, MAX_TOOLS, McpError, McpServer
 
@@ -113,6 +114,32 @@ async def _exchange(
 
 
 async def perform(server: McpServer, tool: str | None, arguments: dict[str, Any]) -> dict[str, Any]:
+    if mcp_cancelled():
+        raise McpError("MCP 调用所属运行已停止，未启动服务器。")
+    result: dict[str, Any] | None = None
+    failure: McpError | None = None
+    async with anyio.create_task_group() as group:
+        async def watch() -> None:
+            while not mcp_cancelled():
+                await anyio.sleep(0.05)
+            group.cancel_scope.cancel()
+        group.start_soon(watch)
+        try:
+            result = await _perform_session(server, tool, arguments)
+        except McpError as exc:
+            failure = exc
+        finally:
+            group.cancel_scope.cancel()
+    if failure is not None:
+        raise failure
+    if result is None or mcp_cancelled():
+        raise McpError("MCP 调用已取消，连接已关闭；外部操作可能已发生，请先核对状态。")
+    return result
+
+
+async def _perform_session(
+    server: McpServer, tool: str | None, arguments: dict[str, Any],
+) -> dict[str, Any]:
     try:
         # anyio scopes surround SDK task groups, and exit in the same task/order.
         with anyio.fail_after(server.timeout_seconds):

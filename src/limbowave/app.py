@@ -56,6 +56,7 @@ from limbowave.application.services.thinking_trial import ThinkingTrial
 from limbowave.bootstrap import APP_DISPLAY_NAME, APP_NAME, AppContext, AppPaths, create_context
 from limbowave.domain.conversation import Message
 from limbowave.domain.files import ATTACHMENT_FILE_FILTER, DOCUMENT_FILE_FILTER, FileKind
+from limbowave.domain.mcp import MCP_TOOLS
 from limbowave.domain.redaction import redact_text
 from limbowave.infrastructure.diagnostics import LogConfig, LogLevel
 from limbowave.infrastructure.diagnostics.runtime import DiagnosticRuntime
@@ -1142,9 +1143,35 @@ def _wire_impl(
             if context is None:
                 return {"ok": False, "error": "记忆调用没有活动运行"}
             conversation_id = context.conversation_id
-        result = await run_blocking(
-            tool_gateway.invoke, tool_name, params, conversation_id, user_confirmed=confirmed
-        )
+        if tool_name in MCP_TOOLS:
+            from limbowave.application.services.mcp_service import mcp_run_scope
+
+            context = tool_gateway.memory_context()
+            if (context is None or context.run_id != params.get("run_id")
+                    or context.conversation_id != conversation_id or resetting or restoring):
+                return {"ok": False, "error": "MCP 调用没有有效的活动运行，未执行"}
+            params = {k: v for k, v in params.items() if k != "run_id"}
+            cancelled = Event()
+            async def watch_mcp_run() -> None:
+                while (tool_gateway.memory_context() == context
+                       and not shutting_down and not resetting and not restoring):
+                    await asyncio.sleep(0.05)
+                cancelled.set()
+            watcher = asyncio.create_task(watch_mcp_run())
+            try:
+                with mcp_run_scope(cancelled):
+                    result = await run_blocking(
+                        tool_gateway.invoke, tool_name, params, conversation_id,
+                        user_confirmed=confirmed,
+                    )
+            finally:
+                cancelled.set()
+                watcher.cancel()
+                await asyncio.gather(watcher, return_exceptions=True)
+        else:
+            result = await run_blocking(
+                tool_gateway.invoke, tool_name, params, conversation_id, user_confirmed=confirmed
+            )
         return {
             "ok": result.ok,
             "data": result.data,

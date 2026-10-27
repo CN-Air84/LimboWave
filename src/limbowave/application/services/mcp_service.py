@@ -6,12 +6,31 @@ import asyncio
 import json
 import os
 import tempfile
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
-from threading import RLock
+from threading import Event, RLock
 from typing import Any
 
 from limbowave.domain.mcp import MAX_ARGUMENT_BYTES, McpConfiguration, McpError, McpServer
+
+_CANCELLED: ContextVar[Event | None] = ContextVar("mcp_cancelled", default=None)
+
+
+@contextmanager
+def mcp_run_scope(cancelled: Event) -> Iterator[None]:
+    token = _CANCELLED.set(cancelled)
+    try:
+        yield
+    finally:
+        _CANCELLED.reset(token)
+
+
+def mcp_cancelled() -> bool:
+    event = _CANCELLED.get()
+    return event is not None and event.is_set()
+
 
 Operation = Callable[[McpServer, str | None, dict[str, Any]], Coroutine[Any, Any, dict[str, Any]]]
 
@@ -77,6 +96,8 @@ class McpService:
     def execute(
         self, server_id: str, tool: str | None = None, arguments: dict[str, Any] | None = None
     ) -> dict[str, Any]:
+        if mcp_cancelled():
+            raise McpError("MCP 调用所属运行已停止，未启动服务器。")
         server = self.resolve(server_id)
         if tool is not None and (
             not tool.strip() or len(tool) > 128 or any(ord(c) < 32 for c in tool)

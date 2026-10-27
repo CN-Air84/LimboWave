@@ -25,7 +25,7 @@ assert(!commands.has("limbowave-capabilities"));
 process.env.LIMBOWAVE_CONTROL_TOKEN = "control";
 const names = ["web_search", "read_url", "reminders", "background_monitoring", "file_read",
   "file_write", "terminal", "attachments", "chat_history", "memory_read", "memory_write",
-  "memory_edit", "scratchpad", "clock", "environment"];
+  "memory_edit", "scratchpad", "clock", "environment", "mcp"];
 let state = "active";
 let mode = "ok";
 let calls = 0;
