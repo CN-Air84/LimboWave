@@ -1,4 +1,4 @@
-"""The real memory consent popup must appear under FULL_ACCESS; no dialog mocks."""
+"""Restricted presets show real consent; full access auto-approves without a popup."""
 
 import asyncio
 import json
@@ -23,7 +23,7 @@ from tests.unit.test_memory_service import memory_stack as memory_stack
     ("update_memory", {"updated_content": "updated global content"}, "global"),
 ])
 @pytest.mark.parametrize("accept", [True, False])
-async def test_full_access_still_shows_real_memory_confirmation(
+async def test_restricted_access_still_shows_real_memory_confirmation(
     qtbot, memory_stack, tmp_path, tool, arguments, scope, accept,
 ):
     service, factory = memory_stack
@@ -31,7 +31,7 @@ async def test_full_access_still_shows_real_memory_confirmation(
     conversation_id, branch_id = (None, None) if scope == "global" else ("c", "b")
     original = service.save("original content", conversation_id, branch_id)
     permissions = PermissionService(factory)
-    permissions.set_preset("c", PermissionPreset.FULL_ACCESS)
+    permissions.set_preset("c", PermissionPreset.READ_ONLY)
     context = MemoryRunContext("r", "c", "b", "msg")
     gateway = ToolGateway(permissions, tmp_path)
     gateway.memory_service = service
@@ -80,3 +80,40 @@ async def test_full_access_still_shows_real_memory_confirmation(
             task.cancel()
             with suppress(asyncio.CancelledError):
                 await task
+
+
+@pytest.mark.parametrize("tool,arguments,scope", [
+    ("update_memory", {"updated_content": "updated content"}, "session"),
+    ("delete_session_memory", {"archive": True}, "session"),
+    ("delete_session_memory", {"archive": False}, "session"),
+    ("update_memory", {"updated_content": "updated global content"}, "global"),
+    ("add_session_memory", {"content": "new memory"}, "session"),
+])
+async def test_full_access_memory_never_prompts(
+    qtbot, memory_stack, tmp_path, tool, arguments, scope,
+):
+    service, factory = memory_stack
+    permissions = PermissionService(factory)
+    permissions.set_preset("c", PermissionPreset.FULL_ACCESS)
+    context = MemoryRunContext("r", "c", "b", "msg")
+    gateway = ToolGateway(permissions, tmp_path)
+    gateway.memory_service = service
+    gateway.memory_context = lambda: context
+    host = QWidget()
+    qtbot.addWidget(host)
+    handler = _make_permission_handler(host, permissions, lambda: "c", gateway,
+                                       memory_service=service, memory_context=lambda: context)
+    params = dict(arguments)
+    if tool != "add_session_memory":
+        conversation_id, branch_id = (None, None) if scope == "global" else ("c", "b")
+        original = service.save("original content", conversation_id, branch_id)
+        params["memory_id"] = original.id
+    allowed = await asyncio.wait_for(handler(f"limbowave.gate:{tool}", json.dumps({
+        "tool": tool, "input": params, "run_id": "r", "call_id": "call",
+    })), timeout=3)
+    assert allowed
+    assert host.findChild(FloatingPanel) is None
+    result = gateway.invoke(tool, {**params, "run_id": "r", "call_id": "call"}, "c")
+    assert result.ok
+    assert all(not audit.user_confirmed for audit in permissions.list_audit("c"))
+    assert permissions.list_audit("c")[-1].matched_rule == "preset.full_access"
