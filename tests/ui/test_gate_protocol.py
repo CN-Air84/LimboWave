@@ -142,11 +142,14 @@ async def test_custom_uses_saved_capability_grants(
     assert await handler(*_gate("create_file", {"path": "n.txt", "content": "x"})) is False
 
 
-async def test_invalid_path_is_rejected_without_prompt(
+async def test_full_access_accepts_outside_paths_but_rejects_invalid_paths(
     gate_env: tuple[PermissionService, ToolGateway],
 ) -> None:
     handler = _handler(gate_env, PermissionPreset.FULL_ACCESS)
-    assert await handler(*_gate("stat_file", {"path": "../outside.txt"})) is False
+    assert await handler(*_gate("stat_file", {"path": "../outside.txt"})) is True
+    assert await handler(*_gate("stat_file", {"path": "bad\x00path"})) is False
+    limited = _handler(gate_env, PermissionPreset.READ_ONLY)
+    assert await limited(*_gate("stat_file", {"path": "../outside.txt"})) is False
 
 
 # ---------- 会话级站点覆盖与视觉能力（Phase 10 / Task 4.4 回归） ----------

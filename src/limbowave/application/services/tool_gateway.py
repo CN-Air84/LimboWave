@@ -67,7 +67,7 @@ from limbowave.domain.network import (
     WebResponse,
 )
 from limbowave.domain.network_guard import NetworkBlocked, check_host
-from limbowave.domain.path_guard import PathEscape, resolve_within
+from limbowave.domain.path_guard import PathEscape, resolve_within, validate_path
 from limbowave.domain.permissions import (
     Capability,
     Decision,
@@ -247,7 +247,10 @@ class FileTools:
         self._documents = documents
 
     def resolve_path(self, raw: str) -> Path:
-        """解析并确认路径在工作区内。越界抛 OutsideAllowedRoot。"""
+        """Resolve valid paths; only trusted full-access calls may leave the workspace."""
+        if has_full_access():
+            candidate = validate_path(raw)
+            return (candidate if candidate.is_absolute() else self._root / candidate).resolve()
         return resolve_within(self._root, raw)
 
     def list_directory(self, path: str = ".") -> dict[str, Any]:

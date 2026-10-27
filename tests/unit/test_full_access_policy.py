@@ -93,3 +93,20 @@ def test_remote_origin_cannot_create_full_access_scope(permissions, tmp_path):
                           network=NetworkTools(fetcher=lambda url: calls.append(url)))
     result = gateway.invoke("read_url", {"url": "http://localhost/"}, "full", user_confirmed=True)
     assert not result.ok and not calls and not has_full_access()
+
+
+def test_full_access_file_scope_is_validated_and_never_leaks(permissions, tmp_path):
+    from limbowave.application.services.tool_gateway import ToolGateway
+
+    root = tmp_path / "workspace"
+    root.mkdir()
+    gateway = ToolGateway(permissions, root)
+    outside = {"path": "../outside.txt", "content": "test data"}
+    assert gateway.invoke("create_file", outside, "full").ok
+    assert (tmp_path / "outside.txt").read_text(encoding="utf-8") == "test data"
+    assert gateway.invoke("stat_file", {"path": "../outside.txt"}, "full").ok
+    assert not gateway.invoke("stat_file", {"path": "../outside.txt"}, "normal",
+                              user_confirmed=True).ok
+    assert not gateway.invoke("stat_file", {"path": "bad\x00path"}, "full").ok
+    audit = permissions.list_audit("full")[-1]
+    assert audit.actual_paths == (str(tmp_path / "outside.txt"),)

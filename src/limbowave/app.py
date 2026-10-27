@@ -733,10 +733,6 @@ def _make_permission_handler(
                 classify_risk,
             )
 
-            try:
-                request = await run_blocking(_gate_tool_request, gate, gateway)
-            except (PathEscape, ToolError):
-                return False
             preset = (
                 await run_blocking(preset_provider, conversation_id)
                 if preset_provider is not None
@@ -744,6 +740,13 @@ def _make_permission_handler(
             )
             if not isinstance(preset, PermissionPreset):
                 preset = PermissionPreset(preset)
+            from limbowave.application.services.tool_access import tool_access_scope
+
+            try:
+                with tool_access_scope(preset is PermissionPreset.FULL_ACCESS):
+                    request = await run_blocking(_gate_tool_request, gate, gateway)
+            except (PathEscape, ToolError):
+                return False
 
             if request.capability is Capability.HISTORY_READ:
                 from limbowave.ui.permission_prompt import ONCE
@@ -808,7 +811,7 @@ def _make_permission_handler(
 
             if preset is PermissionPreset.FULL_ACCESS:
                 await run_blocking(
-                    permissions.authorize, request, conversation_id, user_confirmed=True
+                    permissions.authorize, request, conversation_id
                 )
                 return True
 
