@@ -1,41 +1,21 @@
 """Qt-free history projection shared by the GUI and conversation worker."""
 
-from typing import NamedTuple
+from __future__ import annotations
 
-from limbowave.application.repositories import UnitOfWorkFactory
+from typing import TYPE_CHECKING
+
+from limbowave.application.history_entry import HistoryEntry
 from limbowave.application.tool_step_payload import prepare_tool_step
 from limbowave.domain.compaction import CompressionContext, CompressionStatus
 from limbowave.domain.conversation import (
-    AssistantMessageSegment,
     Message,
     MessageRole,
     MessageStatus,
 )
 from limbowave.domain.run import RunStatus
-from limbowave.domain.tool_step import ToolStep
 
-
-class HistoryEntry(NamedTuple):
-    """历史载荷：一条消息的展示数据。
-
-    ``run_id`` 相同且相邻的助手条目渲染进**同一张卡片**（一轮 Agent run 一卡，
-    卡内按消息分段）。``run_id`` / ``tool_steps`` 有默认值：不带这两个字段的
-    旧 4 元组载荷仍可用，此时每条消息一张卡，行为与合并前一致。
-    ``compressions`` 是此消息之后的压缩分隔线，不计入消息数量或模型上下文。
-    """
-
-    role: str
-    content: str
-    thinking: str
-    message_id: str | None
-    run_id: str | None = None
-    tool_steps: tuple[ToolStep, ...] = ()
-    retry_available: bool = False
-    can_fork: bool = True
-    segments: tuple[AssistantMessageSegment, ...] = ()
-    # Presentation-only boundaries: original messages and model context stay unchanged.
-    compressions: tuple[CompressionContext, ...] = ()
-
+if TYPE_CHECKING:
+    from limbowave.application.repositories import UnitOfWorkFactory
 
 
 def history_payload(

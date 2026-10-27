@@ -2,7 +2,8 @@
 
 from dataclasses import dataclass
 
-from limbowave.application.history_payload import HistoryEntry, history_payload
+from limbowave.application.history_entry import HistoryEntry
+from limbowave.application.history_payload import history_payload
 from limbowave.application.repositories import UnitOfWorkFactory
 from limbowave.application.services.history_service import HistoryService
 from limbowave.application.services.permission_service import PermissionService

@@ -60,7 +60,7 @@ from limbowave.application.events import (
     ChatEvent,
     ChatEventHandler,
 )
-from limbowave.application.history_payload import HistoryEntry, history_payload
+from limbowave.application.history_entry import HistoryEntry
 from limbowave.application.kernel import (
     AgentKernel,
     KernelCapability,
@@ -1370,6 +1370,8 @@ class RunCoordinator:
                 memory_anchor = run.user_message_id
 
         index = next(i for i, message in enumerate(messages) if message.id == target.id)
+        from limbowave.application.history_payload import history_payload
+
         history = history_payload(messages[: index + 1], uow_factory=self._uow_factory)
         return branch, snapshot, memory_anchor, history
 
@@ -1441,6 +1443,8 @@ class RunCoordinator:
             # Commit only repaired orphan links here, before leaving the worker transaction.
             uow.commit()
         # 先带上分叉来源完成重试折叠，再移除它；先截断会让旧尝试复活。
+        from limbowave.application.history_payload import history_payload
+
         prefix = [
             entry
             for entry in history_payload(
@@ -1463,6 +1467,8 @@ class RunCoordinator:
             fork_memory(uow, memory_anchor, branch.conversation_id, branch.id)
             messages = branch_path.branch_messages(uow, branch.id)
             uow.commit()
+        from limbowave.application.history_payload import history_payload
+
         history = history_payload(messages, uow_factory=self._uow_factory, branch_id=branch.id)
         # Native fork may drop an appended compaction, or retain an obsolete overlay.
         # Rebuild only when needed; branching-only kernels keep their existing path.

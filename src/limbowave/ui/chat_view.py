@@ -103,7 +103,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from limbowave.application.history_payload import HistoryEntry as HistoryEntry
+from limbowave.application.history_entry import HistoryEntry
 from limbowave.application.services.send_queue import QueuedSend
 from limbowave.domain.conversation import AssistantMessageSegment
 from limbowave.domain.files import SUPPORTED_ATTACHMENTS_HINT
