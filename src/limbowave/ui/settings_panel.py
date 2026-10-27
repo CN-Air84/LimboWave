@@ -356,6 +356,7 @@ class SettingsPage(QWidget):
         request_logs: Any = None,
         conversation_id: str | None = None,
         memories: Any = None,
+        mcp_service: Any = None,
         diagnostics_available: bool = False,
         lan_panel: QWidget | Callable[[], QWidget] | None = None,
     ) -> None:
@@ -369,6 +370,8 @@ class SettingsPage(QWidget):
         self._appearance_themes = appearance_themes
         self._vault = vault
         self._memories = memories
+        self._mcp_service = mcp_service
+        self._mcp_tab: Any = None
         self._lan_panel = lan_panel
         self._pending_pages: dict[int, Callable[[], QWidget]] = {}
         self._stale_pages: set[int] = set()
@@ -433,6 +436,8 @@ class SettingsPage(QWidget):
         self._add_lazy_page("逻辑模型", self._build_models)
         self._add_lazy_page("站点端点", self._build_endpoints)
         self._add_lazy_page("联网搜索", self._build_network)
+        if mcp_service is not None:
+            self._add_lazy_page("MCP 服务器", self._build_mcp)
 
         self._appearance_index = -1
         if preferences is not None or voice_service is not None:
@@ -535,6 +540,12 @@ class SettingsPage(QWidget):
             self.reminder_sound_preview_requested.emit,
         )
         return self._scroll_page(self._reminder_notifications_tab)
+
+    def _build_mcp(self) -> QWidget:
+        from limbowave.ui.mcp_settings import McpSettingsPage
+
+        self._mcp_tab = McpSettingsPage(self._mcp_service)
+        return self._scroll_page(self._mcp_tab)
 
     def _build_network(self) -> QWidget:
         from limbowave.application.services.network_settings_service import NetworkSettingsService
@@ -690,6 +701,9 @@ class SettingsPage(QWidget):
             old.deleteLater()
 
     def resolve_pending_changes(self) -> bool:
+        if self._mcp_tab is not None and not self._mcp_tab.resolve_pending_changes():
+            self.select_tab("MCP 服务器")
+            return False
         return self._appearance_tab is None or self._appearance_tab.resolve_pending_changes()
 
     def _request_close(self) -> None:

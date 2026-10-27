@@ -1079,11 +1079,21 @@ def _wire_impl(
         _prepare_tool_backends
     )
     from limbowave.application.services.chat_history_service import ChatHistoryService
+    from limbowave.application.services.mcp_service import McpService
 
+    async def _perform_mcp(
+        server: Any, tool: str | None, arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        # Keep SDK imports and subprocess setup out of the startup path.
+        from limbowave.infrastructure.mcp_client import perform
+
+        return await perform(server, tool, arguments)
+
+    mcp_service = McpService(paths.data_root / "mcp.json", operation=_perform_mcp)
     tool_gateway = ToolGateway(
         permissions, paths.data_root, documents=files, terminal=terminal,
         network=network_tools, chat_history=ChatHistoryService(uow_factory),
-        environment=environment_service,
+        environment=environment_service, mcp=mcp_service,
     )
     # 装配可观测：read_document 报「文档服务未配置」时，先看这条日志——
     # documents=False 意味着这个进程跑在未解锁状态，或是修复前的旧进程。
@@ -2917,6 +2927,7 @@ def _wire_impl(
             request_logs=request_logs,
             conversation_id=controller.conversation_id,
             memories=memories,
+            mcp_service=mcp_service,
             diagnostics_available=diagnostics_available,
             lan_panel=lan_access.panel,
         )

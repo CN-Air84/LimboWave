@@ -10,9 +10,9 @@
 - Client integration, not exposing LimboWave itself as an MCP server.
 - Prefer a gateway facade over injecting dynamic tools into Pi: preserves existing gates and immediately sees configuration changes.
 - Support stdio argv (never shell strings) and Streamable HTTP. HTTPS required except explicit loopback HTTP; no redirects. No legacy SSE, OAuth, resources/prompts, sampling, roots or automatic reconnection/retry in this slice.
-- Servers disabled by default; startup does not launch them. Discovery can execute local code and therefore also needs per-call confirmation. Read-only/chat-only cannot invoke external MCP, even if server annotations claim read-only. Web-origin calls stay denied. No persistent MCP grants; every request requires confirmation even in full-access mode.
+- Servers disabled by default; startup does not launch them. Discovery can execute local code and therefore also needs per-call confirmation. Read-only/chat-only cannot invoke external MCP, even if server annotations claim read-only. Web-origin calls stay denied. No persistent MCP grants in custom mode; FULL_ACCESS follows the coordinated global policy and automatically allows MCP.
 - Bound handshake, discovery pagination, schema size, calls and output. Close sessions/subprocesses after each operation; report failures without raw SDK exceptions, URLs or credentials. Never retry a potentially side-effecting call.
-- Remote results and descriptions are untrusted evidence, never instructions. Run outbound and inbound privacy checks through the existing gateway.
+- Remote results and descriptions are untrusted evidence, never instructions. Run outbound and inbound privacy checks through the existing gateway, including its global FULL_ACCESS invocation-scope exemption.
 
 ## Task 1: Configuration and transport (atomic commit)
 Files: `src/limbowave/domain/mcp.py`, `src/limbowave/infrastructure/mcp_client.py`, `src/limbowave/application/services/mcp_service.py`, `tests/unit/test_mcp.py`, `tests/integration/test_mcp_client.py`, `tests/fixtures/mcp_server.py`, `pyproject.toml`, `uv.lock`.
