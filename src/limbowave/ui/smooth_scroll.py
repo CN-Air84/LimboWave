@@ -44,6 +44,21 @@ from shiboken6 import isValid
 from limbowave.ui import theme
 
 _FILTER_NAME = "limbowaveSmoothScroll"
+_INPUT_EVENTS = frozenset({
+    QEvent.Type.Wheel,
+    QEvent.Type.MouseButtonPress,
+    QEvent.Type.MouseButtonRelease,
+    QEvent.Type.MouseButtonDblClick,
+    QEvent.Type.ShortcutOverride,
+    QEvent.Type.KeyPress,
+    QEvent.Type.ApplicationDeactivate,
+    QEvent.Type.WindowDeactivate,
+    QEvent.Type.Hide,
+    QEvent.Type.Close,
+    QEvent.Type.Resize,
+    QEvent.Type.EnabledChange,
+    QEvent.Type.Move,
+})
 
 
 @dataclass(slots=True)
@@ -128,6 +143,8 @@ class SmoothScrollFilter(QObject):
         if not isValid(watched):
             return True
         kind = event.type()
+        if kind not in _INPUT_EVENTS:
+            return False
         if self._auto_event(watched, event) or not isValid(watched):
             return True
         if kind == QEvent.Type.MouseButtonPress and isinstance(watched, QScrollBar):

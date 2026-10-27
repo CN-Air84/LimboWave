@@ -41,6 +41,18 @@ def _scroll_area(qtbot: QtBot) -> QScrollArea:
     return area
 
 
+def test_non_input_events_skip_auto_scroll_dispatch(
+    qtbot: QtBot, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    area = _scroll_area(qtbot)
+    effect = SmoothScrollFilter(area)
+    called = []
+    monkeypatch.setattr(effect, "_auto_event", lambda *_args: called.append(True) or False)
+
+    assert not effect.eventFilter(area, QEvent(QEvent.Type.LayoutRequest))
+    assert called == []
+
+
 def test_discrete_wheel_scrolls_with_animation(qtbot: QtBot) -> None:
     area = _scroll_area(qtbot)
     effect = SmoothScrollFilter(area)
