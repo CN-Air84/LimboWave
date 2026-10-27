@@ -42,6 +42,7 @@ from limbowave.application.services.file_service import (
     FileService,
     RangeLimitExceeded,
 )
+from limbowave.application.services.mcp_service import McpService
 from limbowave.application.services.memory_service import (
     MEMORY_CONTEXT_TOOLS,
     MEMORY_MUTATION_TOOLS,
@@ -59,6 +60,7 @@ from limbowave.application.services.reminder_service import (
 from limbowave.application.services.run_origin import remote_tools_denied
 from limbowave.application.services.tool_access import has_full_access, tool_access_scope
 from limbowave.application.services.web_content import extract_page
+from limbowave.domain.mcp import EXTERNAL_MCP_NOTE, MCP_TOOLS, McpError
 from limbowave.domain.memory import MemoryPolicy, MemoryRunContext
 from limbowave.domain.network import (
     EXTERNAL_CONTENT_NOTE,
@@ -119,6 +121,8 @@ class ToolResult:
 
 # 每个工具的参数签名：(参数名, 必填, 类型)
 _SCHEMAS: dict[str, tuple[tuple[str, bool, type], ...]] = {
+    "list_mcp_tools": (("server_id", False, str), ("offset", False, int), ("limit", False, int)),
+    "call_mcp_tool": (("server_id", True, str), ("tool", True, str), ("arguments", True, dict)),
     "get_current_datetime": (),
     "get_environment": (("location", False, str), ("latitude", False, float),
                         ("longitude", False, float)),
@@ -163,6 +167,8 @@ _SCHEMAS: dict[str, tuple[tuple[str, bool, type], ...]] = {
 }
 
 _CAPABILITY: dict[str, Capability] = {
+    "list_mcp_tools": Capability.MCP,
+    "call_mcp_tool": Capability.MCP,
     "get_current_datetime": Capability.CLOCK_READ,
     "get_environment": Capability.NETWORK,
     "set_reminder": Capability.REMINDERS,
@@ -457,6 +463,7 @@ class ToolGateway:
         terminal: TerminalTools | None = None,
         chat_history: ChatHistoryService | None = None,
         environment: EnvironmentService | None = None,
+        mcp: McpService | None = None,
         max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
         origin_provider: Callable[[], str] | None = None,
     ) -> None:
@@ -468,6 +475,7 @@ class ToolGateway:
         self._terminal = terminal
         self._chat_history = chat_history
         self._environment = environment
+        self._mcp = mcp
         self._max_output_bytes = max_output_bytes
         self.reminder_service: ReminderService | None = None
         self.reminder_context: Callable[[], ReminderContext | None] = lambda: None
@@ -485,6 +493,7 @@ class ToolGateway:
             "web_search", "read_url", "reminders", "background_monitoring",
             "file_read", "file_write", "terminal", "attachments", "chat_history",
             "memory_read", "memory_write", "memory_edit", "scratchpad", "clock", "environment",
+            "mcp",
         )
         if remote_tools_denied(self.origin_provider):
             return {"version": 1, "capabilities": {
@@ -505,6 +514,11 @@ class ToolGateway:
                 status, permission = "unconfigured", "denied"
             elif not ready:
                 status, permission = "restricted", "denied"
+            elif capability is Capability.MCP:
+                if preset in (PermissionPreset.CHAT_ONLY, PermissionPreset.READ_ONLY):
+                    status, permission = "restricted", "denied"
+                elif preset is not PermissionPreset.FULL_ACCESS:
+                    permission = "requires_confirmation"
             elif name == "web_search" and preset is PermissionPreset.CUSTOM:
                 # Search always needs per-call confirmation, but the CUSTOM gate
                 # accepts ALLOW only; it cannot offer confirmation, even with grants.
@@ -536,6 +550,7 @@ class ToolGateway:
                 item["scope"] = scope
             capabilities[name] = item
 
+        add("mcp", self._mcp is not None and self._mcp.available(), Capability.MCP)
         add("web_search", self._network is not None and self._network.search_configured,
             Capability.NETWORK)
         add("read_url", self._network is not None and self._network.fetch_configured,
@@ -583,6 +598,22 @@ class ToolGateway:
         """
         _require_local_origin(self.origin_provider)
         validate_params(tool_name, params)
+        if tool_name in MCP_TOOLS:
+            if self._mcp is None:
+                raise ToolError("MCP 服务未配置")
+            if "server_id" in params:
+                try:
+                    self._mcp.resolve(params["server_id"])
+                except McpError as exc:
+                    raise InvalidParams(str(exc)) from None
+            if tool_name == "list_mcp_tools":
+                for key, default, minimum, maximum in (("offset", 0, 0, 256),
+                                                       ("limit", 20, 1, 100)):
+                    value = params.get(key, default)
+                    if type(value) is not int or not minimum <= value <= maximum:
+                        raise InvalidParams("MCP 分页参数无效")
+            elif not params["tool"].strip() or len(params["tool"]) > 128:
+                raise InvalidParams("MCP 工具名无效")
         if tool_name == "web_search":
             query = params["query"]
             if not query.strip() or len(query) > 2000 or any(ord(c) < 32 for c in query):
@@ -639,7 +670,15 @@ class ToolGateway:
         paths: tuple[str, ...] = ()
         domains: tuple[str, ...] = ()
         command: str | None = None
-        if capability in (Capability.FILE_READ, Capability.FILE_WRITE):
+        if capability is Capability.MCP and params.get("server_id") and self._mcp is not None:
+            from urllib.parse import urlsplit
+
+            server = self._mcp.resolve(params["server_id"])
+            if server.transport == "streamable_http":
+                domains = (urlsplit(server.url).hostname or "",)
+            else:
+                command = server.command
+        elif capability in (Capability.FILE_READ, Capability.FILE_WRITE):
             resolved = self._files.resolve_path(params.get("path", "."))
             paths = (str(resolved),)
         elif capability is Capability.NETWORK:
@@ -692,7 +731,8 @@ class ToolGateway:
                       if self.memory_service is not None else None)
         except Exception:
             return ToolResult(ok=False, error="隐私规则不可读取，未执行工具。")
-        if policy is not None and _CAPABILITY.get(tool_name) is Capability.NETWORK:
+        if (policy is not None
+                and _CAPABILITY.get(tool_name) in (Capability.NETWORK, Capability.MCP)):
             try:
                 if policy.blocks_structure(params, encoded_views=True):
                     return ToolResult(ok=False, error="话题禁区：网络参数未获准外发，未执行请求。")
@@ -706,7 +746,8 @@ class ToolGateway:
         # Keep the checker in the same synchronous context as every DNS/HTTP hop.
         # Context manager reset also preserves any enclosing invocation guard.
         scope = (guard_network_request(check_url)
-                 if _CAPABILITY.get(tool_name) is Capability.NETWORK else nullcontext())
+                 if _CAPABILITY.get(tool_name) in (Capability.NETWORK, Capability.MCP)
+                 else nullcontext())
         with scope:
             result = self._invoke(tool_name, params, conversation_id,
                                   mode=mode, user_confirmed=user_confirmed)
@@ -782,7 +823,7 @@ class ToolGateway:
             return ToolResult(ok=False, error=str(exc), data={**exc.data, "code": exc.code})
         except EnvironmentError as exc:
             return ToolResult(ok=False, error=str(exc), data={**exc.data, "code": exc.code})
-        except (ToolError, PathEscape, NetworkBlocked) as exc:
+        except (ToolError, PathEscape, NetworkBlocked, McpError) as exc:
             return ToolResult(ok=False, error=str(exc))
         except Exception as exc:  # 工具实现不该把异常抛给模型
             return ToolResult(ok=False, error=f"工具执行失败：{exc}")
@@ -919,6 +960,8 @@ class ToolGateway:
         self, tool_name: str, params: dict[str, Any], conversation_id: str | None = None,
     ) -> ToolResult:
         _require_local_origin(self.origin_provider)
+        if tool_name in MCP_TOOLS:
+            return self._execute_mcp(tool_name, params)
         if tool_name == "get_current_datetime":
             now = datetime.now().astimezone()
             return ToolResult(ok=True, data={
@@ -1048,6 +1091,36 @@ class ToolGateway:
             truncated=limited.truncated,
             notes=(*notes, *limited.notes),
         )
+
+    def _execute_mcp(self, tool_name: str, params: dict[str, Any]) -> ToolResult:
+        if self._mcp is None:
+            raise ToolError("MCP 服务未配置")
+        if tool_name == "list_mcp_tools" and "server_id" not in params:
+            data = self._mcp.servers()
+        elif tool_name == "list_mcp_tools":
+            catalog = self._mcp.execute(params["server_id"])
+            offset, limit = params.get("offset", 0), params.get("limit", 20)
+            tools = catalog["tools"]
+            selected = tools[offset:offset + limit]
+            data = {"server_id": params["server_id"], "tools": selected, "total": len(tools),
+                    "next_offset": offset + len(selected) if offset + len(selected) < len(tools)
+                    else None}
+            while selected and len(json.dumps(data).encode("utf-8")) > self._max_output_bytes:
+                selected.pop()
+                data["next_offset"] = offset + len(selected)
+            if not selected and offset < len(tools):
+                raise ToolError("MCP 单个工具说明超过输出上限；请在服务器侧精简模式")
+        else:
+            data = self._mcp.execute(params["server_id"], params["tool"], params["arguments"])
+        if len(json.dumps(data, ensure_ascii=False).encode("utf-8")) > self._max_output_bytes:
+            return ToolResult(
+                ok=False, error="MCP 结果超过输出上限，未提供；操作可能已生效，请勿盲目重试",
+                data={"code": "output_limit"}, truncated=True, notes=(EXTERNAL_MCP_NOTE,),
+            )
+        failed = data.get("isError") is True
+        return ToolResult(ok=not failed, data=data,
+                          error="MCP 服务器报告工具执行失败" if failed else None,
+                          notes=(EXTERNAL_MCP_NOTE,))
 
     def _network_result(self, data: dict[str, Any], truncated: bool) -> ToolResult:
         """Limit the entire JSON payload, preserving URLs and evidence metadata."""

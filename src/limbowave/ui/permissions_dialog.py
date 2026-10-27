@@ -47,6 +47,7 @@ CAPABILITY_TEXT = {
     Capability.REMINDERS: "定时提醒",
     Capability.HISTORY_READ: "跨会话聊天记录查询",
     Capability.NETWORK: "联网访问",
+    Capability.MCP: "MCP 外部工具",
 }
 
 _DECISION_TEXT = {"allow": "放行", "confirm": "需确认", "deny": "拒绝"}

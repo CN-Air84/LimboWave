@@ -38,6 +38,7 @@ class Capability(enum.StrEnum):
     CLOCK_READ = "clock_read"
     REMINDERS = "reminders"
     HISTORY_READ = "history_read"
+    MCP = "mcp"
 
 
 class PermissionPreset(enum.StrEnum):
@@ -239,6 +240,12 @@ def evaluate(
     3. 有匹配授权且在范围内：放行。
     4. 无匹配授权：要求确认（用户可授予本次或本会话）。
     """
+    if request.capability is Capability.MCP:
+        return PermissionDecision(
+            decision=Decision.CONFIRM, risk=RiskLevel.HIGH,
+            reason="MCP 可运行外部程序、读取数据或产生副作用；包括发现工具在内，每次均需确认",
+            matched_rule="mcp.per_call",
+        )
     if request.tool_name == "web_search":
         return PermissionDecision(
             decision=Decision.CONFIRM, risk=RiskLevel.NORMAL,

@@ -19,6 +19,8 @@ from limbowave.domain.permissions import Capability, ExecutionMode
 from limbowave.infrastructure.memory_repositories import InMemoryStore, in_memory_uow_factory
 
 TOOLS = {
+    "list_mcp_tools": {},
+    "call_mcp_tool": {"server_id": "test", "tool": "echo", "arguments": {}},
     "get_current_datetime": {},
     "get_environment": {"latitude": 31.23, "longitude": 121.47},
     "set_reminder": {"reason": "test", "delay_seconds": 60},

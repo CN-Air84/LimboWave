@@ -748,6 +748,35 @@ def _make_permission_handler(
             except (PathEscape, ToolError):
                 return False
 
+            if request.capability is Capability.MCP:
+                from limbowave.ui.permission_prompt import ONCE
+
+                decision = await run_blocking(permissions.authorize, request, conversation_id)
+                if (preset in (PermissionPreset.CHAT_ONLY, PermissionPreset.READ_ONLY)
+                        or decision.decision is Decision.DENY):
+                    return False
+                answer = (ONCE if preset is PermissionPreset.FULL_ACCESS else
+                          await _ask_permission(window, request, decision.reason, None))
+                allowed = (
+                    answer == ONCE and conversation_provider is not None
+                    and conversation_provider() == conversation_id
+                    and not remote_tools_denied(
+                        gateway.origin_provider if gateway is not None else None
+                    )
+                )
+                decision = await run_blocking(
+                    permissions.authorize, request, conversation_id,
+                    user_confirmed=allowed, user_denied=not allowed,
+                )
+                return (
+                    allowed and decision.decision is not Decision.DENY
+                    and conversation_provider is not None
+                    and conversation_provider() == conversation_id
+                    and not remote_tools_denied(
+                        gateway.origin_provider if gateway is not None else None
+                    )
+                )
+
             if request.capability is Capability.HISTORY_READ:
                 from limbowave.ui.permission_prompt import ONCE
 

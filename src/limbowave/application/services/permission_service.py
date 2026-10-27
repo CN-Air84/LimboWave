@@ -25,6 +25,7 @@ from limbowave.domain.permissions import (
     PermissionDecision,
     PermissionGrant,
     PermissionPreset,
+    RiskLevel,
     ToolRequest,
     evaluate,
 )
@@ -167,6 +168,16 @@ class PermissionService:
             decision = replace(
                 decision, decision=Decision.ALLOW,
                 reason="完全访问自动允许所有工具操作", matched_rule="preset.full_access",
+            )
+        if request.capability is Capability.MCP and (
+            conversation is None or conversation.permission_preset in (
+                PermissionPreset.CHAT_ONLY, PermissionPreset.READ_ONLY,
+            )
+        ):
+            decision = PermissionDecision(
+                decision=Decision.DENY, risk=RiskLevel.HIGH,
+                reason="MCP 仅允许在完全访问或自定义会话中逐次确认；当前权限不允许",
+                matched_rule="mcp.preset_denied",
             )
         if user_denied:
             user_confirmed = False

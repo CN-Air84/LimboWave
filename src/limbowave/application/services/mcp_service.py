@@ -93,8 +93,6 @@ class McpService:
             raise McpError("MCP 参数必须是 JSON 对象。")
         operation = self._operation
         if operation is None:
-            from limbowave.infrastructure.mcp_client import perform
-
-            operation = perform
+            raise McpError("MCP 传输未装配，未启动服务器。")
         # Called only in background workers. No long-lived SDK tasks cross event loops.
         return asyncio.run(operation(server, tool, arguments))
