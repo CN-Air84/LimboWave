@@ -23,6 +23,8 @@ dependencies = [
     "olefile>=0.47",
     "defusedxml>=0.7.1",
     "tzdata>=2025.2",
+    "mcp>=1.26,<2",
+    "jsonschema>=4.23",
 ]
 
 [dependency-groups]
@@ -37,6 +39,7 @@ dev = [
     "types-qrcode>=8.2.0.20260518",
     "types-olefile>=0.47.0.20260508",
     "types-defusedxml>=0.7.0.20260504",
+    "types-jsonschema>=4.26.0.20261006",
 ]
 
 [build-system]
