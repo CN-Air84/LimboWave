@@ -616,7 +616,7 @@ def _make_permission_handler(
             preset_provider if preset_provider is not None else permissions.get_preset,
             conversation_id,
         )
-        return preset == PermissionPreset.FULL_ACCESS
+        return bool(preset == PermissionPreset.FULL_ACCESS)
 
     async def confirm(title: str, detail: str) -> bool:
         from limbowave.application.services.run_origin import remote_tools_denied

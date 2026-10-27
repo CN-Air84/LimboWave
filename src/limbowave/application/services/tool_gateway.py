@@ -519,8 +519,7 @@ class ToolGateway:
                 permission = ("allowed" if policy is MemoryPolicy.ALLOW and name == "memory_write"
                               else "requires_confirmation")
             elif capability is Capability.HISTORY_READ:
-                permission = ("allowed" if preset is PermissionPreset.FULL_ACCESS
-                              else "requires_confirmation")
+                permission = "requires_confirmation"  # Full access was handled above.
             elif preset is PermissionPreset.CHAT_ONLY:
                 status, permission = "restricted", "denied"
             elif capability is Capability.REMINDERS:
