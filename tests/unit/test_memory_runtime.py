@@ -17,7 +17,7 @@ from tests.unit.test_run_coordinator import FakeKernel
 @pytest.mark.parametrize("preset", list(PermissionPreset))
 @pytest.mark.parametrize("override", list(MemoryPolicy))
 @pytest.mark.parametrize("default", ["ask", "allow"])
-async def test_memory_policy_independent_of_tool_presets(
+async def test_memory_policy_respects_full_access_override(
     memory_stack, monkeypatch, tmp_path, preset, override, default
 ):
     service, factory = memory_stack
@@ -53,7 +53,8 @@ async def test_memory_policy_independent_of_tool_presets(
         }
     )
     allowed = await handler("limbowave.gate:add_session_memory", detail)
-    expected = service.effective_policy("c") is MemoryPolicy.ALLOW
+    expected = (preset is PermissionPreset.FULL_ACCESS
+                or service.effective_policy("c") is MemoryPolicy.ALLOW)
     assert allowed is expected
     assert bool(asked) is not expected
     params = {"content": "note", "call_id": "call", "run_id": "r"}

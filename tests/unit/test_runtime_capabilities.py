@@ -232,3 +232,18 @@ def test_search_service_rechecks_configuration_and_key_presence(stack):
     assert status() == "unconfigured"
     gateway._network = create_network_tools(settings, None)
     assert status() == "unconfigured"
+
+
+def test_full_access_snapshot_matches_memory_and_file_permissions(memory_stack, tmp_path):
+    service, factory = memory_stack
+    permissions = PermissionService(factory)
+    permissions.set_preset("c", PermissionPreset.FULL_ACCESS)
+    gateway = ToolGateway(permissions, tmp_path)
+    gateway.memory_service = service
+    gateway.memory_context = lambda: MemoryRunContext("r", "c", "b", "m")
+    snapshot = gateway.runtime_capabilities("c")["capabilities"]
+    assert snapshot["memory_write"]["permission"] == "allowed"
+    assert snapshot["memory_edit"]["permission"] == "allowed"
+    assert snapshot["file_read"]["scope"] == "local_only"
+    assert snapshot["file_write"]["scope"] == "local_only"
+    assert not permissions.list_audit("c")

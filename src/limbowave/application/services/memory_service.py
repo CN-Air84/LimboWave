@@ -17,6 +17,7 @@ from limbowave.application.services.privacy_service import (
     allowed_memory,
     load_policy,
 )
+from limbowave.application.services.tool_access import has_full_access
 from limbowave.domain.footprint import MemoryFootprint
 from limbowave.domain.memory import (
     MemoryDocument,
@@ -435,7 +436,7 @@ class MemoryService:
                 return item
             with self._approval_lock:
                 approval = self._approvals.pop((context.run_id, call_id), None)
-            if approval != (context, content):
+            if approval != (context, content) and not (approval is None and has_full_access()):
                 raise ValueError("记忆写入缺少有效的一次性授权")
             items = _items(uow.memories.get(_key(context.branch_id)))
             item = MemoryItem(uuid4().hex, content, source, datetime.now(UTC).isoformat())
@@ -628,9 +629,14 @@ class MemoryService:
             else:
                 with self._approval_lock:
                     approval = self._mutations.get((context.run_id, call_id))
-                if approval is None or approval[0] != context:
+                if approval is None and has_full_access():
+                    change = self.prepare_mutation(
+                        context, tool_name, memory_id, updated_content, archive=archive,
+                    )
+                elif approval is None or approval[0] != context:
                     raise ValueError("记忆变更缺少有效的一次性授权")
-                change = approval[1]
+                else:
+                    change = approval[1]
         if (change.tool_name, change.original.id, change.updated_content, change.archive) != (
             tool_name, memory_id, updated_content, archive,
         ):
@@ -662,7 +668,7 @@ class MemoryService:
                 return result
             with self._approval_lock:
                 approval = self._mutations.pop((context.run_id, call_id), None)
-            if approval != (context, change):
+            if approval != (context, change) and not (approval is None and has_full_access()):
                 raise ValueError("记忆变更缺少有效的一次性授权")
             global_scope = change.scope == "global"
             if global_scope and not any(
@@ -705,6 +711,7 @@ class MemoryService:
 
     def record_mutation_decision(
         self, context: MemoryRunContext, call_id: str, change: MemoryMutation, *, allowed: bool,
+        asked: bool = True,
     ) -> None:
         with self._uow_factory() as uow:
             uow.permissions.add_audit(PermissionAudit(
@@ -713,10 +720,10 @@ class MemoryService:
                 capability=Capability.MEMORY_WRITE,
                 params={"call_id": call_id, "run_id": context.run_id,
                         "branch_id": context.branch_id, **asdict(change)},
-                matched_rule="memory.mutation.ask",
+                matched_rule="memory.mutation.ask" if asked else "preset.full_access",
                 decision=Decision.ALLOW if allowed else Decision.DENY,
                 risk=RiskLevel.HIGH if change.scope == "global" else RiskLevel.NORMAL,
-                user_confirmed=allowed,
+                user_confirmed=allowed and asked,
             ))
             uow.commit()
 

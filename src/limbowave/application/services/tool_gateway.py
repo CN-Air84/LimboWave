@@ -525,18 +525,17 @@ class ToolGateway:
                 status, permission = "restricted", "denied"
             elif capability in (Capability.MEMORY_READ, Capability.SCRATCHPAD):
                 pass  # Run-bound memory tools are independent of the ordinary preset.
+            elif preset is PermissionPreset.FULL_ACCESS:
+                pass
             elif capability is Capability.MEMORY_WRITE:
                 assert self.memory_service is not None
                 policy = self.memory_service.effective_policy(conversation_id)
                 permission = ("allowed" if policy is MemoryPolicy.ALLOW and name == "memory_write"
                               else "requires_confirmation")
             elif capability is Capability.HISTORY_READ:
-                permission = ("allowed" if preset is PermissionPreset.FULL_ACCESS
-                              else "requires_confirmation")
+                permission = "requires_confirmation"  # Full access was handled above.
             elif preset is PermissionPreset.CHAT_ONLY:
                 status, permission = "restricted", "denied"
-            elif preset is PermissionPreset.FULL_ACCESS:
-                pass
             elif capability is Capability.REMINDERS:
                 permission = "requires_confirmation"  # Creation, not list/cancel.
             elif preset is PermissionPreset.READ_ONLY:
@@ -559,8 +558,9 @@ class ToolGateway:
             ready=reminder is not None and reminder.conversation_id == conversation_id,
             scope="local_only")
         add("background_monitoring", False, None)
-        add("file_read", True, Capability.FILE_READ, scope="workspace_only")
-        add("file_write", True, Capability.FILE_WRITE, scope="workspace_only")
+        file_scope = "local_only" if preset is PermissionPreset.FULL_ACCESS else "workspace_only"
+        add("file_read", True, Capability.FILE_READ, scope=file_scope)
+        add("file_write", True, Capability.FILE_WRITE, scope=file_scope)
         add("terminal", self._terminal is not None, Capability.TERMINAL)
         add("attachments", self._documents is not None, Capability.FILE_READ)
         add("chat_history", self._chat_history is not None, Capability.HISTORY_READ)
@@ -575,7 +575,7 @@ class ToolGateway:
         add("clock", True, Capability.CLOCK_READ)
         add("environment", self._environment is not None and self._environment.configured,
             Capability.NETWORK)
-        if self.memory_service is not None:
+        if self.memory_service is not None and preset is not PermissionPreset.FULL_ACCESS:
             privacy = self.memory_service.privacy.policy(conversation_id)
             if privacy.rules:
                 capabilities["scratchpad"].update(status="restricted", permission="denied")
@@ -788,6 +788,8 @@ class ToolGateway:
         params = request.raw_params  # 规范化后的参数：空的可选参数已回落默认
 
         if tool_name in MEMORY_CONTEXT_TOOLS:
+            if has_full_access() and request.capability is Capability.MEMORY_WRITE:
+                self._permissions.authorize(request, conversation_id)
             return self._invoke_memory_tool(tool_name, params, conversation_id)
 
         reminder_scope = self.reminder_context() if tool_name in REMINDER_TOOLS else None

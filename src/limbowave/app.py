@@ -605,7 +605,18 @@ def _make_permission_handler(
     memory_service: Any = None,
     memory_context: Callable[[], Any] | None = None,
 ) -> Callable[[str, str], Awaitable[bool]]:
-    """普通工具使用预选权限；记忆与跨会话查询独立审批，历史仅完全访问免询问。"""
+    """本地完全访问统一免确认；其他档位保留普通工具及记忆的独立审批。"""
+
+    async def full_access_for(conversation_id: str | None) -> bool:
+        from limbowave.domain.permissions import PermissionPreset
+
+        if permissions is None or conversation_id is None:
+            return False
+        preset = await run_blocking(
+            preset_provider if preset_provider is not None else permissions.get_preset,
+            conversation_id,
+        )
+        return bool(preset == PermissionPreset.FULL_ACCESS)
 
     async def confirm(title: str, detail: str) -> bool:
         from limbowave.application.services.run_origin import remote_tools_denied
@@ -655,11 +666,14 @@ def _make_permission_handler(
                     detail_text += ("\n\n归档后不再主动注入，可在记忆面板恢复。" if change.archive
                                     else "\n\n从当前记忆删除；已有历史快照不会物理清除。")
                 stage = "show_confirmation"
-                allowed = await _ask_memory_user(window, f"{action}{scope_label}？", detail_text)
+                asked = not await full_access_for(context.conversation_id)
+                allowed = not asked or await _ask_memory_user(
+                    window, f"{action}{scope_label}？", detail_text,
+                )
                 allowed = allowed and memory_context is not None and memory_context() == context
                 stage = "record_decision"
                 await run_blocking(memory_service.record_mutation_decision,
-                                   context, call_id, change, allowed=allowed)
+                                   context, call_id, change, allowed=allowed, asked=asked)
                 if not allowed or memory_context is None or memory_context() != context:
                     return False
                 memory_service.approve_mutation(context, call_id, change)
@@ -692,7 +706,7 @@ def _make_permission_handler(
                 return False
             try:
                 content = memory_service.validate_content(content)
-                allowed = (
+                allowed = await full_access_for(context.conversation_id) or (
                     await run_blocking(memory_service.effective_policy, context.conversation_id)
                     is MemoryPolicy.ALLOW
                 )

@@ -129,7 +129,7 @@ def test_scratchpad_revision_isolation_and_historical_fork(memory_stack):
     ("delete_session_memory", {"archive": False}),
 ])
 @pytest.mark.parametrize("accept", [True, False])
-async def test_real_gate_mutations_always_ask(memory_stack, monkeypatch, tmp_path,
+async def test_restricted_gate_mutations_always_ask(memory_stack, monkeypatch, tmp_path,
                                              tool, arguments, accept):
     import json
 
@@ -143,7 +143,7 @@ async def test_real_gate_mutations_always_ask(memory_stack, monkeypatch, tmp_pat
     item = service.save("original", "c", "b")
     service.set_policy("c", MemoryPolicy.ALLOW)
     permissions = PermissionService(factory)
-    permissions.set_preset("c", PermissionPreset.FULL_ACCESS)
+    permissions.set_preset("c", PermissionPreset.READ_ONLY)
     context = MemoryRunContext("r", "c", "b", "msg")
     gateway = ToolGateway(permissions, tmp_path)
     gateway.memory_context = lambda: context
@@ -360,3 +360,32 @@ def test_search_explicitly_marks_model_writability(memory_stack):
     assert rows[global_item.id]["allowed_operations"] == ["update_memory"]
     assert rows[session_item.id]["allowed_operations"] == ["update_memory", "delete_session_memory"]
     assert rows[session_item.id]["model_writable"] is True
+
+
+@pytest.mark.parametrize("scope", ["session", "global"])
+def test_full_access_mutation_needs_no_gate_and_replay_keeps_original(
+    memory_stack, tmp_path, scope,
+):
+    from limbowave.application.services.permission_service import PermissionService
+    from limbowave.application.services.tool_gateway import ToolGateway
+    from limbowave.domain.permissions import PermissionPreset
+
+    service, factory = memory_stack
+    permissions = PermissionService(factory)
+    permissions.set_preset("c", PermissionPreset.FULL_ACCESS)
+    conversation_id, branch_id = (None, None) if scope == "global" else ("c", "b")
+    item = service.save("original", conversation_id, branch_id)
+    context = MemoryRunContext("r", "c", "b", "msg")
+    gateway = ToolGateway(permissions, tmp_path)
+    gateway.memory_context = lambda: context
+    gateway.memory_service = service
+    params = {"memory_id": item.id, "updated_content": "new", "run_id": "r", "call_id": "call"}
+    result = gateway.invoke("update_memory", params, "c")
+    assert result.ok
+    assert service.list(conversation_id, branch_id)[0].content == "new"
+    assert gateway.invoke("update_memory", params, "c").data == result.data
+    assert not gateway.invoke("update_memory", {**params, "updated_content": "tampered"}, "c").ok
+    assert not gateway.invoke("update_memory", {**params, "run_id": "stale"}, "c").ok
+    assert all(not audit.user_confirmed for audit in permissions.list_audit("c"))
+    permissions.set_preset("c", PermissionPreset.READ_ONLY)
+    assert not gateway.invoke("update_memory", {**params, "call_id": "next"}, "c").ok

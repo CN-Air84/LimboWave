@@ -34,7 +34,7 @@ def integrated_boundary(memory_stack, tmp_path, monkeypatch):
         uow.commit()
     memory.privacy.add("blockedtopic", source_ids=["protected-source"])
     permissions = PermissionService(factory)
-    permissions.set_preset("c", PermissionPreset.FULL_ACCESS)
+    permissions.set_preset("c", PermissionPreset.READ_ONLY)
     dns = []
     requests = []
     responses = []

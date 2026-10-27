@@ -20,7 +20,7 @@ def boundary_stack(memory_stack, tmp_path):
         uow.commit()
     service.privacy.add("FORBIDDEN_TOPIC", ["ＳＥＣＲＥＴＡＬＩＡＳ"], ["private-source"])
     permissions = PermissionService(factory)
-    permissions.set_preset("c", PermissionPreset.FULL_ACCESS)
+    permissions.set_preset("c", PermissionPreset.READ_ONLY)
     calls = []
 
     def search(query):
@@ -337,3 +337,36 @@ def test_network_scope_is_reset_even_when_invocation_raises(boundary_stack, monk
     with pytest.raises(RuntimeError, match="execution failed"):
         gateway.invoke("read_url", {"url": "https://example.com"}, "c")
     check_network_destination("https://example.com/FORBIDDEN_TOPIC")
+
+
+@pytest.mark.parametrize("tool,params", [
+    ("web_search", {"query": "FORBIDDEN_TOPIC"}),
+    ("read_url", {"url": "http://localhost/FORBIDDEN_TOPIC"}),
+])
+def test_full_access_overrides_tool_privacy_without_erasing_rules(boundary_stack, tool, params):
+    gateway, calls, service = boundary_stack
+    permissions = gateway._permissions
+    rules = service.privacy.policy("c")
+    permissions.set_preset("c", PermissionPreset.FULL_ACCESS)
+    assert gateway.invoke(tool, params, "c").ok
+    assert len(calls) == 1
+    assert service.privacy.policy("c") == rules
+    permissions.set_preset("c", PermissionPreset.READ_ONLY)
+    result = gateway.invoke(tool, params, "c", user_confirmed=True)
+    assert not result.ok and len(calls) == 1
+
+
+def test_full_access_memory_privacy_and_capability_agree(boundary_stack):
+    from limbowave.domain.memory import MemoryRunContext
+
+    gateway, _, service = boundary_stack
+    gateway._permissions.set_preset("c", PermissionPreset.FULL_ACCESS)
+    gateway.memory_context = lambda: MemoryRunContext("r", "c", "b", "msg")
+    result = gateway.invoke("add_session_memory", {
+        "content": "FORBIDDEN_TOPIC", "run_id": "r", "call_id": "call",
+    }, "c")
+    assert result.ok
+    assert service.privacy.policy("c").rules
+    snapshot = gateway.runtime_capabilities("c")["capabilities"]
+    assert snapshot["scratchpad"]["permission"] == "allowed"
+    assert snapshot["memory_write"]["permission"] == "allowed"

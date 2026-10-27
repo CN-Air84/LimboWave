@@ -10,6 +10,7 @@ from threading import RLock
 from uuid import uuid4
 
 from limbowave.application.repositories import UnitOfWork, UnitOfWorkFactory
+from limbowave.application.services.tool_access import has_full_access
 from limbowave.domain.conversation import Message, MessageRole
 from limbowave.domain.memory import MemoryDocument, MemoryItem
 from limbowave.domain.privacy import PrivacyPolicy, TopicBoundary, content_fingerprint, normalized
@@ -33,6 +34,10 @@ def privacy_model_request() -> Iterator[None]:
 
 
 def load_policy(uow: UnitOfWork, conversation_id: str | None = None) -> PrivacyPolicy:
+    # Explicit local full access overrides tool-use restrictions only for this invocation.
+    # Stored rules and ordinary prompt/history projections remain untouched.
+    if conversation_id is not None and has_full_access():
+        return PrivacyPolicy()
     document = uow.memories.get(PRIVACY_KEY)
     # Deliberately propagate malformed/decryption failures; never silently fail open.
     policy = PrivacyPolicy.model_validate_json(document.payload) if document else PrivacyPolicy()
