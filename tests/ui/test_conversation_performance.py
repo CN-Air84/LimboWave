@@ -136,6 +136,17 @@ def test_empty_deltas_do_not_create_a_reply(qtbot: QtBot) -> None:
     assert view._rows == []
 
 
+def test_history_rows_skip_transient_composing_widgets(qtbot: QtBot) -> None:
+    view = ChatView()
+    qtbot.addWidget(view)
+    view.load_history(_history(12))
+    assistant_segments = [
+        segment for row in view._rows if row._role == "assistant" for segment in row._segments
+    ]
+    assert assistant_segments
+    assert all(segment.hint is None for segment in assistant_segments)
+
+
 def test_load_earlier_keeps_existing_rows_and_documents(qtbot: QtBot) -> None:
     view = ChatView()
     qtbot.addWidget(view)
@@ -151,6 +162,32 @@ def test_load_earlier_keeps_existing_rows_and_documents(qtbot: QtBot) -> None:
     assert changes == []
     view._load_earlier()
     assert view._rows[2 * HISTORY_PAGE:] == previous
+
+
+def test_load_earlier_button_yields_between_small_batches(
+    qtbot: QtBot, monkeypatch
+) -> None:
+    view = ChatView()
+    qtbot.addWidget(view)
+    view.load_history(_history())
+    previous = len(view._rows)
+    batches: list[int] = []
+    original = view._render_history_steps
+
+    def recorded(*args, **kwargs):
+        count = 0
+        for step in original(*args, **kwargs):
+            count += 1
+            yield step
+        batches.append(count)
+
+    monkeypatch.setattr(view, "_render_history_steps", recorded)
+    assert view._load_earlier_button is not None
+    view._load_earlier_button.click()
+    assert len(view._rows) < previous + HISTORY_PAGE
+    qtbot.waitUntil(lambda: view._history_prepend_steps is None)
+    assert len(view._rows) == previous + HISTORY_PAGE
+    assert batches == [HISTORY_PAGE]
 
 
 def test_pagination_preserves_expansion_and_selection(qtbot: QtBot) -> None:

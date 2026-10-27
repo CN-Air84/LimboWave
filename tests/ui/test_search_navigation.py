@@ -85,3 +85,14 @@ async def test_search_jump_uses_history_preview_without_interrupting_run(wired):
     assert controller.conversation_id == live_id
     assert controller.busy
     assert not kernel.aborted
+
+
+def test_search_jump_rebuilds_bounded_window_for_middle_history(qtbot) -> None:
+    entries = [HistoryEntry("user", f"message {i}", "", f"m{i}") for i in range(600)]
+    entries[250] = HistoryEntry("user", "middle needle", "", "target")
+    view = ChatView()
+    qtbot.addWidget(view)
+    view.load_history(entries)
+    assert view.show_search_match("needle", "target")
+    assert any(row._message_id == "target" for row in view._rows)
+    assert len(view._rows) <= 2 * HISTORY_PAGE

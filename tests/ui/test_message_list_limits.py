@@ -302,3 +302,22 @@ def test_scroll_smoothness_is_not_automated() -> None:
     """
     # 这条测试没有断言，存在的意义是把上面这段理由写进代码里
     assert HISTORY_PAGE > 0
+
+
+def test_user_pagination_keeps_two_page_widget_window(qtbot: QtBot) -> None:
+    from PySide6.QtWidgets import QPushButton
+
+    view = ChatView()
+    qtbot.addWidget(view)
+    view.load_history(_history(1_000))
+    for _ in range(6):
+        button = view._load_earlier_button
+        assert button is not None
+        button.click()
+        qtbot.waitUntil(lambda: view._history_prepend_steps is None)
+        assert len(view._rows) <= 2 * HISTORY_PAGE
+    latest = [button for button in view.findChildren(QPushButton) if "回到最新" in button.text()]
+    assert len(latest) == 1
+    latest[0].click()
+    assert len(view._rows) == HISTORY_PAGE
+    assert view._history_offset == len(view._full_history) - HISTORY_PAGE

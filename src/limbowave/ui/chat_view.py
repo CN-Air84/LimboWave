@@ -173,6 +173,8 @@ _COPIED_FEEDBACK_MS = 1500  # 复制后对勾停留多久再换回复制图标
 # 上下边距（10 / 14）以内，否则会被上面的消息区、下面的垫块盖住一截。
 _TRANSCRIPT_BOTTOM = 12  # 消息区内容的底边距
 _STICK_THRESHOLD = 24  # 距底部多少像素以内视为「停在底部」，流式输出会自动跟随
+_HISTORY_PREPEND_BATCH = 1  # 一条/帧优先交互连续性；整页稍慢但不会出现可感知长帧
+_HISTORY_WIDGET_PAGES = 2  # 用户翻历史时最多常驻两页 Qt 控件，完整数据仍保留在内存载荷中
 _JUMP_BUTTON_GAP = 16  # 「回到底部」按钮与消息区可见底边的间距
 _JUMP_BUTTON_MS = 200  # 「回到底部」按钮进出场时长
 _JUMP_BUTTON_RISE = 16  # 进场时从就位点下方多少像素浮上来（退场沉回同样距离）
@@ -912,9 +914,10 @@ class _BubbleRow(QWidget):
             self.begin_segment()
         return self._segments[-1]
 
-    def begin_segment(self) -> None:
+    def begin_segment(self, *, composing: bool = True) -> None:
         """开启一段新的模型消息。同一轮 run 的后续消息**并入本卡**，不另开卡片。
 
+        ``composing`` 只用于实时生成；历史消息已定稿，跳过临时提示和计时器。
         末一段还完全空着（预立卡时先开好、尚未落字）时直接沿用：构思计时
         继续走，不另起一段、不画分隔线。
         """
@@ -941,7 +944,8 @@ class _BubbleRow(QWidget):
         # 运行中动态插入的组件要显式 show，状态才立即正确（见 _add_bubble 同因）
         segment.show()
         self._segments.append(segment)
-        segment.start_composing()
+        if composing:
+            segment.start_composing()
         self._content = browser
         self._sync_segment_presentation()
 
@@ -2049,13 +2053,20 @@ class ChatView(QWidget):
         # 长会话滞性化（Task 0.2）：完整历史 + 当前已物化的起点
         self._full_history: list[HistoryEntry] = []
         self._history_offset = 0
+        self._history_end = 0
         self._load_earlier_button: QPushButton | None = None
+        self._return_latest_button: QPushButton | None = None
         self._history_scroll_anchor: tuple[_BubbleRow, int] | None = None
         self._restoring_history_anchor = False
         self._history_anchor_timer = QTimer(self)
         self._history_anchor_timer.setSingleShot(True)
         self._history_anchor_timer.setInterval(16)
         self._history_anchor_timer.timeout.connect(self._finish_history_prepend)
+        self._history_prepend_steps: Iterator[None] | None = None
+        self._history_prepend_timer = QTimer(self)
+        self._history_prepend_timer.setSingleShot(True)
+        self._history_prepend_timer.setInterval(0)
+        self._history_prepend_timer.timeout.connect(self._drain_history_prepend)
         # 用户消息 id → 已发送附件（由上层注入）；没有注入时不显示缩略图
         self._attachment_resolver: Callable[[str], list[SentAttachment]] | None = None
         self._history_transition: QParallelAnimationGroup | None = None
@@ -3366,13 +3377,25 @@ class ChatView(QWidget):
                         selections.append(selection)
                 browser.setExtraSelections(selections)
 
+    def _ensure_history_index_visible(self, index: int) -> None:
+        if index < 0 or index >= len(self._full_history):
+            return
+        if self._history_offset <= index < self._history_end:
+            return
+        start = self._align_window_start(max(0, index - HISTORY_PAGE // 2))
+        end = self._align_window_end(min(
+            len(self._full_history), start + _HISTORY_WIDGET_PAGES * HISTORY_PAGE
+        ))
+        self._history_offset = start
+        self._history_end = end
+        self._render_window()
+
     def focus_message(self, message_id: str) -> bool:
         """Locate a retained source message without inventing a text-search query."""
         self.clear_search_matches()
         index = next((i for i, entry in enumerate(self._full_history)
                       if entry.message_id == message_id), len(self._full_history))
-        while index < self._history_offset:
-            self._load_earlier()
+        self._ensure_history_index_visible(index)
         self._cancel_history_anchor()
         target: QWidget | None = None
         for row in self._rows:
@@ -3437,8 +3460,7 @@ class ChatView(QWidget):
         message_id = self._search_ids[self._search_index]
         index = next((i for i, entry in enumerate(self._full_history)
                       if entry.message_id == message_id), len(self._full_history))
-        while index < self._history_offset:
-            self._load_earlier()
+        self._ensure_history_index_visible(index)
         self._cancel_history_anchor()
         self._highlight_search()
         target: QWidget | None = None
@@ -3504,8 +3526,10 @@ class ChatView(QWidget):
 
     def _reset_rows(self) -> None:
         """只清组件，不动历史缓存。"""
+        self._cancel_history_prepend()
         self._cancel_history_anchor()
         self._load_earlier_button = None
+        self._return_latest_button = None
         self._stream_row = None
         self._run_rows.clear()
         self._run_tail = None
@@ -3641,6 +3665,7 @@ class ChatView(QWidget):
         self._history_offset = self._align_window_start(
             max(0, len(self._full_history) - HISTORY_PAGE)
         )
+        self._history_end = len(self._full_history)
 
     async def load_history_incrementally(
         self, messages: Sequence[HistoryEntry], *, rendered: Mapping[str, str] | None = None
@@ -3657,6 +3682,16 @@ class ChatView(QWidget):
         if self.isVisible():
             self._animate_history_in(generation, slide=False)
         return True
+
+    def _align_window_end(self, offset: int) -> int:
+        history = self._full_history
+        while (
+            0 < offset < len(history)
+            and history[offset - 1].run_id is not None
+            and history[offset].run_id == history[offset - 1].run_id
+        ):
+            offset += 1
+        return offset
 
     def _align_window_start(self, offset: int) -> int:
         """翻页边界不切断 run：窗口起点落在某轮中间时，回退到该轮首条消息。
@@ -3802,7 +3837,10 @@ class ChatView(QWidget):
         hidden = self._history_offset
         if hidden > 0:
             self._add_load_earlier(hidden)
-        yield from self._render_history_steps(self._full_history[hidden:], rendered)
+        yield from self._render_history_steps(
+            self._full_history[hidden:self._history_end], rendered
+        )
+        self._add_return_latest(self._history_end < len(self._full_history))
 
     def _render_history_steps(
         self, window: Sequence[HistoryEntry], rendered: Mapping[str, str] | None = None,
@@ -3843,7 +3881,7 @@ class ChatView(QWidget):
                 ),)
                 steps_by_id = {step.tool_call_id: step for step in item.tool_steps}
                 for part in parts:
-                    row.begin_segment()
+                    row.begin_segment(composing=False)
                     row.finalize_segment(
                         part.content, item.message_id,
                         html=rendered.get(part.content) if rendered is not None else None,
@@ -3866,6 +3904,31 @@ class ChatView(QWidget):
                                              self._transcript.indexOf(row) + 1)
             index += count
 
+    def _add_return_latest(self, shown: bool) -> None:
+        if self._return_latest_button is not None:
+            button = self._return_latest_button
+            self._transcript.removeWidget(button)
+            button.setParent(None)
+            button.deleteLater()
+            self._return_latest_button = None
+        if not shown:
+            return
+        button = QPushButton("回到最新消息")
+        button.setProperty("flat", True)
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+        button.clicked.connect(self._return_to_latest)
+        self._transcript.insertWidget(self._transcript.count() - 1, button)
+        self._return_latest_button = button
+
+    def _return_to_latest(self) -> None:
+        self._cancel_history_prepend()
+        self._history_end = len(self._full_history)
+        self._history_offset = self._align_window_start(
+            max(0, self._history_end - HISTORY_PAGE)
+        )
+        self._render_window()
+        self._scroll_to_bottom(force=True)
+
     def _add_load_earlier(self, hidden: int) -> None:
         """顶部「加载更早的消息」入口。只影响展示——数据早就在内存里。"""
         if self._load_earlier_button is not None:
@@ -3879,14 +3942,14 @@ class ChatView(QWidget):
         button = QPushButton(f"加载更早的 {min(hidden, HISTORY_PAGE)} 条消息（还有 {hidden} 条）")
         button.setProperty("flat", True)
         button.setCursor(Qt.CursorShape.PointingHandCursor)
-        button.clicked.connect(self._load_earlier)
+        button.clicked.connect(self._schedule_load_earlier)
         self._transcript.insertWidget(0, button)
         self._load_earlier_button = button
 
-    def _load_earlier(self) -> None:
+    def _prepare_history_prepend(self) -> tuple[int, int, _BubbleRow | None] | None:
         old_offset = self._history_offset
         if old_offset <= 0:
-            return
+            return None
         viewport = self._scroll.viewport()
         before = self._rows[0] if self._rows else None
         anchor = next((row for row in self._rows
@@ -3895,7 +3958,85 @@ class ChatView(QWidget):
             self._history_scroll_anchor = (anchor, anchor.mapTo(viewport, QPoint()).y())
             self._stick_to_bottom = False
             self._user_scrolled_up = True
-        self._history_offset = self._align_window_start(max(0, old_offset - HISTORY_PAGE))
+        new_offset = self._align_window_start(max(0, old_offset - HISTORY_PAGE))
+        self._history_offset = new_offset
+        return old_offset, new_offset, before
+
+    def _schedule_load_earlier(self) -> None:
+        """User-facing pagination: build a few rows per event-loop turn."""
+        if self._history_prepend_steps is not None:
+            return
+        prepared = self._prepare_history_prepend()
+        if prepared is None:
+            return
+        old_offset, new_offset, before = prepared
+        if self._load_earlier_button is not None:
+            self._load_earlier_button.setEnabled(False)
+            self._load_earlier_button.setText("正在加载更早的消息…")
+        self._history_prepend_steps = self._render_history_steps(
+            self._full_history[new_offset:old_offset], before=before
+        )
+        self._history_prepend_timer.start()
+
+    def _drain_history_prepend(self) -> None:
+        steps = self._history_prepend_steps
+        if steps is None:
+            return
+        completed = False
+        try:
+            for _ in range(_HISTORY_PREPEND_BATCH):
+                next(steps)
+        except StopIteration:
+            completed = True
+        self._transcript.activate()
+        self._restore_history_anchor()
+        if not completed:
+            self._history_prepend_timer.start()
+            return
+        self._history_prepend_steps = None
+        self._trim_user_history_window()
+        self._add_load_earlier(self._history_offset)
+        self._add_return_latest(self._history_end < len(self._full_history))
+        self._transcript.activate()
+        self._restore_history_anchor()
+        self._history_anchor_timer.start()
+
+    def _cancel_history_prepend(self) -> None:
+        self._history_prepend_timer.stop()
+        self._history_prepend_steps = None
+
+    def _trim_user_history_window(self) -> None:
+        if self._stream_row is not None:
+            return
+        end = self._align_window_end(min(
+            self._history_end, self._history_offset + _HISTORY_WIDGET_PAGES * HISTORY_PAGE
+        ))
+        if end >= self._history_end:
+            return
+        self._history_end = end
+        keep_ids = {
+            entry.message_id for entry in self._full_history[self._history_offset:end]
+            if entry.message_id is not None
+        }
+        for row in list(reversed(self._rows)):
+            ids = {
+                segment.message_id
+                for segment in row._segments
+                if segment.message_id is not None
+            }
+            if row._message_id is not None:
+                ids.add(row._message_id)
+            if ids and ids.isdisjoint(keep_ids):
+                self._drop_row(row)
+        while len(self._rows) > _HISTORY_WIDGET_PAGES * HISTORY_PAGE:
+            self._drop_row(self._rows[-1])
+        self.sync_compression_markers(self._full_history)
+
+    def _load_earlier(self) -> None:
+        prepared = self._prepare_history_prepend()
+        if prepared is None:
+            return
+        old_offset, _new_offset, before = prepared
         # Never rebuild the existing page: preserve selection, expanded reasoning/tools,
         # and especially _stream_row/_run_tail when paging during a live reply.
         layout_enabled = self._transcript.isEnabled()
