@@ -57,3 +57,39 @@ def test_other_conversations_do_not_inherit_full_access(permissions, conversatio
     assert permissions.authorize(request, conversation).decision is Decision.CONFIRM
     assert permissions.set_preset("full", PermissionPreset.READ_ONLY)
     assert permissions.authorize(request, "full").decision is Decision.CONFIRM
+
+
+@pytest.mark.parametrize("confirmed", [True, False])
+def test_gateway_derives_network_scope_from_preset_not_confirmation(
+    permissions, tmp_path, confirmed,
+):
+    from limbowave.application.services.tool_access import has_full_access
+    from limbowave.application.services.tool_gateway import NetworkTools, ToolGateway
+    from limbowave.domain.network import WebResponse
+    from limbowave.infrastructure.web_access import validate_public_url
+
+    seen = []
+
+    def fetch(url):
+        seen.append(has_full_access())
+        normalized, _, _ = validate_public_url(url)
+        return WebResponse(normalized, 200, "text/plain", b"hello", "2026-10-27T00:00:00Z")
+
+    gateway = ToolGateway(permissions, tmp_path, network=NetworkTools(page_fetcher=fetch))
+    params = {"url": "http://127.0.0.1:8080/"}
+    assert gateway.invoke("read_url", params, "full", user_confirmed=confirmed).ok
+    assert not has_full_access()
+    assert not gateway.invoke("read_url", params, "normal", user_confirmed=True).ok
+    assert seen == [True, False]
+    assert not gateway.invoke("read_url", {**params, "full_access": True}, "normal").ok
+
+
+def test_remote_origin_cannot_create_full_access_scope(permissions, tmp_path):
+    from limbowave.application.services.tool_access import has_full_access
+    from limbowave.application.services.tool_gateway import NetworkTools, ToolGateway
+
+    calls = []
+    gateway = ToolGateway(permissions, tmp_path, origin_provider=lambda: "web",
+                          network=NetworkTools(fetcher=lambda url: calls.append(url)))
+    result = gateway.invoke("read_url", {"url": "http://localhost/"}, "full", user_confirmed=True)
+    assert not result.ok and not calls and not has_full_access()

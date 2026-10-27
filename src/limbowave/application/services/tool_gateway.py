@@ -57,6 +57,7 @@ from limbowave.application.services.reminder_service import (
     validate_reminder_params,
 )
 from limbowave.application.services.run_origin import remote_tools_denied
+from limbowave.application.services.tool_access import has_full_access, tool_access_scope
 from limbowave.application.services.web_content import extract_page
 from limbowave.domain.memory import MemoryPolicy, MemoryRunContext
 from limbowave.domain.network import (
@@ -417,7 +418,8 @@ class NetworkTools:
         parsed = urlparse(url)
         if parsed.scheme not in ("http", "https"):
             raise ToolError(f"不支持的协议：{parsed.scheme or '(无)'}")
-        check_host(parsed.hostname or "", allow_private=self._allow_private)
+        if not has_full_access():
+            check_host(parsed.hostname or "", allow_private=self._allow_private)
         if self._fetcher is None:
             raise ToolError("联网抓取未配置（需要 HTTP 客户端）")
         status, content_type, body = self._fetcher(url)
@@ -661,6 +663,20 @@ class ToolGateway:
     def invoke(
         self, tool_name: str, params: dict[str, Any], conversation_id: str, *,
         mode: ExecutionMode = ExecutionMode.BUILTIN_TOOLS, user_confirmed: bool = False,
+    ) -> ToolResult:
+        # Origin is checked before creating trusted scope; user_confirmed is not full access.
+        try:
+            _require_local_origin(self.origin_provider)
+        except ToolDenied as exc:
+            return ToolResult(ok=False, error=str(exc))
+        full_access = self._permissions.get_preset(conversation_id) is PermissionPreset.FULL_ACCESS
+        with tool_access_scope(full_access):
+            return self._invoke_scoped(tool_name, params, conversation_id,
+                                       mode=mode, user_confirmed=user_confirmed)
+
+    def _invoke_scoped(
+        self, tool_name: str, params: dict[str, Any], conversation_id: str, *,
+        mode: ExecutionMode, user_confirmed: bool,
     ) -> ToolResult:
         # Final output gate also covers filenames, errors, reminder text and external tools.
         # Rules are loaded before execution; corruption must not perform an action first.

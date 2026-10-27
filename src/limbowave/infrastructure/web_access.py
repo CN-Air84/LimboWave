@@ -1,4 +1,4 @@
-"""Bounded public HTTP(S), without cookies, ambient proxies, or DNS re-resolution."""
+"""Bounded HTTP(S); public-only unless a trusted full-access invocation allows more."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ from limbowave.application.services.network_privacy import (
     check_network_destination,
     guard_network_request,
 )
+from limbowave.application.services.tool_access import has_full_access
 from limbowave.domain.network import WebAccessError, WebResponse
 from limbowave.domain.network_guard import resolve_host
 
@@ -53,6 +54,7 @@ def _public_address(value: str) -> bool:
 
 def validate_public_url(url: str) -> tuple[str, str, int]:
     """Validate syntax without DNS/network. Authorization happens before resolution."""
+    full_access = has_full_access()
     try:
         if not url or len(url) > 4096 or any(c.isspace() or ord(c) < 32 for c in url):
             raise ValueError
@@ -63,10 +65,12 @@ def validate_public_url(url: str) -> tuple[str, str, int]:
             raise ValueError
         host = (parts.hostname or "").rstrip(".").encode("idna").decode("ascii").lower()
         port = parts.port if parts.port is not None else (443 if parts.scheme == "https" else 80)
-        if port != (443 if parts.scheme == "https" else 80) or not host:
+        default_port = 443 if parts.scheme == "https" else 80
+        if not host or port < 1 or (not full_access and port != default_port):
             raise ValueError
-        if host in {"localhost", "metadata.goog", "metadata.google.internal"} or host.endswith(
-            (".localhost", ".local", ".internal", ".home")
+        if not full_access and (
+            host in {"localhost", "metadata.goog", "metadata.google.internal"}
+            or host.endswith((".localhost", ".local", ".internal", ".home"))
         ):
             raise ValueError
         try:
@@ -82,9 +86,11 @@ def validate_public_url(url: str) -> tuple[str, str, int]:
             ):
                 raise ValueError from None
         else:
-            if not _public_address(str(address)):
+            if not full_access and not _public_address(str(address)):
                 raise ValueError
         netloc = f"[{host}]" if ":" in host else host
+        if port != default_port:
+            netloc += f":{port}"
         path = quote(parts.path or "/", safe="/%:@!$&'()*+,;=-._~")
         query = quote(parts.query, safe="/%?:@!$&'()*+,;=-._~")
         normalized = urlunsplit((parts.scheme, netloc, path, query, ""))
@@ -93,7 +99,8 @@ def validate_public_url(url: str) -> tuple[str, str, int]:
         return normalized, host, port
     except (ValueError, UnicodeError):
         raise WebAccessError(
-            "blocked_url", "仅允许无内嵌凭据、标准端口的公网 HTTP(S) 地址"
+            "blocked_url", ("仅允许合法且无内嵌凭据的 HTTP(S) 地址" if full_access else
+                            "仅允许无内嵌凭据、标准端口的公网 HTTP(S) 地址")
         ) from None
 
 
@@ -221,6 +228,8 @@ class PublicHTTPClient:
         """
         if method not in {"GET", "POST"} or max_bytes <= 0:
             raise WebAccessError("invalid_request", "不支持的网络请求")
+        full_access = has_full_access()
+        request_overrides = dict(headers or {})
         deadline = time.monotonic() + self._timeout
         current, host, port = validate_public_url(url)
 
@@ -234,7 +243,7 @@ class PublicHTTPClient:
             if remaining <= 0:
                 raise WebAccessError("timeout", "网页请求超时，未取得可用内容")
             ips = self._resolve(host, remaining)
-            if not all(_public_address(ip) for ip in ips):
+            if not full_access and not all(_public_address(ip) for ip in ips):
                 raise WebAccessError("blocked_address", "目标包含非公网地址，已阻止请求")
             parts = urlsplit(current)
             conn = None
@@ -251,7 +260,7 @@ class PublicHTTPClient:
                     "Accept": ", ".join(sorted(accepted_types)),
                     "Accept-Encoding": "identity",
                     "Connection": "close",
-                    **dict(headers or {}),
+                    **request_overrides,
                 }
                 target = parts.path + ("?" + parts.query if parts.query else "")
                 conn.request(method, target, body=body, headers=request_headers)
@@ -286,11 +295,18 @@ class PublicHTTPClient:
                         # Not requested automatically, but do not return a prohibited
                         # target in structured errors for another tool call either.
                         check_destination(next_url)
-                        raise WebAccessError(
-                            "redirect_requires_permission",
-                            "网页重定向到另一来源；需单独授权 read_url",
-                            data={"redirect_url": next_url},
-                        )
+                        if not full_access or method != "GET":
+                            raise WebAccessError(
+                                "redirect_requires_permission",
+                                "网页重定向到另一来源；需单独授权 read_url",
+                                data={"redirect_url": next_url},
+                            )
+                        # Authorization is broad, but credentials belong to their origin.
+                        request_overrides = {
+                            key: value for key, value in request_overrides.items()
+                            if key.lower() not in {"authorization", "proxy-authorization",
+                                                   "cookie", "host"}
+                        }
                     if hop == self._max_redirects:
                         raise WebAccessError("redirect_limit", "网页重定向次数超过上限")
                     current, host, port = next_url, next_host, next_port

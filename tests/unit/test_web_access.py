@@ -509,3 +509,75 @@ def test_optional_request_checker_failure_is_redacted_and_reset(monkeypatch):
     assert exc.value.code == "privacy_denied" and "SECRET" not in str(exc.value)
     assert calls == []
     assert client.request("https://example.com/").status == 200 and len(calls) == 1
+
+
+@pytest.mark.parametrize("url,host,port", [
+    ("http://127.0.0.1:8080/", "127.0.0.1", 8080),
+    ("http://[::1]:9000/", "::1", 9000),
+    ("http://10.0.0.1/", "10.0.0.1", 80),
+    ("http://169.254.169.254/", "169.254.169.254", 80),
+    ("http://localhost:3000/", "localhost", 3000),
+    ("https://service.internal:8443/", "service.internal", 8443),
+])
+def test_full_access_allows_nonpublic_hosts_and_ports_without_leaking(monkeypatch, url, host, port):
+    from limbowave.application.services.tool_access import tool_access_scope
+
+    client, calls, _ = client_with(monkeypatch, [Response()], ["127.0.0.1"])
+    with tool_access_scope(True):
+        assert validate_public_url(url) == (url, host, port)
+        assert client.request(url).body == b"hello"
+    assert calls[0][1:3] == (host, port)
+    with pytest.raises(WebAccessError):
+        client.request(url)
+    assert len(calls) == 1
+
+
+def test_full_access_allows_fake_ip_dns_and_cross_origin_redirect(monkeypatch):
+    from limbowave.application.services.tool_access import tool_access_scope
+
+    client, calls, conns = client_with(monkeypatch, [
+        Response(headers={"Location": "http://localhost:8080/article"}, status=302), Response(),
+    ], ["198.18.0.10", "93.184.216.34"])
+    with tool_access_scope(True):
+        result = client.request("https://example.com/", headers={
+            "Authorization": "test-only", "Cookie": "test-only", "X-Trace": "keep",
+        })
+    assert result.url == "http://localhost:8080/article"
+    assert len(calls) == 2
+    assert conns[1].requests[0][3]["X-Trace"] == "keep"
+    assert "Authorization" not in conns[1].requests[0][3]
+    assert "Cookie" not in conns[1].requests[0][3]
+    with pytest.raises(WebAccessError, match="公网"):
+        client.request("https://example.com/")
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize("url", [
+    "file:///etc/passwd", "http://user:pass@example.com/", "http://example.com:0/",
+    "http://example.com:65536/", "https://example.com/\\evil", "https://example.com/\nX:foo",
+])
+def test_full_access_preserves_url_syntax_validation(url):
+    from limbowave.application.services.tool_access import tool_access_scope
+
+    with tool_access_scope(True), pytest.raises(WebAccessError):
+        validate_public_url(url)
+
+
+async def test_full_access_context_isolated_and_reset_after_failure():
+    import asyncio
+
+    from limbowave.application.services.tool_access import has_full_access, tool_access_scope
+
+    async def check(enabled):
+        with tool_access_scope(enabled):
+            await asyncio.sleep(0)
+            assert has_full_access() is enabled
+            with tool_access_scope(False):
+                assert not has_full_access()
+            assert has_full_access() is enabled
+        assert not has_full_access()
+
+    await asyncio.gather(check(True), check(False))
+    with pytest.raises(RuntimeError), tool_access_scope(True):
+        raise RuntimeError("simulated transport failure")
+    assert not has_full_access()
