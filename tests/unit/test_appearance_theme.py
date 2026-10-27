@@ -181,3 +181,63 @@ def test_theme_service_defaults_to_system_mode_when_no_state_exists(
     dark_service = AppearanceThemeService(tmp_path / "dark-themes")
     assert dark_service.active_theme.id == DEFAULT_THEME_ID
 
+
+
+def test_default_night_wallpaper_is_bundled_and_not_user_managed(tmp_path: Path) -> None:
+    service = AppearanceThemeService(tmp_path / "themes", legacy_theme="dark")
+    background = service.active_theme.background
+    assert background.asset == "builtin:limbowave-night"
+    assert background.fit_mode == "cover"
+    assert background.position == "center"
+    assert background.mask_color == "#0B0C0E"
+    assert background.mask_opacity == pytest.approx(0.24)
+    resolved = service.resolve_asset(background.asset)
+    assert resolved is not None and resolved.is_file()
+    assert not resolved.is_relative_to(service.root)
+    with Image.open(resolved) as image:
+        assert image.format == "JPEG"
+        assert image.size == (1920, 1080)
+        image.verify()
+    assert not service.root.exists()
+    assert service.cleanup_orphan_assets() == ()
+    assert resolved.is_file()
+    assert all(not theme.background.asset for theme in BUILTIN_THEMES[1:])
+
+
+def test_custom_copy_retains_bundled_wallpaper_after_restart(tmp_path: Path) -> None:
+    root = tmp_path / "themes"
+    service = AppearanceThemeService(root, legacy_theme="dark")
+    custom = service.create("海边夜色", service.active_theme)
+    restarted = AppearanceThemeService(root)
+    assert restarted.active_theme.id == custom.id
+    assert restarted.active_theme.background == custom.background
+    resolved = restarted.resolve_asset(custom.background.asset)
+    assert resolved is not None and resolved.is_file()
+    assert restarted.cleanup_orphan_assets() == ()
+    assert resolved.is_file()
+
+
+@pytest.mark.parametrize(
+    "asset",
+    [
+        "builtin:unknown",
+        "builtin:../limbowave-night.jpg",
+        "builtin:limbowave-night/../../theme-state.json",
+        "../ui/assets/limbowave-night.jpg",
+    ],
+)
+def test_bundled_background_only_accepts_registered_ids(tmp_path: Path, asset: str) -> None:
+    service = AppearanceThemeService(tmp_path / "themes")
+    assert service.resolve_asset(asset) is None
+
+
+def test_missing_bundled_background_returns_none(tmp_path: Path, monkeypatch) -> None:
+    from limbowave.application.services import appearance_theme_service
+
+    monkeypatch.setitem(
+        appearance_theme_service.BUILTIN_BACKGROUND_ASSETS,
+        "builtin:limbowave-night",
+        tmp_path / "missing.jpg",
+    )
+    service = AppearanceThemeService(tmp_path / "themes", legacy_theme="dark")
+    assert service.resolve_asset(service.active_theme.background.asset) is None

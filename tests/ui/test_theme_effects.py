@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 from dataclasses import replace
 
+import pytest
 from PySide6.QtCore import QEvent
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import QApplication, QLabel, QPushButton, QVBoxLayout, QWidget
@@ -16,6 +17,14 @@ from limbowave.domain.appearance import (
 )
 from limbowave.ui import theme
 from limbowave.ui.theme_effects import apply_text_glow, install_hover_suspension
+
+
+@pytest.fixture(autouse=True)
+def reset_theme():
+    # Hover-only tests must not inherit a wallpaper from earlier UI tests.
+    theme.set_palette("dark")
+    yield
+    theme.set_palette("dark")
 
 
 def test_text_glow_applies_to_dark_glyphs_and_skips_light_text(qtbot: QtBot) -> None:
@@ -141,7 +150,9 @@ def test_control_categories_and_tab_indicator_change_generated_qss() -> None:
 
 
 def test_chrome_surfaces_keep_palette_when_no_backdrop() -> None:
-    source = BUILTIN_THEMES[0]
+    source = replace(
+        BUILTIN_THEMES[0], background=replace(BUILTIN_THEMES[0].background, asset="")
+    )
     theme.apply_appearance_theme(source)
     css = theme.app_stylesheet()
     canvas = css.split("QWidget {", 1)[1].split("}", 1)[0]

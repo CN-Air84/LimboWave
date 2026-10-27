@@ -53,6 +53,13 @@ def test_build_arguments_defaults(tmp_path: Path) -> None:
         "limbowave/infrastructure/crypto",
         "limbowave/web/static",
     }
+    # The default night wallpaper must ship with the existing UI asset bundle.
+    assets_source = next(
+        Path(item.split(";", 1)[0])
+        for item in add_data
+        if item.endswith(";limbowave/ui/assets")
+    )
+    assert (assets_source / "limbowave-night.jpg").is_file()
     # about.json 未提供时不注入
     assert not any(item.endswith(";.") for item in add_data)
 

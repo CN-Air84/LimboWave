@@ -276,7 +276,16 @@ def _builtin(
 
 
 BUILTIN_THEMES = (
-    AppearanceTheme("builtin:limbowave-dark", "灵波夜", DARK_COLORS),
+    AppearanceTheme(
+        "builtin:limbowave-dark",
+        "灵波夜",
+        DARK_COLORS,
+        background=BackgroundSettings(
+            asset="builtin:limbowave-night",
+            mask_color="#0B0C0E",
+            mask_opacity=0.24,
+        ),
+    ),
     _builtin(
         "clear-day",
         "清昼",

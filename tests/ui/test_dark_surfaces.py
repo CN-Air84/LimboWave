@@ -11,6 +11,9 @@ from limbowave.domain.appearance import BUILTIN_THEMES
 from limbowave.ui import theme
 from limbowave.ui.main_window import MainWindow
 
+# These tests cover the no-wallpaper fallback, not the default night wallpaper.
+PLAIN_DARK = replace(BUILTIN_THEMES[0], background=replace(BUILTIN_THEMES[0].background, asset=""))
+
 
 @pytest.fixture(autouse=True)
 def restore_theme(qapp):
@@ -25,7 +28,7 @@ def test_default_dark_has_tonal_surfaces_and_quiet_borders(legacy):
     if legacy:
         theme.set_palette("dark")
     else:
-        theme.apply_appearance_theme(BUILTIN_THEMES[0])
+        theme.apply_appearance_theme(PLAIN_DARK)
     assert theme.BG_APP.upper() == "#0B0C0E"
     assert theme.sidebar_surface().upper() == "#111317"
     assert theme.card_surface().upper() == "#16181D"
@@ -37,11 +40,11 @@ def test_default_dark_has_tonal_surfaces_and_quiet_borders(legacy):
 
 
 def test_window_containers_share_soft_border(qtbot, qapp):
-    theme.apply_appearance_theme(BUILTIN_THEMES[0])
+    theme.apply_appearance_theme(PLAIN_DARK)
     qapp.setStyleSheet(theme.app_stylesheet())
     window = MainWindow()
     qtbot.addWidget(window)
-    window.set_appearance_theme(BUILTIN_THEMES[0])
+    window.set_appearance_theme(PLAIN_DARK)
     assert theme.sidebar_surface() in window.sidebar.styleSheet()
     assert theme.container_border() in window.chat._composer.styleSheet()
     assert theme.container_border() in window.toolbar.styleSheet()
@@ -117,12 +120,12 @@ def test_ambient_never_overlays_wallpaper_or_light_theme(qtbot, wallpaper, light
 
 
 def test_dark_surfaces_are_visible_in_composited_window(qtbot, qapp):
-    theme.apply_appearance_theme(BUILTIN_THEMES[0])
+    theme.apply_appearance_theme(PLAIN_DARK)
     qapp.setStyleSheet(theme.app_stylesheet())
     window = MainWindow()
     qtbot.addWidget(window)
     window.resize(1000, 700)
-    window.set_appearance_theme(BUILTIN_THEMES[0])
+    window.set_appearance_theme(PLAIN_DARK)
     window.show()
     qtbot.wait(30)
     image = window.grab().toImage()
@@ -180,7 +183,7 @@ def test_assistant_background_is_painted_with_rounded_corners(qtbot, qapp, palet
 def test_existing_assistant_background_refreshes_with_palette_and_material(qtbot, qapp):
     from limbowave.ui.chat_view import ChatView
 
-    base = BUILTIN_THEMES[0]
+    base = PLAIN_DARK
     wallpaper = replace(
         base,
         background=replace(base.background, asset="wall.png"),

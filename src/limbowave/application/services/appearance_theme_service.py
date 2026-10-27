@@ -28,6 +28,14 @@ SCHEMA_VERSION = 1
 MAX_IMAGE_BYTES = 32 * 1024 * 1024
 MAX_IMAGE_PIXELS = 64_000_000
 
+# Exact IDs keep bundled images separate from user-managed, disposable assets.
+# Package-relative paths work both in source installs and PyInstaller bundles.
+BUILTIN_BACKGROUND_ASSETS = {
+    "builtin:limbowave-night": (
+        Path(__file__).resolve().parents[2] / "ui" / "assets" / "limbowave-night.jpg"
+    ),
+}
+
 
 @dataclass(frozen=True, slots=True)
 class ThemeState:
@@ -216,6 +224,9 @@ class AppearanceThemeService:
     def resolve_asset(self, asset: str) -> Path | None:
         if not asset:
             return None
+        if asset in BUILTIN_BACKGROUND_ASSETS:
+            bundled = BUILTIN_BACKGROUND_ASSETS[asset]
+            return bundled if bundled.is_file() else None
         try:
             resolved = (self.root / asset).resolve(strict=True)
             root = self.assets.resolve(strict=True)
