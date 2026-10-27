@@ -561,7 +561,7 @@ class ToolGateway:
         add("clock", True, Capability.CLOCK_READ)
         add("environment", self._environment is not None and self._environment.configured,
             Capability.NETWORK)
-        if self.memory_service is not None:
+        if self.memory_service is not None and preset is not PermissionPreset.FULL_ACCESS:
             privacy = self.memory_service.privacy.policy(conversation_id)
             if privacy.rules:
                 capabilities["scratchpad"].update(status="restricted", permission="denied")
