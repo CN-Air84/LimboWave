@@ -1,18 +1,34 @@
+
+<img width="1672" height="941" alt="rainflow-1f1071864a284683aae5623b37130858" src="https://github.com/user-attachments/assets/2dbacf28-7304-4c28-aeac-d7c6428274ab" />
+
+---
+
+<div align="center">
+  
+**放下心来，倾诉心中所想；让芯连心，倾听灵魂的声音。**
+
+**认出纯洁的你、记住真正的你一一仅此而已。**
+
+
 # LimboWave · 灵波
 
-**共鸣、共振。**
-
-在屏幕的一角，留一扇可以慢慢说话的窗。
 
 LimboWave 是一款 **Windows 优先的原生桌面 AI 对话与陪伴应用**。它把你选择的模型、愿意留下的记忆，以及日常里那些零碎的话，放在同一个可以长久使用的空间里。
 
 你可以认真讨论一个问题，也可以只说一句“今天有点累”。不必每次开口都带着任务，不必把每段心情都整理成一份需求。
 
-**陪伴是主线，能做事是底气；什么时候靠近、记住什么、允许做什么，由你决定。**
-
 [看看它能做什么](#核心功能) · [开始使用](#开始使用) · [使用与部署文档](#使用与部署文档)
 
+
+
 ---
+
+Bilibili [个人主页](https://space.bilibili.com/526883669)|<del>[宣传视频](https://www.bilibili.com/)</del>26-10-28 17:55  | LinuxDo[个人主页](https://linux.do/u/air84/summary)|<del>[项目主贴](https://linux.do/404)</del>26-10-28 18:00 | [Discord](https://discord.gg/ewAg422ZQ)
+
+</div>
+
+---
+
 
 ## 有些时候，你需要的不是另一个工作台
 
