@@ -21,8 +21,6 @@ LimboWave 是一款 **Windows 优先的原生桌面 AI 对话与陪伴应用**�
 
 
 
-
-
 ---
 
 Bilibili [个人主页](https://space.bilibili.com/526883669)|<del>[宣传视频](https://www.bilibili.com/)</del>26-10-28 17:55  | LinuxDo[个人主页](https://linux.do/u/air84/summary)|<del>[项目主贴](https://linux.do/404)</del>26-10-28 18:00 | [Discord](https://discord.gg/ewAg422ZQ)
