@@ -60,6 +60,7 @@ def test_build_arguments_defaults(tmp_path: Path) -> None:
         if item.endswith(";limbowave/ui/assets")
     )
     assert (assets_source / "limbowave-night.jpg").is_file()
+    assert (assets_source / "limbowave.ico").is_file()
     # about.json 未提供时不注入
     assert not any(item.endswith(";.") for item in add_data)
 

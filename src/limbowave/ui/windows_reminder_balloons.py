@@ -6,12 +6,12 @@ import itertools
 import sys
 from collections.abc import Callable
 from ctypes import wintypes
-from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import QAbstractNativeEventFilter, QByteArray, QTimer
-from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication, QWidget
+
+from limbowave.ui.app_icon import application_icon
 
 NIM_ADD, NIM_MODIFY, NIM_DELETE, NIM_SETVERSION = 0, 1, 2, 4
 NIF_MESSAGE, NIF_ICON, NIF_TIP, NIF_INFO = 1, 2, 4, 16
@@ -73,7 +73,7 @@ class WindowsReminderBalloons(QAbstractNativeEventFilter):
         if self._shell is None:
             return False
         if not self._icon:
-            icon = QIcon(str(Path(__file__).with_name("assets") / "limbowave-logo.svg"))
+            icon = application_icon()
             self._icon = int(icon.pixmap(32, 32).toImage().toHICON())
             if not self._icon:
                 return False

@@ -98,3 +98,22 @@ def test_failed_show_removes_registered_icon(balloons):
     assert not backend.show("title", "body", lambda: None)
     assert records[-1][0] == NIM_DELETE
     assert not backend._callbacks and not backend._timers
+
+
+def test_balloon_loads_shared_runtime_icon(balloons, monkeypatch):
+    from limbowave.ui import windows_reminder_balloons as module
+
+    backend, records, destroyed = balloons
+    backend._icon = 0
+    requested_sizes = []
+
+    def pixmap(width, height):
+        requested_sizes.append((width, height))
+        return SimpleNamespace(toImage=lambda: SimpleNamespace(toHICON=lambda: 73))
+
+    monkeypatch.setattr(module, "application_icon", lambda: SimpleNamespace(pixmap=pixmap))
+    assert backend.show("title", "body", lambda: None)
+    assert requested_sizes == [(32, 32)]
+    assert records[0][1].hIcon == 73
+    backend.close()
+    assert destroyed == [73]

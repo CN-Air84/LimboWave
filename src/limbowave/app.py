@@ -64,6 +64,7 @@ from limbowave.infrastructure.memory_repositories import in_memory_uow_factory
 from limbowave.infrastructure.restart import restart_application, restart_into_oobe
 from limbowave.infrastructure.tools.ipc_server import IPC_ENV, RATE_LIMIT_IPC_ENV, ToolIpcServer
 from limbowave.ui import markdown_render
+from limbowave.ui.app_icon import application_icon
 from limbowave.ui.chat_view import HISTORY_PAGE, ChatView, ComposerDraft, HistoryEntry
 from limbowave.ui.floating import (
     FloatingPanel,
@@ -133,12 +134,14 @@ def build_application(argv: Sequence[str]) -> QApplication:
     if isinstance(existing, QApplication):
         from limbowave.ui.smooth_scroll import install_smooth_scrolling
 
+        existing.setWindowIcon(application_icon())
         install_smooth_scrolling(existing)
         return existing
 
     app = QApplication(list(argv))
     app.setApplicationName(APP_NAME)
     app.setApplicationDisplayName(APP_DISPLAY_NAME)
+    app.setWindowIcon(application_icon())
     app.setApplicationVersion(__version__)
     app.setOrganizationName(APP_NAME)
 
@@ -5128,6 +5131,12 @@ def _run_gui(
     # 主窗口不接收业务上下文：窗口只展示与发命令，装配由上层负责。
     window = MainWindow(enable_oobe_debug=oobe_debug_enabled)
     cleanup.callback(window.close)
+    from limbowave.ui.system_tray import SystemTray
+
+    tray = SystemTray(window)
+    cleanup.callback(tray.hide)
+    if not smoke:
+        tray.show()
     restart_requested = False
     reset_request: DataResetService | None = None
     restore_request: PreparedRestore | None = None
